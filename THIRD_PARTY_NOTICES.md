@@ -8,8 +8,7 @@ respective files; per-file headers (SPDX identifiers) are authoritative where pr
 
 ## 1. LLVM / compiler-rt — MemorySanitizer (incorporated)
 - **What:** the CQMSan LLVM pass (`CompilerQEMUMemorySanitizer`) is derived from LLVM's
-  `MemorySanitizer.cpp`; the runtime (`cqmsan-rt/`, incl. `sanitizer_common`, `interception`,
-  `ubsan`) is derived from LLVM's `compiler-rt`. Most runtime files carry the original
+  `MemorySanitizer.cpp`; the runtime (`cqmsan-rt/`, incl. `sanitizer_common`, `interception`). Most runtime files carry the original
   `// Part of the LLVM Project … SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`
   header (retained).
 - **License:** Apache License 2.0 **WITH LLVM-exception** (see `LICENSE`).

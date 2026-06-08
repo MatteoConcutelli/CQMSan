@@ -208,7 +208,7 @@ static void InitializeFlags() {
   RegisterCQMsanFlags(&parser, f);
   RegisterCommonFlags(&parser);
 
-/* [TODO] future work remove
+/* [TODO] future work support ubsan
 #if CQMSAN_CONTAINS_UBSAN
   __ubsan::Flags *uf = __ubsan::flags();
   uf->SetDefaults();
@@ -725,7 +725,7 @@ void __cqmsan_init() {
   SetCurrentThread(main_thread);
   main_thread->Init();
 
-/* [TODO] future work
+/* [TODO] future work support ubsan
 #if CQMSAN_CONTAINS_UBSAN
   __ubsan::InitAsPlugin();
 #endif

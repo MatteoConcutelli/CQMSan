@@ -19,7 +19,7 @@
 #include "../sanitizer_common/sanitizer_stacktrace.h"
 #include "cqmsan_interface_internal.h"
 #include "cqmsan_flags.h"
-#include "../ubsan/ubsan_platform.h"
+//#include "../ubsan/ubsan_platform.h"
 
 #ifndef CQMSAN_REPLACE_OPERATORS_NEW_AND_DELETE
 # define CQMSAN_REPLACE_OPERATORS_NEW_AND_DELETE 1
