@@ -204,6 +204,12 @@ static cl::opt<bool> ClCheckLoads(
     cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
     cl::Hidden, cl::init(true));
 
+static cl::opt<bool> ClInstrumentStores(
+    "cqmsan-instrument-stores",
+    cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
+    cl::Hidden, cl::init(true));
+)
+
 /// ------------------------------------------------------------------------------------ ///
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
@@ -1689,6 +1695,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Just collect all the store instructions for successively instrument them with
     /// materializeStores() function
     void visitStoreInst(StoreInst &I) {
+        if (!ClInstrumentStores) return;
         StoreList.push_back(&I);
         // Optional: check that the store destination address is fully defined.
         // Captures UMR on uninitialized address (e.g., `int *p; *p = 1;`).
