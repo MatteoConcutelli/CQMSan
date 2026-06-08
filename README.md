@@ -1,4 +1,4 @@
-# CQMSan - Compile-level QMSan
+# Compile-level QMSan
 
 CQMSan brings QMSan's _**opportunistic**_ UMR-detection strategy from the **binary level (QEMU)** down to the **compile level (LLVM)**. Instead of fully propagating shadow state like MemorySanitizer, it performs a cheap **check at each load** ("is the valude I just loaded coming from uninitialized memory?") and turns UMR events into **extra coverage feedback** for the fuzzer.
 
