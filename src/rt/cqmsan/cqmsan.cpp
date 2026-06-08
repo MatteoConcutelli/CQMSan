@@ -35,9 +35,9 @@
 
 #include <link.h>
 
-// [TODO] future work remove
-#include "../ubsan/ubsan_flags.h"
-#include "../ubsan/ubsan_init.h"
+// UBSAN not supported
+//#include "../ubsan/ubsan_flags.h"
+//#include "../ubsan/ubsan_init.h"
 
 #include "cqmsan_shadow_constants.h"
 
