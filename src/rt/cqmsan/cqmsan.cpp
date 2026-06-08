@@ -437,11 +437,10 @@ void cqmsan_attach_afl_shm() {
   cqmsan_area_ptr = (u8*)p;
   //null_function(); // for debugging
 
-  Printf("==CQMSAN== attached to AFL shared memory %p\n", cqmsan_area_ptr);
+  Printf("==CQMSAN== Attached to AFL shared memory %p\n", cqmsan_area_ptr);
 
   /* If AFL_INST_RATIO or similar is set, touch a byte so parent doesn't give up */
   if (getenv("AFL_INST_RATIO")) cqmsan_area_ptr[0] = 1;
-
 
 }
 
@@ -558,7 +557,7 @@ using namespace __cqmsan;
 // of GET_CALLER_PC_BP and PrintWarningWithOrigin in the common case of no warning.
 #define CQMSAN_MAYBE_WARNING(type, size) \
     void __cqmsan_maybe_warning_##size(type s, __sanitizer::u32 o) { \
-      if (UNLIKELY(!s)) return; \
+      if (LIKELY(!s)) return; \
       GET_CALLER_PC_BP; \
       PrintWarningWithOrigin(pc, bp, o); \
       if (__cqmsan::flags()->halt_on_error) Die(); \
