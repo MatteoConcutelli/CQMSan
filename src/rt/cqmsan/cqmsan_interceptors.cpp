@@ -1951,8 +1951,7 @@ void InitializeInterceptors() {
 #if SANITIZER_NETBSD
   INTERCEPT_FUNCTION(__libc_thr_keycreate);
 #endif
-
-  // [FIX] pthread_join già registrato sopra (cluster pthread) — rimosso duplicato.
+  
   INTERCEPT_FUNCTION(tzset);
   INTERCEPT_FUNCTION(atexit);
   INTERCEPT_FUNCTION(__cxa_atexit);
