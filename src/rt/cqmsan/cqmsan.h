@@ -25,9 +25,9 @@
 # define CQMSAN_REPLACE_OPERATORS_NEW_AND_DELETE 1
 #endif
 
-#ifndef CQMSAN_CONTAINS_UBSAN
-# define CQMSAN_CONTAINS_UBSAN CAN_SANITIZE_UB
-#endif
+//#ifndef CQMSAN_CONTAINS_UBSAN
+//# define CQMSAN_CONTAINS_UBSAN CAN_SANITIZE_UB
+//#endif
 
 struct MappingDesc {
   __sanitizer::uptr start;
