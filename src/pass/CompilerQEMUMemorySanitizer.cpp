@@ -1,0 +1,3067 @@
+//===- CompilerQEMUMemorySanitizer.cpp - opportunistic UMR detector -------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// Derived from LLVM's MemorySanitizer.cpp. Modified for CQMSan: removes shadow
+// propagation and implements opportunistic check-at-load UMR detection with
+// AFL coverage feedback.
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Argument.h"
+#include "llvm/IR/AttributeMask.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CallingConv.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstVisitor.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsAArch64.h"
+#include "llvm/IR/IntrinsicsX86.h"
+#include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/ValueMap.h"
+#include "llvm/Passes/PassPlugin.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Support/AtomicOrdering.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/DebugCounter.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <numeric>
+#include <string>
+#include <tuple>
+
+#include "CompilerQEMUMemorySanitizer.h"
+
+// replicating msan pipeline 
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/JumpThreading.h"
+#include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Analysis/GlobalsModRef.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "cqmsan"
+
+DEBUG_COUNTER(DebugInsertCheck, "cqmsan-insert-check",
+    "Controls which checks to insert");
+
+DEBUG_COUNTER(DebugInstrumentInstruction, "cqmsan-instrument-instruction",
+    "Controls which instruction to instrument");
+
+static const Align kShadowTLSAlignment = Align(8);
+
+// These constants must be kept in sync with the ones in cqmsan.h.
+static const unsigned kParamTLSSize = 800;
+static const unsigned kRetvalTLSSize = 800;
+
+// Accesses sizes are powers of two: 1, 2, 4, 8.
+static const size_t kNumberOfAccessSizes = 4;
+
+// ------------------------------- FLAGS ----------------------------------
+
+// [OPTIMIZATION] 22/05
+static cl::opt<bool> ClFastWarning(
+    "cqmsan-fast-warning",
+    cl::desc("Use bitmap-only warning handler (__cqmsan_warning_fast) instead "
+             "of full-diagnostic handler. Skips stack unwind, symbolize, and "
+             "stderr Printf. Preserves AFL bitmap signal. Recommended for "
+             "fuzzing campaigns; not recommended for developer debugging."),
+    cl::Hidden, cl::init(true));
+
+// [OPTIMIZATION] 22/05
+static cl::opt<bool> ClBBCoalescedChecks(
+    "cqmsan-bb-coalesced-checks",
+    cl::desc("Group shadow checks per basic block (Opt-3)."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
+    cl::desc("keep going after reporting a UMR"),
+    cl::Hidden, cl::init(true));
+
+// disable only for debug
+static cl::opt<bool> ClPoisonStack("cqmsan-poison-stack",
+    cl::desc("poison uninitialized stack variables"), 
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClPoisonStackWithCall("cqmsan-poison-stack-with-call",
+    cl::desc("poison uninitialized stack variables with a call"),
+    cl::Hidden, cl::init(false));   // enable only for debug
+    // [TODO] future work: implement the use of this integrating CQMsanUnpoisonAllocaFn...
+
+static cl::opt<int> ClPoisonStackPattern("cqmsan-poison-stack-pattern",
+    cl::desc("poison uninitialized stack variables with the given pattern"),
+    cl::Hidden, cl::init(0xff)); 
+
+// Reduce false negatives since it poisons uninitialized variables in the stack
+static cl::opt<bool> ClPoisonUndef("cqmsan-poison-undef",
+    cl::desc("poison undef temps"), 
+    cl::Hidden, cl::init(true));
+
+// Reduce false negatives. Without we lost UMR stack slot reuse 
+static cl::opt<bool> ClHandleLifetimeIntrinsics("cqmsan-handle-lifetime-intrinsics",
+    cl::desc("when possible, poison scoped variables at the beginning of the scope " 
+             "(slower, but more precise)"),
+    cl::Hidden, cl::init(true));
+
+// When compiling the Linux kernel, we sometimes see false positives
+// being unable to understand that inline assembly calls may initialize
+// local variables.
+// This flag makes the compiler conservatively unpoison every memory location
+// passed into an assembly call. Note that this may cause false positives.
+// Because it's impossible to figure out the array sizes, we can only unpoison
+// the first sizeof(type) bytes for each type* pointer.
+// [TODO] implement the use of this
+// Reduces the false positives
+static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
+    cl::desc("conservative handling of inline assembly"), cl::Hidden,
+    cl::init(true));
+
+
+/* CHECK SHADOW ADDRESS */
+
+// This flag controls whether we check the shadow of the address
+// operand of load or store. Such bugs are very rare, since load from
+// a garbage address typically results in SEGV, but still happen
+// (e.g. only lower bits of address are garbage, or the access happens
+// early at program startup where malloc-ed memory is more likely to
+// be zeroed. As of 2012-08-28 this flag adds 20% slowdown.
+static cl::opt<bool> ClCheckAccessAddress(
+    "cqmsan-check-access-address",
+    cl::desc("report accesses through a pointer which has poisoned shadow"),
+    cl::Hidden, cl::init(false));  // [PERF FIX-5] era true; MSan upstream usa false.
+                                   // Toglie il check shadow sull'INDIRIZZO ad ogni
+                                   // load/store (overhead su pointer-chasing) → +6%
+                                   // ex/s su pcre2, a parità col default MSan.
+
+// [ABLAZIONE — misura dell'UPPER BOUND, vedi WORKFLOW_upperbound_noload.md]
+// Default true ⇒ comportamento di tesi INVARIATO. Servono SOLO a misurare il tetto di
+// throughput del load-skipping (NON sono detector reali: con false si perde detection).
+//
+// ClInstrumentLoads=false : visitLoadInst non instrumenta affatto i load (niente
+//   shadow-load, niente check; lo shadow del load è trattato come pulito). È il tetto:
+//   nessuna ottimizzazione di load-skipping può andare più veloce di così.
+//   Selezione per-target: -mllvm -cqmsan-instrument-loads=0
+static cl::opt<bool> ClInstrumentLoads(
+    "cqmsan-instrument-loads",
+    cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
+    cl::Hidden, cl::init(true));
+
+// ClCheckLoads=false : lo shadow del load viene caricato ma il check UMR NON viene
+//   emesso. Senza propagazione lo shadow-load diventa morto e la DCE lo rimuove ⇒ in
+//   pratica collassa su instrument-loads=0 (utile per confermare che il costo è lo
+//   shadow-load, non il solo branch del check).
+//   Selezione per-target: -mllvm -cqmsan-check-loads=0
+static cl::opt<bool> ClCheckLoads(
+    "cqmsan-check-loads",
+    cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
+    cl::desc("check arguments and return values at function call boundaries"),
+    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
+
+static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
+cl::desc(
+    "If the function being instrumented requires more than "
+    "this number of checks and origin stores, use callbacks instead of "
+    "inline checks (-1 means never use callbacks)."),
+cl::Hidden, cl::init(3500));
+
+// Reduce possible false negatives when true, avoiding the skip of costant shadow values
+static cl::opt<bool> ClCheckConstantShadow("cqmsan-check-constant-shadow",
+    cl::desc("Insert checks for constant shadow values"),
+    cl::Hidden, cl::init(true));
+
+// This is off by default because of a bug in gold:
+// https://sourceware.org/bugzilla/show_bug.cgi?id=19002
+static cl::opt<bool> ClWithComdat("cqmsan-with-comdat",
+        cl::desc("Place MSan constructors in comdat sections"),
+        cl::Hidden, cl::init(false));
+
+/* SHADOW MAPPING */
+// [TODO] future work is to handle these 3 options.
+
+// These options allow to specify custom memory map parameters
+// See MemoryMapParams for details.
+static cl::opt<uint64_t> ClAndMask("cqmsan-and-mask",
+    cl::desc("Define custom CQMSan AndMask"),
+    cl::Hidden, cl::init(0));
+
+static cl::opt<uint64_t> ClXorMask("cqmsan-xor-mask",
+    cl::desc("Define custom CQMSan XorMask"),
+    cl::Hidden, cl::init(0));
+
+static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
+    cl::desc("Define custom CQMSan ShadowBase"),
+    cl::Hidden, cl::init(0));
+
+
+
+// [Disallignment with 19.x version] --> disabled for benchmarking vs 19.1.7 msan that does not have this flag
+// [NOT IMPLEMENTED]
+// Reduce false negatives since it precisely poisrons partially undefined constant vectors.
+static cl::opt<bool> ClPoisonUndefVectors("cqmsan-poison-undef-vectors",
+    cl::desc("Precisely poison partially undefined constant vectors. "
+            "If false (legacy behavior), the entire vector is "
+            "considered fully initialized, which may lead to false "
+            "negatives. Fully undefined constant vectors are "
+            "unaffected by this flag (see -cqmsan-poison-undef)."),
+    cl::Hidden, cl::init(false));
+
+// "Use of uninitialized value at %s...", stack_name
+// [TODO] implement the use of this
+static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
+    cl::desc("Print name of local stack variable"),
+    cl::Hidden, cl::init(false));
+
+/* ----- END FLAGS ----- */
+
+// Define the constructor name and the init function name of the runtime library
+const char kCQMSanModuleCtorName[] = "cqmsan.module_ctor";
+const char kCQMSanInitName[] = "__cqmsan_init";
+
+namespace {
+
+    // Memory map parameters used in application-to-shadow address calculation.
+    // Offset = (Addr & ~AndMask) ^ XorMask
+    // Shadow = ShadowBase + Offset
+    struct MemoryMapParams {
+        uint64_t AndMask;
+        uint64_t XorMask;
+        uint64_t ShadowBase;
+    };
+
+    // not used for now
+    struct PlatformMemoryMapParams {
+        const MemoryMapParams *bits32;
+        const MemoryMapParams *bits64;
+    };
+
+    // x86_64 Linux
+    static const MemoryMapParams Linux_X86_64_MemoryMapParams = {
+        0,              // AndMask (not used)
+        0x500000000000, // XorMask
+        0               // ShadowBase
+    };
+
+    /* [TODO] future work add platform-specific memory map parameters*/
+
+};
+
+//===-------------------------CompilerQEMUMemorySanitizerClass---------------------===//
+
+namespace {
+
+/// Instrument functions of a module to detect uninitialized reads.
+///
+/// Instantiating CompilerQEMUMemorySanitizer inserts the cqmsan runtime library API function
+/// declarations into the module if they don't exist already. Instantiating
+/// ensures the __cqmsan_init function is in the list of global constructors for
+/// the module.
+class CompilerQEMUMemorySanitizer {
+public:
+    CompilerQEMUMemorySanitizer(Module &M, CompilerQEMUMemorySanitizerOptions Options)
+        : Recover(Options.Recover), EagerChecks(Options.EagerChecks){
+        initializeModule(M);
+    }
+
+    // CQMSan cannot be moved or copied because of MapParams.
+    // Move constructor
+    CompilerQEMUMemorySanitizer(CompilerQEMUMemorySanitizer &&) = delete;
+    // Move assignment
+    CompilerQEMUMemorySanitizer &operator=(CompilerQEMUMemorySanitizer &&) = delete;
+    // Copy constructor
+    CompilerQEMUMemorySanitizer(const CompilerQEMUMemorySanitizer &) = delete;
+    // Copy assignment
+    CompilerQEMUMemorySanitizer &operator=(const CompilerQEMUMemorySanitizer &) = delete;
+
+    // Entry point for function instrumentation. 
+    // Called for each function in the module by CompilerQEMUMemorySanitizerPass.
+    // Construct the CompilerQEMUMemorySanitizerVisitor.
+    // Return true if the function has been modified, false otherwise.
+    bool sanitizeFunction(Function &F, TargetLibraryInfo &TLI);
+
+private:
+    // InstructionVisitor that performs the actual instrumentation of the function.
+    friend struct CompilerQEMUMemorySanitizerVisitor;
+
+    // Handle variadic functions and their calling convenctions (for different architectures).
+    // [DONE] For now Linux x86_64 only
+    friend struct VarArgHelperBase;
+    friend struct VarArgAMD64Helper;
+    // For unknown architectures
+    friend struct VarArgNoOpHelper;
+    // [TODO] future work, support other architectures
+
+    void initializeModule(Module &M);
+    void createUserspaceApi(Module &M, const TargetLibraryInfo &TLI);
+    void initializeCallbacks(Module &M, const TargetLibraryInfo &TLI);
+
+    bool Recover; // If true, continue after the error
+    bool EagerChecks;
+
+    Triple TargetTriple; // Linux/x86_64 etc.
+    LLVMContext *C;
+
+    Type *IntptrTy; // i64 on x86_64
+    PointerType *PtrTy; // ptr type
+
+    /// TLS shadow channels ///
+    /// Thread-local shadow storage for function parameters.
+    Value *ParamTLS;
+    /// Thread-local shadow storage for function return value.
+    Value *RetvalTLS;
+    /// Thread-local shadow storage for in-register va_arg function.
+    Value *VAArgTLS;
+    /// Thread-local shadow storage for va_arg overflow area.
+    Value *VAArgOverflowSizeTLS;
+
+    /// Are the instrumentation callbacks set up?
+    bool CallbacksInitialized = false;
+
+    /// FunctionCallee for runtime helpers ///
+    // These arrays are indexed by log2(AccessSize).
+    FunctionCallee MaybeWarningFn[kNumberOfAccessSizes];
+
+    /// The run-time callback to print a warning.
+    FunctionCallee WarningFn;
+    /// Run-time helper that poisons stack on function entry.
+    FunctionCallee CQMSanPoisonStackFn;
+    /// CQMSan runtime replacements for memmove, memcpy and memset.
+    FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
+
+    // [TODO]: implement this
+    FunctionCallee CQMSanInstrumentAsmStoreFn;
+    
+    // Memory map parameters used in application-to-shadow calculation.
+    const MemoryMapParams *MapParams;
+    /// Custom memory map parameters used when -msan-shadow-base is provided
+    MemoryMapParams CustomMapParams;
+
+    MDNode *ColdCallWeights;
+
+};
+
+// [DONE] 11/05
+/// \brief Inserts a global constructor into the module to initialize the CQMSan runtime.
+///
+/// This function ensures that the runtime initialization function
+/// (__cqmsan_init) is called at application startup, before the
+/// main() function executes.
+///
+/// Use `getOrCreateSanitizerCtorAndInitFunctions` to create a
+/// stub constructor function (cqmsan.module_ctor) that invokes __cqmsan_init. This constructor
+/// is then added to the module's list of global constructors (`llvm.global_ctors`)
+/// with priority 0 (first-come, first-served execution).
+///
+/// It also handles the `ClWithComdat` option to place the constructor in a
+/// Comdat section, allowing the linker to deduplicate constructors if the same
+/// runtime is statically linked multiple times.
+///
+/// \param M The LLVM module into which to inject the constructor.
+void insertModuleCtor(Module &M) {
+    getOrCreateSanitizerCtorAndInitFunctions(
+        M, kCQMSanModuleCtorName, kCQMSanInitName,
+        /*InitArgTypes=*/{},
+        /*InitArgs=*/{},
+        // This callback is invoked when the functions are created the first
+        // time. Hook them into the global ctors list in that case:
+        [&](Function *Ctor, FunctionCallee) {
+            if (!ClWithComdat) {
+                appendToGlobalCtors(M, Ctor, 0);
+                return;
+            }
+            Comdat *CQMSanCtorComdat = M.getOrInsertComdat(kCQMSanModuleCtorName);
+            Ctor->setComdat(CQMSanCtorComdat);
+            appendToGlobalCtors(M, Ctor, 0, Ctor);
+        });
+}
+
+template <class T> T getOptOrDefault(const cl::opt<T> &Opt, T Default) {
+    return (Opt.getNumOccurrences() > 0) ? Opt : Default;
+}
+
+} // end anonymous namespace
+
+
+// ___________________________CompilerQEMUMemorySanitizer___________________________//
+
+// [DONE] 11/05
+CompilerQEMUMemorySanitizerOptions::CompilerQEMUMemorySanitizerOptions(bool R,
+    bool EagerChecks)
+    : Recover(getOptOrDefault(ClKeepGoing, R)),
+      EagerChecks(getOptOrDefault(ClEagerChecks, EagerChecks)) {}
+
+// [DONE] 11/05
+PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
+
+    insertModuleCtor(M); // ensure the __cqmsan_init is called before main()
+
+    // get the function analysis manager from the module analysis manager
+    auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
+    bool Modified = false;
+
+    // Foreach function in the module, apply the CompilerQEMUMemorySanitizer instrumentation
+    for (Function &F : M) {
+        if (F.empty())
+            continue;
+
+        CompilerQEMUMemorySanitizer CQMSan(*F.getParent(), Options);
+        Modified |= CQMSan.sanitizeFunction(F, FAM.getResult<TargetLibraryAnalysis>(F));
+    }
+
+    if (!Modified)
+        return PreservedAnalyses::all();
+
+    PreservedAnalyses PA = PreservedAnalyses::none();
+    // GlobalsAA is considered stateless and does not get invalidated unless
+    // explicitly invalidated; PreservedAnalyses::none() is not enough. Sanitizers
+    // make changes that require GlobalsAA to be invalidated.
+    PA.abandon<GlobalsAA>();
+    return PA;
+}
+
+// [DONE] 11/05
+void CompilerQEMUMemorySanitizerPass::printPipeline(
+    raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
+  static_cast<PassInfoMixin<CompilerQEMUMemorySanitizerPass> *>(this)->printPipeline(
+      OS, MapClassName2PassName);
+  OS << '<';
+  if (Options.Recover)
+    OS << "recover;";
+  if (Options.EagerChecks)
+    OS << "eager-checks;";
+  OS << '>';
+}
+
+// [DONE] 11/05
+// Used for declaring globals as "__cqmsan_retval_tls"...
+static Constant *getOrInsertGlobal(Module &M, StringRef Name, Type *Ty) {
+  return M.getOrInsertGlobal(Name, Ty, [&] {
+    return new GlobalVariable(M, Ty, false, GlobalVariable::ExternalLinkage,
+                              nullptr, Name, nullptr,
+                              GlobalVariable::InitialExecTLSModel);
+  });
+}
+
+// [DONE] 11/05
+void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibraryInfo &TLI) {
+    IRBuilder<> IRB(*C);
+
+    StringRef WarningFnName = Recover ? "__cqmsan_warning" : "__cqmsan_warning_noreturn";
+    // [OPTIMIZATION] 22/05
+    WarningFnName = ClFastWarning ? "__cqmsan_warning_fast" : WarningFnName;
+
+    // [OPTIMIZATION] 22/05 — Opt-1/Opt-5: warning handler attributes
+    // Cold: keep warning callsites out of I-cache hot path (.text.cold layout)
+    // NoUnwind: warning never throws C++ exceptions, omit unwind tables
+    // NoReturn: only for the noreturn variant — fast/keep-going return normally
+    AttributeList Attrs = AttributeList()
+        .addFnAttribute(*C, Attribute::Cold)
+        .addFnAttribute(*C, Attribute::NoUnwind);
+    if (!Recover && !ClFastWarning) {
+        Attrs = Attrs.addFnAttribute(*C, Attribute::NoReturn);
+    }
+    WarningFn = M.getOrInsertFunction(WarningFnName, Attrs, IRB.getVoidTy());
+    
+
+    // Create the global TLS variables.    
+    RetvalTLS =
+      getOrInsertGlobal(M, "__cqmsan_retval_tls",
+                        ArrayType::get(IRB.getInt64Ty(), kRetvalTLSSize / 8));
+
+    ParamTLS =
+        getOrInsertGlobal(M, "__cqmsan_param_tls",
+                            ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
+
+    VAArgTLS =
+      getOrInsertGlobal(M, "__cqmsan_va_arg_tls",
+                        ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
+
+    VAArgOverflowSizeTLS = getOrInsertGlobal(M, "__cqmsan_va_arg_overflow_size_tls",
+                                           IRB.getIntPtrTy(M.getDataLayout()));
+    
+    // obtain __cqmsan_maybe_warning_X functions (X=1,2,4,8)
+    // ( defined in the runtime library as CQMSAN_MAYBE_WARNING(u8, X) )
+    for (size_t AccessSizeIndex = 0; AccessSizeIndex < kNumberOfAccessSizes;
+        AccessSizeIndex++) {
+
+        unsigned AccessSize = 1 << AccessSizeIndex;
+
+        std::string FunctionName = "__cqmsan_maybe_warning_" + itostr(AccessSize);
+        MaybeWarningFn[AccessSizeIndex] = M.getOrInsertFunction(
+            FunctionName, TLI.getAttrList(C, {0, 1}, /*Signed=*/false),
+            IRB.getVoidTy(), IRB.getIntNTy(AccessSize * 8), IRB.getInt32Ty());
+
+    }
+
+    CQMSanPoisonStackFn = M.getOrInsertFunction("__cqmsan_poison_stack",
+                                            IRB.getVoidTy(), PtrTy, IntptrTy);
+
+}
+
+// [DONE] 11/05
+/// Insert extern declaration of runtime-provided functions and globals.
+void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLibraryInfo &TLI) {
+    
+    // Only do this once.
+    if (CallbacksInitialized)
+        return;
+
+    IRBuilder<> IRB(*C);
+
+    // Initialize callbacks that are common for kernel and userspace
+    // instrumentation.
+    MemmoveFn = M.getOrInsertFunction("__cqmsan_memmove", PtrTy, PtrTy, PtrTy, IntptrTy);
+    MemcpyFn = M.getOrInsertFunction("__cqmsan_memcpy", PtrTy, PtrTy, PtrTy, IntptrTy); 
+    MemsetFn = M.getOrInsertFunction("__cqmsan_memset",
+                                            TLI.getAttrList(C, {1}, /*Signed=*/true),
+                                            PtrTy, PtrTy, IRB.getInt32Ty(), IntptrTy);
+    
+    // [TODO] future work: use this
+    CQMSanInstrumentAsmStoreFn = M.getOrInsertFunction("__cqmsan_instrument_asm_store", 
+        IRB.getVoidTy(), PtrTy, IntptrTy);
+
+    createUserspaceApi(M, TLI);
+    CallbacksInitialized = true;
+}
+
+// [DONE] 10/05
+/// Module-level initialization.
+///
+/// inserts a call to __cqmsan_init to the module's constructor list.
+void CompilerQEMUMemorySanitizer::initializeModule(Module &M) {
+    auto &DL = M.getDataLayout();         // wich endianness, size of types, etc.
+    
+    TargetTriple = llvm::Triple(M.getTargetTriple());   // which OS, arch, etc.
+  
+    bool ShadowPassed = ClShadowBase.getNumOccurrences() > 0;
+    
+    // Check the overrides first
+    if (ShadowPassed) {
+        CustomMapParams.AndMask = ClAndMask;
+        CustomMapParams.XorMask = ClXorMask;
+        CustomMapParams.ShadowBase = ClShadowBase;
+        MapParams = &CustomMapParams;
+    } else {
+        switch (TargetTriple.getOS()) {
+            case Triple::Linux:
+                switch (TargetTriple.getArch()) {
+                    case Triple::x86_64:
+                        MapParams = &Linux_X86_64_MemoryMapParams;
+                        break;
+                    default:
+                    report_fatal_error("unsupported architecture");
+                }
+                break;
+            default:
+                report_fatal_error(Twine("unsupported operating system: ") + TargetTriple.str());
+        }
+    }
+  
+    C = &(M.getContext());
+    IRBuilder<> IRB(*C);
+    IntptrTy = IRB.getIntPtrTy(DL); // Get the integer type with the size of a pointer in the default address space. (i64 or i32)
+    PtrTy = IRB.getPtrTy();
+    
+    ColdCallWeights = MDBuilder(*C).createUnlikelyBranchWeights(); // Create a metadata node for unlikely branch weights.
+    
+    if (Recover) {
+        M.getOrInsertGlobal("__cqmsan_keep_going", IRB.getInt32Ty(), [&] {
+            
+            return new GlobalVariable(M, IRB.getInt32Ty(), true,
+                                    GlobalValue::WeakODRLinkage,
+                                    IRB.getInt32(Recover), "__cqmsan_keep_going");
+        });
+    }
+
+}
+
+namespace {
+
+/// A helper class that handles instrumentation of VarArg
+/// functions on a particular platform.
+///
+/// Implementations are expected to insert the instrumentation
+/// necessary to propagate argument shadow through VarArg function
+/// calls. Visit* methods are called during an InstVisitor pass over
+/// the function, and should avoid creating new basic blocks. A new
+/// instance of this class is created for each instrumented function.
+struct VarArgHelper {
+  virtual ~VarArgHelper() = default;
+
+  /// Visit a CallBase.
+  virtual void visitCallBase(CallBase &CB, IRBuilder<> &IRB) = 0;
+
+  /// Visit a va_start call.
+  virtual void visitVAStartInst(VAStartInst &I) = 0;
+
+  /// Visit a va_copy call.
+  virtual void visitVACopyInst(VACopyInst &I) = 0;
+
+  /// Finalize function instrumentation.
+  ///
+  /// This method is called after visiting all interesting (see above)
+  /// instructions in a function.
+  virtual void finalizeInstrumentation() = 0;
+};
+
+struct CompilerQEMUMemorySanitizerVisitor;
+
+} // end anonymous namespace
+
+
+static VarArgHelper *CreateVarArgHelper(Function &Func, CompilerQEMUMemorySanitizer &CQMSan,
+                                        CompilerQEMUMemorySanitizerVisitor &Visitor);
+
+// [DONE] 11/05
+static unsigned TypeSizeToSizeIndex(TypeSize TS) {
+    if (TS.isScalable())
+        // Scalable types unconditionally take slowpaths.
+        return kNumberOfAccessSizes;
+
+    unsigned TypeSizeFixed = TS.getFixedValue();
+    
+    if (TypeSizeFixed <= 8)
+        return 0;
+    
+    return Log2_32_Ceil((TypeSizeFixed + 7) / 8);
+}
+
+
+//____________________________________________________________________________________//
+//____________________________________________________________________________________//
+//________________________CompilerQEMUMemorySanitizerVisitor_________________________//
+//____________________________________________________________________________________//
+//____________________________________________________________________________________//
+
+namespace {
+
+/// Helper class to attach debug information of the given instruction onto new
+/// instructions inserted after.
+class NextNodeIRBuilder : public IRBuilder<> {
+    public:
+      explicit NextNodeIRBuilder(Instruction *IP) : IRBuilder<>(IP->getNextNode()) {
+        SetCurrentDebugLocation(IP->getDebugLoc());
+    }
+};
+
+struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemorySanitizerVisitor> {
+
+    Function &F;
+    CompilerQEMUMemorySanitizer &CQMS;
+    SmallVector<PHINode *, 16> ShadowPHINodes;
+    // IR <-> ShadowValue
+    ValueMap<Value *, Value *> ShadowMap;
+    std::unique_ptr<VarArgHelper> VAHelper;
+    const TargetLibraryInfo *TLI;   // for recognizing libc functions
+    Instruction *FnPrologueEnd;
+    // List of instructions to instrument in a second time (see runOnFunction)
+    SmallVector<Instruction *, 16> Instructions;    
+
+    bool InsertChecks;
+    bool PoisonStack;
+    bool PoisonUndef;
+    // [Disallignment with 19.x version]
+    // bool PoisonUndefVectors;
+
+    struct ShadowAndInsertPoint {
+        Value *Shadow;
+        Instruction *OrigIns;
+
+        ShadowAndInsertPoint(Value *S, Instruction *I)
+            : Shadow(S), OrigIns(I) {}
+    };
+
+    SmallVector<ShadowAndInsertPoint, 16> InstrumentationList;
+    bool InstrumentLifetimeStart = ClHandleLifetimeIntrinsics;
+    SmallSetVector<AllocaInst *, 16> AllocaSet;
+    SmallVector<std::pair<IntrinsicInst *, AllocaInst *>, 16> LifetimeStartList;
+    // For instrument the store in a second time
+    SmallVector<StoreInst *, 16> StoreList;
+    int64_t SplittableBlocksCount = 0;
+
+    // [DONE] 11/05
+    CompilerQEMUMemorySanitizerVisitor(Function &F, CompilerQEMUMemorySanitizer &CQMS, const TargetLibraryInfo &TLI)
+        : F(F), CQMS(CQMS), VAHelper(CreateVarArgHelper(F, CQMS, *this)), TLI(&TLI) {
+        
+        // [TODO] future work: handle this
+        // CQMSAN is loaded as an out-of-tree pass via -fplugin: Clang doesn't automatically add
+        // Attribute::SanitizeMemory to functions (it only does so with -fsanitize=memory).
+        F.addFnAttr(Attribute::SanitizeMemory);
+        bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeMemory);
+        InsertChecks = SanitizeFunction;
+        PoisonStack = SanitizeFunction && ClPoisonStack;
+        PoisonUndef = SanitizeFunction && ClPoisonUndef;
+        // [Disallignment with 19.x version]
+        //PoisonUndefVectors = SanitizeFunction && ClPoisonUndefVectors;
+
+        removeUnreachableBlocks(F); // Remove unreachable blocks from the function.
+
+        CQMS.initializeCallbacks(*F.getParent(), TLI);
+        // prologue delineation
+        FnPrologueEnd = IRBuilder<>(&F.getEntryBlock(), F.getEntryBlock().getFirstNonPHIIt()) 
+                                .CreateIntrinsic(Intrinsic::donothing, {}, {}); // no value-arg
+
+        LLVM_DEBUG(if (!InsertChecks) dbgs()
+               << "MemorySanitizer is not inserting checks into '"
+               << F.getName() << "'\n");
+        
+    }
+
+    // [DONE] 11/05
+    /// Decide whether to use call-based instrumentation instead of
+    /// branch-based checks for this shadow value.
+    /// Call-based checks emit a direct __cqmsan_warning_N call, while
+    /// branch-based checks split the block and insert an icmp/br sequence.
+    bool instrumentWithCalls(Value *V) {
+        // Constants likely will be eliminated by follow-up passes.
+        // If V is a constant, never use calls:
+        if (isa<Constant>(V))
+            return false;
+        
+        //this counter tracks how many times we've considered call-based instrumentation.
+        ++SplittableBlocksCount;
+        
+        // Compare against user-configurable threshold:
+        //    - If threshold < 0 → never switch to calls.
+        //    - Otherwise, once the count exceeds the threshold, return true
+        //      to switch to call-based instrumentation.
+        return ClInstrumentationWithCallThreshold >= 0 &&
+                SplittableBlocksCount > ClInstrumentationWithCallThreshold;
+    }
+
+    // [DONE] 11/05
+    bool isInPrologue(Instruction &I) {
+        return I.getParent() == FnPrologueEnd->getParent() &&
+                (&I == FnPrologueEnd || I.comesBefore(FnPrologueEnd));
+    }
+
+    // [DONE] 11/05
+    void materializeStores() {
+        
+        for (StoreInst *SI : StoreList) {
+            
+            IRBuilder<> IRB(SI);
+            Value *Val = SI->getValueOperand();
+            Value *Addr = SI->getPointerOperand();
+
+            Value *Shadow = SI->isAtomic() ? getCleanShadow(Val) : getShadow(Val);
+            
+            Type *ShadowTy = Shadow->getType();
+            const Align Alignment = SI->getAlign();
+
+            Value *ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ true);
+        
+            StoreInst *NewSI = IRB.CreateAlignedStore(Shadow, ShadowPtr, Alignment);
+            LLVM_DEBUG(dbgs() << "  STORE: " << *NewSI << "\n");
+            (void)NewSI;
+            
+            if (SI->isAtomic())
+                SI->setOrdering(addReleaseOrdering(SI->getOrdering()));
+            
+        }
+    }
+
+    // [DONE] 11/05
+    /// Helper function to insert an CQMSan warning at IRB's current insert point.
+    /// CQMSan does not implement origin tracking (vedi docs/flags/ClTrackOrigins.md),
+    /// so the warning call takes no arguments.
+    void insertWarningFn(IRBuilder<> &IRB) {
+        IRB.CreateCall(CQMS.WarningFn)->setCannotMerge();
+    }
+
+    // [DONE] 11/05
+    void materializeOneCheck(IRBuilder<> &IRB, Value *ConvertedShadow) {
+        const DataLayout &DL = F.getDataLayout();
+        TypeSize TypeSizeInBits = DL.getTypeSizeInBits(ConvertedShadow->getType());
+        unsigned SizeIndex = TypeSizeToSizeIndex(TypeSizeInBits);
+
+        if (instrumentWithCalls(ConvertedShadow) && SizeIndex < kNumberOfAccessSizes) {
+            // Path OUT-OF-LINE: call helper
+            FunctionCallee Fn = CQMS.MaybeWarningFn[SizeIndex];
+            ConvertedShadow = convertShadowToScalar(ConvertedShadow, IRB);
+            Value *ConvertedShadow2 = IRB.CreateZExt(
+                ConvertedShadow, IRB.getIntNTy(8 * (1 << SizeIndex)));
+            CallBase *CB = IRB.CreateCall(Fn,
+                {ConvertedShadow2, (Value *)IRB.getInt32(0)});
+            CB->addParamAttr(0, Attribute::ZExt);
+            CB->addParamAttr(1, Attribute::ZExt);
+        } else {
+            // Path INLINE: split + warning
+            Value *Cmp = convertToBool(ConvertedShadow, IRB, "_cqmscmp");
+            Instruction *CheckTerm = SplitBlockAndInsertIfThen(
+                Cmp, &*IRB.GetInsertPoint(), !CQMS.Recover, CQMS.ColdCallWeights);
+            IRB.SetInsertPoint(CheckTerm);
+            insertWarningFn(IRB);
+        }
+    }
+
+    // [DONE] 11/05
+    void materializeInstructionChecks( ArrayRef<ShadowAndInsertPoint> InstructionChecks) {
+        const DataLayout &DL = F.getDataLayout();
+        
+        Instruction *OrigIns = InstructionChecks.front().OrigIns;
+        Value *Shadow = nullptr;
+        
+        for (const auto &ShadowData : InstructionChecks) {
+            assert(ShadowData.OrigIns == OrigIns);
+            IRBuilder<> IRB(OrigIns);
+            Value *ConvertedShadow = ShadowData.Shadow;
+            
+            if (auto *ConstantShadow = dyn_cast<Constant>(ConvertedShadow)) {
+                if (!ClCheckConstantShadow || ConstantShadow->isZeroValue()) {
+                    continue;
+                }
+                
+                if (llvm::isKnownNonZero(ConvertedShadow, DL)) {
+                    insertWarningFn(IRB);
+                    if (!CQMS.Recover)
+                        return;
+                    continue;
+                }
+            }
+            
+            if (!Shadow) {
+                Shadow = ConvertedShadow;
+                continue;
+            }
+            
+            Shadow = convertToBool(Shadow, IRB, "_cqmscmp");
+            ConvertedShadow = convertToBool(ConvertedShadow, IRB, "_cqmscmp");
+            Shadow = IRB.CreateOr(Shadow, ConvertedShadow, "_cqmsor");
+        }
+        
+        if (Shadow) {
+            IRBuilder<> IRB(OrigIns);
+            materializeOneCheck(IRB, Shadow);
+        }
+    }
+
+    // [DONE] 11/05
+    void materializeChecksLegacy() {
+#ifndef NDEBUG
+    // For assert below.
+    SmallPtrSet<Instruction *, 16> Done;
+#endif
+
+    for (auto I = InstrumentationList.begin(); I != InstrumentationList.end();) {
+        auto OrigIns = I->OrigIns;
+        // Checks are grouped by the original instruction. We call all
+        // `insertShadowCheck` for an instruction at once.
+        assert(Done.insert(OrigIns).second);
+        auto J = std::find_if(I + 1, InstrumentationList.end(),
+                            [OrigIns](const ShadowAndInsertPoint &R) {
+                                return OrigIns != R.OrigIns;
+                            });
+        // Process all checks of instruction at once.
+        materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint>(I, J));
+        I = J;
+    }
+
+        LLVM_DEBUG(dbgs() << "DONE:\n" << F);
+    }
+
+    bool isImmediateEssentialSink(Instruction *OrigIns) const {
+        // Indirect call: ptr deve essere checked PRIMA della call execution
+        if (auto *CB = dyn_cast<CallBase>(OrigIns))
+            if (CB->isIndirectCall())
+                return true;
+        // Memory intrinsics: OOB execution prima del check sarebbe catastrofica
+        if (isa<MemIntrinsic>(OrigIns)) return true;
+        // Atomic: race effects materializzati prima del check
+        if (isa<AtomicCmpXchgInst>(OrigIns) || isa<AtomicRMWInst>(OrigIns))
+            return true;
+        return false;
+    }
+
+    void materializeChecks() {
+        if (!ClBBCoalescedChecks) {
+            materializeChecksLegacy();   // codice attuale
+            return;
+        }
+
+        // Opt-3 path
+        DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;
+
+        for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
+            if (isImmediateEssentialSink(It->OrigIns)) {
+                // Materialize subito al sink originale
+                IRBuilder<> IRB(It->OrigIns);
+                materializeOneCheck(IRB, It->Shadow);
+            } else {
+                // Accumula per BB
+                BasicBlock *BB = It->OrigIns->getParent();
+                BBShadows[BB].push_back(It->Shadow);
+            }
+        }
+
+        // Per ogni BB, emette UN check al terminator
+        for (auto &Entry : BBShadows) {
+            BasicBlock *BB = Entry.first;
+            auto &Shadows = Entry.second;
+            if (Shadows.empty()) continue;
+
+            Instruction *Term = BB->getTerminator();
+            IRBuilder<> IRB(Term);
+
+            // OR di tutti shadow → i1 normalizzato
+            Value *Accumulated = normalizeShadow(IRB, Shadows[0]);
+            for (size_t i = 1; i < Shadows.size(); ++i) {
+                Value *S = normalizeShadow(IRB, Shadows[i]);
+                Accumulated = IRB.CreateOr(Accumulated, S);
+            }
+
+            materializeOneCheck(IRB, Accumulated);
+        }
+    }
+
+    // Helper
+    Value *normalizeShadow(IRBuilder<> &IRB, Value *S) {
+        if (S->getType()->isVectorTy())
+            S = IRB.CreateOrReduce(S);
+        return IRB.CreateICmpNE(S, Constant::getNullValue(S->getType()));
+    }
+
+    // [DONE] 11/05
+    bool runOnFunction() {
+
+        // Iterate all BBs in depth-first order and create shadow instructions
+        // only for load and stores
+        for (BasicBlock *BB : depth_first(FnPrologueEnd->getParent()))
+            visit(*BB);
+
+        // `visit` above only collects instructions. Process them after iterating
+        // CFG to avoid requirement on CFG transformations.
+        for (Instruction *I : Instructions)
+            InstVisitor<CompilerQEMUMemorySanitizerVisitor>::visit(*I);
+
+        // Finalize PHI nodes.
+        for (PHINode *PN : ShadowPHINodes) {
+            PHINode *PNS = cast<PHINode>(getShadow(PN));
+            size_t NumValues = PN->getNumIncomingValues();
+            for (size_t v = 0; v < NumValues; v++) {
+                PNS->addIncoming(getShadow(PN, v), PN->getIncomingBlock(v));
+            }
+        }
+
+        VAHelper->finalizeInstrumentation();
+
+        // Poison llvm.lifetime.start intrinsics, if we haven't fallen back to
+        // instrumenting only allocas.
+        if (InstrumentLifetimeStart) {
+            for (auto Item : LifetimeStartList) {
+                instrumentAlloca(*Item.second, Item.first);
+                AllocaSet.remove(Item.second);
+            }
+        }
+
+        // Poison the allocas for which we didn't instrument the corresponding
+        // lifetime intrinsics.
+        for (AllocaInst *AI : AllocaSet)
+            instrumentAlloca(*AI);
+        
+        // Insert shadow value checks (deferred from visit phase).
+        materializeChecks();
+
+        // Delayed instrumentation of StoreInst.
+        // This may not add new address checks.
+        materializeStores();
+
+        return true;
+    }
+
+    // [DONE] 11/05
+    /// Compute the shadow type that corresponds to a given Value.
+    Type *getShadowTy(Value *V) { return getShadowTy(V->getType()); }
+
+    // [DONE] 11/05
+    /// Compute the shadow type that corresponds to a given Type.
+    Type *getShadowTy(Type *OrigTy) {
+
+        if (!OrigTy->isSized()) {
+            return nullptr;
+        }
+        
+        // For integer type, shadow is the same as the original type.
+        // This may return weird-sized types like i1.
+        if (IntegerType *IT = dyn_cast<IntegerType>(OrigTy))
+            return IT;
+        
+        const DataLayout &DL = F.getDataLayout();
+        
+        if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
+            uint32_t EltSize = DL.getTypeSizeInBits(VT->getElementType());
+            return VectorType::get(IntegerType::get(*CQMS.C, EltSize),
+                                    VT->getElementCount());
+        }
+
+        if (ArrayType *AT = dyn_cast<ArrayType>(OrigTy)) {
+            return ArrayType::get(getShadowTy(AT->getElementType()),
+                                AT->getNumElements());
+        }
+        
+        if (StructType *ST = dyn_cast<StructType>(OrigTy)) {
+            SmallVector<Type *, 4> Elements;
+            
+            for (unsigned i = 0, n = ST->getNumElements(); i < n; i++)
+                Elements.push_back(getShadowTy(ST->getElementType(i)));
+            
+            StructType *Res = StructType::get(*CQMS.C, Elements, ST->isPacked());
+            LLVM_DEBUG(dbgs() << "getShadowTy: " << *ST << " ===> " << *Res << "\n");
+            return Res;
+        }
+
+        uint32_t TypeSize = DL.getTypeSizeInBits(OrigTy);
+        return IntegerType::get(*CQMS.C, TypeSize);
+    }
+
+    // [DONE] 11/05
+    /// Extract combined shadow of struct elements as a bool
+    Value *collapseStructShadow(StructType *Struct, Value *Shadow,
+                                IRBuilder<> &IRB) {
+        Value *FalseVal = IRB.getIntN(/* width */ 1, /* value */ 0);
+        Value *Aggregator = FalseVal;
+
+        for (unsigned Idx = 0; Idx < Struct->getNumElements(); ++Idx) {
+            // Combine by ORing together each element's bool shadow
+            Value *ShadowItem = IRB.CreateExtractValue(Shadow, Idx);
+            Value *ShadowBool = convertToBool(ShadowItem, IRB); // return 1 if poisoned
+    
+            if (Aggregator != FalseVal)
+                Aggregator = IRB.CreateOr(Aggregator, ShadowBool);
+            else
+                Aggregator = ShadowBool;
+        }
+
+        return Aggregator;
+    }
+
+    // [DONE] 11/05
+    /// Extract combined shadow of array elements.
+    /// Returns scalar shadow != 0 if any element is poisoned.
+    Value *collapseArrayShadow(ArrayType *Array, Value *Shadow,
+                            IRBuilder<> &IRB) {
+        if (!Array->getNumElements())
+            return IRB.getIntN(/* width */ 1, /* value */ 0);  // empty array → clean
+        
+        Value *FirstItem = IRB.CreateExtractValue(Shadow, 0);
+        Value *Aggregator = convertShadowToScalar(FirstItem, IRB);
+        
+        for (unsigned Idx = 1; Idx < Array->getNumElements(); ++Idx) {
+            Value *ShadowItem = IRB.CreateExtractValue(Shadow, Idx);
+            Value *ShadowInner = convertShadowToScalar(ShadowItem, IRB);
+            Aggregator = IRB.CreateOr(Aggregator, ShadowInner);
+        }
+        
+        return Aggregator;
+    }
+
+    // // [DONE] 11/05
+    /// Convert a shadow value to its flattened scalar form.
+    /// The resulting value can be used to check initialization (e.g., via comparison with 0).
+    /// Note: this does not itself apply poisoned/unpoisoned logic — just aggregation.
+    Value *convertShadowToScalar(Value *V, IRBuilder<> &IRB) {
+        Type *Ty = V->getType();
+        
+        if (StructType *Struct = dyn_cast<StructType>(Ty))
+            return collapseStructShadow(Struct, V, IRB);
+        
+        if (ArrayType *Array = dyn_cast<ArrayType>(Ty))
+            return collapseArrayShadow(Array, V, IRB);
+        
+        if (isa<VectorType>(Ty)) {
+            if (isa<ScalableVectorType>(Ty))
+                return convertShadowToScalar(IRB.CreateOrReduce(V), IRB);
+            
+            unsigned BitWidth =
+                Ty->getPrimitiveSizeInBits().getFixedValue();
+            return IRB.CreateBitCast(V, IntegerType::get(*CQMS.C, BitWidth));
+        }
+        
+        return V;
+    }
+    
+    // [DONE] 11/05
+    // Convert a scalar value to an i1 by comparing with 0
+    Value *convertToBool(Value *V, IRBuilder<> &IRB, const Twine &name = "") {
+        Type *VTy = V->getType();
+        if (!VTy->isIntegerTy()) {
+            return convertToBool(convertShadowToScalar(V, IRB), IRB, name);
+        }
+        if (VTy->getIntegerBitWidth() == 1) {
+            // Just converting a bool to a bool, so do nothing.
+            return V; // already i1, no need to invert
+        }
+        return IRB.CreateICmpNE(V, ConstantInt::get(VTy, 0), name);  // post-G1
+    }
+
+    // [DONE] 11/05
+    Type *ptrToIntPtrType(Type *PtrTy) const {
+        if (VectorType *VectTy = dyn_cast<VectorType>(PtrTy)) {
+            return VectorType::get(ptrToIntPtrType(VectTy->getElementType()),
+                                VectTy->getElementCount());
+        }
+        assert(PtrTy->isIntOrPtrTy());
+        return CQMS.IntptrTy;
+    }
+
+    // [DONE] 11/05
+    Type *getPtrToShadowPtrType(Type *IntPtrTy, Type *ShadowTy) const {
+        if (VectorType *VectTy = dyn_cast<VectorType>(IntPtrTy)) {
+          return VectorType::get(
+              getPtrToShadowPtrType(VectTy->getElementType(), ShadowTy),
+              VectTy->getElementCount());
+        }
+        assert(IntPtrTy == CQMS.IntptrTy);
+        return CQMS.PtrTy;
+    }
+
+    // [DONE] 11/05
+    Constant *constToIntPtr(Type *IntPtrTy, uint64_t C) const {
+        if (VectorType *VectTy = dyn_cast<VectorType>(IntPtrTy)) {
+            return ConstantVector::getSplat(
+                VectTy->getElementCount(),
+                constToIntPtr(VectTy->getElementType(), C));
+        }
+        assert(IntPtrTy == CQMS.IntptrTy);
+        return ConstantInt::get(CQMS.IntptrTy, C);
+    }
+
+    // [DONE] 11/05
+    /// Returns the integer shadow offset that corresponds to a given
+    /// application address, whereby:
+    ///
+    ///     Offset = (Addr & ~AndMask) ^ XorMask
+    ///     Shadow = ShadowBase + Offset
+    ///
+    /// Note: for efficiency, many shadow mappings only require use the XorMask
+    ///       and OriginBase; the AndMask and ShadowBase are often zero.
+    Value *getShadowPtrOffset(Value *Addr, IRBuilder<> &IRB) {
+        Type *IntptrTy = ptrToIntPtrType(Addr->getType());
+        Value *OffsetLong = IRB.CreatePointerCast(Addr, IntptrTy);
+
+        if (uint64_t AndMask = CQMS.MapParams->AndMask)
+            OffsetLong = IRB.CreateAnd(OffsetLong, constToIntPtr(IntptrTy, ~AndMask));
+        if (uint64_t XorMask = CQMS.MapParams->XorMask)
+            OffsetLong = IRB.CreateXor(OffsetLong, constToIntPtr(IntptrTy, XorMask));
+
+        return OffsetLong;
+    }
+
+    // [DONE] 11/05
+    /// Compute the shadow and origin addresses corresponding to a given
+    /// application address.
+    ///
+    /// Shadow = ShadowBase + Offset
+    /// Addr can be a ptr or <N x ptr>. In both cases ShadowTy the shadow type of
+    /// a single pointee.
+    /// Returns shadow_ptr or <<N x shadow_ptr>
+    Value* getShadowPtrUserspace(Value *Addr, IRBuilder<> &IRB, Type *ShadowTy, [[maybe_unused]] MaybeAlign Alignment) {
+
+        VectorType *VectTy = dyn_cast<VectorType>(Addr->getType());
+        if (!VectTy) {
+            assert(Addr->getType()->isPointerTy());
+        } else {
+            assert(VectTy->getElementType()->isPointerTy());
+        }
+
+        Value *ShadowOffset = getShadowPtrOffset(Addr, IRB); 
+        // returns the offset calculator instruction
+        // Offset = (Addr & ~AndMask) ^ XorMask
+
+        Value *ShadowLong = ShadowOffset;
+        Type *IntptrTy = ptrToIntPtrType(Addr->getType());
+
+        // if the shadow base is customized
+        if (uint64_t ShadowBase = CQMS.MapParams->ShadowBase) {
+            ShadowLong =
+                IRB.CreateAdd(ShadowLong, constToIntPtr(IntptrTy, ShadowBase));
+        }
+
+        Value *ShadowPtr = IRB.CreateIntToPtr(
+            ShadowLong, getPtrToShadowPtrType(IntptrTy, ShadowTy));
+        // inttoptr casting
+        
+        return ShadowPtr; // returns % = inttoptr i64 %ShadowLong to ptr 
+    }
+
+    
+    // [DONE] 12/05 
+    Value* getShadowPtr(Value *Addr, IRBuilder<> &IRB,
+        Type *ShadowTy, MaybeAlign Alignment, [[maybe_unused]] bool isStore) {
+        return getShadowPtrUserspace(Addr, IRB, ShadowTy, Alignment);
+    }
+
+    // [DONE] 12/05
+    /// Compute the shadow address for a given function argument.
+    ///
+    /// Shadow = ParamTLS+ArgOffset.
+    Value *getShadowPtrForArgument(IRBuilder<> &IRB, int ArgOffset) {
+        Value *Base = IRB.CreatePointerCast(CQMS.ParamTLS, CQMS.IntptrTy);
+        if (ArgOffset)
+            Base = IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
+        return IRB.CreateIntToPtr(Base, IRB.getPtrTy(0), "_cqmsarg");
+    }
+
+    // [DONE] 12/05
+    // [TODO] 12/05 Now it is just a place older since we do not propagate the return value --> clean
+    /// Compute the shadow address for a retval.
+    Value *getShadowPtrForRetval(IRBuilder<> &IRB) {
+        return IRB.CreatePointerCast(CQMS.RetvalTLS, IRB.getPtrTy(0), "_cqmsret");
+    }
+
+    // [DONE] 12/05
+    /// Set SV to be the shadow value for V.
+    void setShadow(Value *V, Value *SV) {
+        assert(!ShadowMap.count(V) && "Values may only have one shadow");
+        ShadowMap[V] = SV;
+    }
+
+    // [DONE] 12/05
+    // create clean shadow value for a given type as initialized
+    Constant *getCleanShadow(Type *OrigTy) {
+        Type *ShadowTy = getShadowTy(OrigTy);
+        if (!ShadowTy)
+        return nullptr;
+        return Constant::getNullValue(ShadowTy);
+    }
+
+    // [DONE] 12/05
+    /// Create a clean shadow value for a given value.
+    ///
+    /// Convenzione shadow: 0 = inizializzato/definito, 1 = poisoned (come MSan).
+    /// Clean shadow = tutti zeri (getNullValue).
+    Constant *getCleanShadow(Value *V) { return getCleanShadow(V->getType()); }
+
+    // [DONE] 12/05
+    /// Create a dirty shadow of a given shadow type.
+    Constant *getPoisonedShadow(Type *ShadowTy) {
+        assert(ShadowTy);
+        if (isa<IntegerType>(ShadowTy) || isa<VectorType>(ShadowTy))
+            return Constant::getAllOnesValue(ShadowTy); 
+
+        if (ArrayType *AT = dyn_cast<ArrayType>(ShadowTy)) {
+            SmallVector<Constant *, 4> Vals(AT->getNumElements(),
+                                        getPoisonedShadow(AT->getElementType()));
+            return ConstantArray::get(AT, Vals);
+        }
+
+        if (StructType *ST = dyn_cast<StructType>(ShadowTy)) {
+            SmallVector<Constant *, 4> Vals;
+            for (unsigned i = 0, n = ST->getNumElements(); i < n; i++)
+                Vals.push_back(getPoisonedShadow(ST->getElementType(i)));
+            return ConstantStruct::get(ST, Vals);
+        }
+        llvm_unreachable("Unexpected shadow type");
+    }
+
+    // [DONE] 12/05
+    /// Create a dirty shadow for a given value.
+    Constant *getPoisonedShadow(Value *V) {
+        Type *ShadowTy = getShadowTy(V);
+        if (!ShadowTy)
+            return nullptr;
+        return getPoisonedShadow(ShadowTy);
+    }
+
+    // [DONE] 12/05
+    /// Get the shadow value for a given Value.
+    ///
+    /// This function either returns the value set earlier with setShadow,
+    /// or extracts if from ParamTLS (for function arguments).
+    Value *getShadow(Value *V) {
+
+        if (Instruction *I = dyn_cast<Instruction>(V)) {
+            // Functions with no_sanitize attribute - clean
+            if (I->getMetadata(LLVMContext::MD_nosanitize))
+                return getCleanShadow(V);
+            
+            // For instructions the shadow is already stored in the map.
+            Value *Shadow = ShadowMap[V];
+            if (!Shadow) {
+                // OLD
+                //  LLVM_DEBUG(dbgs() << "No shadow: " << *V << "\n" << *(I->getParent()));
+                //  assert(Shadow && "No shadow for a value");ù
+                // NEW
+                // Se l'istruzione non è stata strumentata (es. prologo, o saltata),
+                // assumiamo che il suo valore sia pulito/inizializzato.
+                LLVM_DEBUG(dbgs() << "No shadow found for: " << *V << " -> Returning Clean Shadow\n");
+                return getCleanShadow(V);
+            }
+            return Shadow;
+        }  
+
+        // Handle fully undefined values
+        if (UndefValue *U = dyn_cast<UndefValue>(V)) {
+            Value *AllOnes = PoisonUndef ? getPoisonedShadow(V) : getCleanShadow(V);
+            LLVM_DEBUG(dbgs() << "Undef: " << *U << " ==> " << *AllOnes << "\n");
+            (void)U;
+            return AllOnes;
+        }
+
+        if (Argument *A = dyn_cast<Argument>(V)) {
+            // For arguments we compute the shadow on demand and store it in the map.
+            Value *&ShadowPtr = ShadowMap[V];
+            if (ShadowPtr) return ShadowPtr;   // if the shadow is already set, return it
+
+            Function *F = A->getParent();   // caller function
+            IRBuilder<> EntryIRB(FnPrologueEnd); // IRBuilder to insert instructions at the end of the function prologue
+            // (after parameters setup instructions)
+
+            unsigned ArgOffset = 0;
+            const DataLayout &DL = F->getDataLayout();
+
+            for (auto &FArg : F->args()) {
+
+                // Non-sized and scalable types are not supported by the shadow mapping (assume clean).
+                if (!FArg.getType()->isSized() || FArg.getType()->isScalableTy()) {
+                    LLVM_DEBUG(dbgs() << (FArg.getType()->isScalableTy()
+                                                ? "vscale not fully supported\n"
+                                                : "Arg is not sized\n"));
+                    if (A == &FArg) {
+                        ShadowPtr = getCleanShadow(V);
+                        break;
+                    }
+                    continue;
+                }
+
+                unsigned Size = FArg.hasByValAttr()
+                                    ? DL.getTypeAllocSize(FArg.getParamByValType())
+                                    : DL.getTypeAllocSize(FArg.getType());
+                
+                // Find A in the for cicle
+                if (A == &FArg) {
+                    bool Overflow = ArgOffset + Size > kParamTLSSize;
+                    
+                    // The argument is passed via memory/stack (byval). We need to copy the shadow of the argument. 
+                    if (FArg.hasByValAttr()) { 
+                        // ByVal pointer itself has clean shadow. We copy the actual
+                        // argument shadow to the underlying memory.
+                        // Figure out maximal valid memcpy alignment.
+                        const Align ArgAlign = DL.getValueOrABITypeAlignment(FArg.getParamAlign(), FArg.getParamByValType());
+                        Value *CpShadowPtr = getShadowPtr(V, EntryIRB, EntryIRB.getInt8Ty(), ArgAlign, /*isStore*/ true);
+                        
+                        // handle the overflow of the TLS buffer (assume clean).
+                        if (Overflow) {
+                            // ParamTLS overflow.
+                            EntryIRB.CreateMemSet( CpShadowPtr, Constant::getNullValue(EntryIRB.getInt8Ty()),
+                                                                                    Size, ArgAlign);
+                        } else {
+                            // memcpy shadow ByVal from Param TLS
+                            Value *Base = getShadowPtrForArgument(EntryIRB, ArgOffset);
+                            const Align CopyAlign = std::min(ArgAlign, kShadowTLSAlignment);
+                            Value *Cpy = EntryIRB.CreateMemCpy( CpShadowPtr, CopyAlign, Base, CopyAlign, Size);
+                            LLVM_DEBUG(dbgs() << "  ByValCpy: " << *Cpy << "\n");
+                            (void)Cpy;
+                        }
+                    }
+
+                    if (Overflow || FArg.hasByValAttr() || (CQMS.EagerChecks && FArg.hasAttribute(Attribute::NoUndef))) {
+                        ShadowPtr = getCleanShadow(V);
+                    } else {
+                        // Shadow over TLS
+                        Value *Base = getShadowPtrForArgument(EntryIRB, ArgOffset);
+                        ShadowPtr = EntryIRB.CreateAlignedLoad(getShadowTy(&FArg), Base, kShadowTLSAlignment);
+                    }
+                    LLVM_DEBUG(dbgs() << "  ARG:    " << FArg << " ==> " << *ShadowPtr << "\n");
+                    break;
+                }
+
+                ArgOffset += alignTo(Size, kShadowTLSAlignment);
+            }
+            assert(ShadowPtr && "Could not find shadow for an argument");
+            return ShadowPtr;
+        }
+        
+        // For everything else the shadow is one.
+        return getCleanShadow(V);
+
+    }
+    
+    // [DONE] 12/05
+    /// Get the shadow for i-th argument of the instruction I.
+    Value *getShadow(Instruction *I, int i) {
+        return getShadow(I->getOperand(i));
+    }
+
+    // [DONE] 12/05
+    /// Remember the place where a shadow check should be inserted.
+    ///
+    /// This location will be later instrumented with a check that will print a
+    /// UMR warning in runtime if the shadow value is not 0.
+    void pushShadowCheck(Value *Shadow, Instruction *OrigIns) {
+        assert(Shadow);
+        if (!InsertChecks)
+            return;
+        
+#ifndef NDEBUG
+        Type *ShadowTy = Shadow->getType();
+        assert((isa<IntegerType>(ShadowTy) || isa<VectorType>(ShadowTy) ||
+                isa<StructType>(ShadowTy) || isa<ArrayType>(ShadowTy)) &&
+            "Can only insert checks for integer, vector, and aggregate shadow types");
+#endif
+        
+        InstrumentationList.push_back(ShadowAndInsertPoint(Shadow, OrigIns));
+    }
+
+    // [DONE] 12/05
+    /// Remember the place where a shadow check should be inserted.
+    ///
+    /// This location will be later instrumented with a check that will print a
+    /// UMR warning in runtime if the value is not fully defined.
+    void insertShadowCheck(Value *Val, Instruction *OrigIns) {
+        assert(Val);
+        Value *Shadow;
+        if (ClCheckConstantShadow) {
+            Shadow = getShadow(Val);
+        } else {
+            Shadow = dyn_cast_or_null<Instruction>(getShadow(Val));
+        }
+        if (!Shadow) return;
+        pushShadowCheck(Shadow, OrigIns);
+    }
+
+    // [DONE] 12/05
+    AtomicOrdering addReleaseOrdering(AtomicOrdering a) {
+        switch (a) {
+            case AtomicOrdering::NotAtomic:
+                return AtomicOrdering::NotAtomic;
+            case AtomicOrdering::Unordered:
+            case AtomicOrdering::Monotonic:
+            case AtomicOrdering::Release:
+                return AtomicOrdering::Release;
+            case AtomicOrdering::Acquire:
+            case AtomicOrdering::AcquireRelease:
+                return AtomicOrdering::AcquireRelease;
+            case AtomicOrdering::SequentiallyConsistent:
+                return AtomicOrdering::SequentiallyConsistent;
+        }
+        llvm_unreachable("Unknown ordering");
+    }
+
+    // [DONE] 12/05
+    Value *makeAddReleaseOrderingTable(IRBuilder<> &IRB) {
+      constexpr int NumOrderings = (int)AtomicOrderingCABI::seq_cst + 1;
+      uint32_t OrderingTable[NumOrderings] = {};
+
+      OrderingTable[(int)AtomicOrderingCABI::relaxed] =
+          OrderingTable[(int)AtomicOrderingCABI::release] =
+              (int)AtomicOrderingCABI::release;
+      OrderingTable[(int)AtomicOrderingCABI::consume] =
+          OrderingTable[(int)AtomicOrderingCABI::acquire] =
+              OrderingTable[(int)AtomicOrderingCABI::acq_rel] =
+                  (int)AtomicOrderingCABI::acq_rel;
+      OrderingTable[(int)AtomicOrderingCABI::seq_cst] =
+          (int)AtomicOrderingCABI::seq_cst;
+
+      return ConstantDataVector::get(IRB.getContext(), OrderingTable);
+    }
+
+    // [DONE] 12/05
+    AtomicOrdering addAcquireOrdering(AtomicOrdering a) {
+        switch (a) {
+            case AtomicOrdering::NotAtomic:
+                return AtomicOrdering::NotAtomic;
+            case AtomicOrdering::Unordered:
+            case AtomicOrdering::Monotonic:
+            case AtomicOrdering::Acquire:
+                return AtomicOrdering::Acquire;
+            case AtomicOrdering::Release:
+            case AtomicOrdering::AcquireRelease:
+                return AtomicOrdering::AcquireRelease;
+            case AtomicOrdering::SequentiallyConsistent:
+                return AtomicOrdering::SequentiallyConsistent;
+        }
+        llvm_unreachable("Unknown ordering");
+    }
+
+    // [DONE] 12/05
+    Value *makeAddAcquireOrderingTable(IRBuilder<> &IRB)
+    {
+      constexpr int NumOrderings = (int)AtomicOrderingCABI::seq_cst + 1;
+      uint32_t OrderingTable[NumOrderings] = {};
+
+      OrderingTable[(int)AtomicOrderingCABI::relaxed] =
+          OrderingTable[(int)AtomicOrderingCABI::acquire] =
+              OrderingTable[(int)AtomicOrderingCABI::consume] =
+                  (int)AtomicOrderingCABI::acquire;
+      OrderingTable[(int)AtomicOrderingCABI::release] =
+          OrderingTable[(int)AtomicOrderingCABI::acq_rel] =
+              (int)AtomicOrderingCABI::acq_rel;
+      OrderingTable[(int)AtomicOrderingCABI::seq_cst] =
+          (int)AtomicOrderingCABI::seq_cst;
+
+      return ConstantDataVector::get(IRB.getContext(), OrderingTable);
+    }
+
+    // ------------------- Visitors.
+    using InstVisitor<CompilerQEMUMemorySanitizerVisitor>::visit;
+
+    // [DONE] 12/05
+    /// \brief Visitor entry point for each individual statement.
+    ///
+    /// This function acts as a preliminary filter and collector. It is called
+    /// for each statement in the visited basic blocks (during the first pass of runOnFunction).
+    ///
+    /// Its main tasks are:
+    /// 1. Ignore statements explicitly marked with 'nosanitize' metadata.
+    /// 2. Ignore statements that are part of the function's prologue (which should not be touched).
+    /// 3. Manage debug counters (DebugCounter) to allow bug bisecting,
+    ///     while ensuring that skipped statements still have a valid shadow (Clean).
+    /// 4. Add valid instructions to the `Instructions` list for deferred instrumentation.
+    ///
+    /// \param I The current statement to visit.
+    void visit(Instruction &I) {
+        
+        if (I.getMetadata(LLVMContext::MD_nosanitize))
+            return;
+
+        // Don't want to visit if we're in the prologue
+        if (isInPrologue(I))
+            return;
+        
+        if (!DebugCounter::shouldExecute(DebugInstrumentInstruction)) {
+            LLVM_DEBUG(dbgs() << "Skipping instruction: " << I << "\n");
+            // We still need to set the shadow and origin to clean values.
+            setShadow(&I, getCleanShadow(&I));
+            return;
+        }
+
+        Instructions.push_back(&I);
+    }
+
+    bool hasDominatingConstantStoreInBB(AllocaInst *AI, LoadInst *LI) {
+        BasicBlock *BB = LI->getParent();
+        if (AI->getParent() != BB) return false;
+
+        // Elidere il check di un load come "clean" SOLO se uno store dominante copre
+        // ESATTAMENTE la locazione letta. Usando stripInBoundsConstantOffsets() sul
+        // puntatore dello store, uno store a `gep AI, off` verrebbe ridotto ad AI e
+        // trattato come se inizializzasse tutto l'alloca (mentre scrive solo una
+        // porzione) → un load da byte non scritti sarebbe eliso erroneamente (FALSO
+        // NEGATIVO). Richiediamo quindi: stesso puntatore del load, valore costante,
+        // e dimensione dello store >= del load.
+        const DataLayout &DL = LI->getModule()->getDataLayout();
+        Value *LPtr = LI->getPointerOperand();
+        uint64_t LSize = DL.getTypeStoreSize(LI->getType());
+
+        for (Instruction *I = AI->getNextNode(); I && I != LI; I = I->getNextNode()) {
+            // Call intermedia: conservativa, abort
+            if (auto *CB = dyn_cast<CallBase>(I))
+                if (!isa<IntrinsicInst>(CB) || CB->mayWriteToMemory())
+                    return false;
+
+            if (auto *SI = dyn_cast<StoreInst>(I)) {
+                if (SI->getPointerOperand() == LPtr &&
+                    isa<Constant>(SI->getValueOperand()) &&
+                    DL.getTypeStoreSize(SI->getValueOperand()->getType()) >= LSize)
+                    return true;  // copre esattamente il load → clean
+                // Qualunque altro store può aliasare o coprire solo in parte:
+                // conservativo, non elidere.
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool isLoadFromGlobalConstant(LoadInst *LI) {
+        Value *Ptr = LI->getPointerOperand()->stripInBoundsConstantOffsets();
+        auto *GV = dyn_cast<GlobalVariable>(Ptr);
+        return GV && GV->isConstant() && GV->hasInitializer()
+            && !GV->isExternallyInitialized();
+    }
+
+    bool canProveLoadIsClean(LoadInst *LI) {
+        // [TODO] if this work, implement this flag then
+        //if (!ClSkipProvableCleanLoads) return false;
+
+        // R1
+        if (isLoadFromGlobalConstant(LI)) return true;
+
+        // R2
+        Value *Ptr = LI->getPointerOperand()->stripInBoundsConstantOffsets();
+        if (auto *AI = dyn_cast<AllocaInst>(Ptr))
+            if (hasDominatingConstantStoreInBB(AI, LI))
+                return true;
+
+        return false;
+    }
+
+    // [DONE] 12/05
+    /// Instrument LoadInst
+    ///
+    /// Loads the corresponding shadow and (optionally) origin.
+    /// Optionally, checks that the load address is fully defined.
+    void visitLoadInst(LoadInst &I) {
+        assert(I.getType()->isSized() && "Load type must have size");
+        assert(!I.getMetadata(LLVMContext::MD_nosanitize));
+
+        // [ABLAZIONE upper-bound] Non instrumentare affatto i load: shadow pulito, nessun
+        // accesso in memoria, nessun check. È il tetto del load-skipping. (default: ON)
+        if (!ClInstrumentLoads) {
+            setShadow(&I, getCleanShadow(&I));
+            if (I.isAtomic())
+                I.setOrdering(addAcquireOrdering(I.getOrdering()));
+            return;
+        }
+
+        IRBuilder<> IRB(&I);
+        Type *ShadowTy = getShadowTy(&I);
+        Value *Addr = I.getPointerOperand();
+        const Align Alignment = I.getAlign();
+
+        // Load the shadow of the value
+        Value *ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
+        LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
+        setShadow(&I, LoadedShadow);
+
+        // Register the check on the shadow of the value (deferred).
+        // Use pushShadowCheck because LoadedShadow is already a shadow IR Value.
+        //pushShadowCheck(LoadedShadow, &I);
+        // NEW: skip se provabile clean — e [ABLAZIONE] skip se ClCheckLoads=false.
+        if (!canProveLoadIsClean(&I) && ClCheckLoads) {
+            pushShadowCheck(LoadedShadow, &I);
+        }
+
+        // Optional: check that the load address is fully defined.
+        // Captures UMR on uninitialized address (e.g., `int *p; *p = 1;`).
+        if (ClCheckAccessAddress)
+            insertShadowCheck(I.getPointerOperand(), &I);
+        
+        // Atomic correctness: Instrumented loads add a shadow load BEFORE
+        // the original load. To ensure happens-before between the two, the ordering
+        // of the original load must be at least acquired.
+        if (I.isAtomic())
+            I.setOrdering(addAcquireOrdering(I.getOrdering()));
+        
+    }
+
+    // [DONE] 12/05
+    /// Instrument StoreInst
+    /// 
+    /// Just collect all the store instructions for successively instrument them with
+    /// materializeStores() function
+    void visitStoreInst(StoreInst &I) {
+        StoreList.push_back(&I);
+        // Optional: check that the store destination address is fully defined.
+        // Captures UMR on uninitialized address (e.g., `int *p; *p = 1;`).
+        if (ClCheckAccessAddress)
+            insertShadowCheck(I.getPointerOperand(), &I);
+    }
+
+    // [DONE] 12/05
+    void handleCASOrRMW(Instruction &I) {
+        assert(isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I));
+
+        IRBuilder<> IRB(&I);
+        Value *Addr = I.getOperand(0);
+        Value *Val = I.getOperand(1);
+        Value *ShadowPtr = getShadowPtr(Addr, IRB, getShadowTy(Val), Align(1), /*isStore*/ true);
+
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+
+        // Only test the conditional argument of cmpxchg instruction.
+        // The other argument can potentially be uninitialized, but we can not
+        // detect this situation reliably without possible false positives.
+        if (isa<AtomicCmpXchgInst>(I))
+            insertShadowCheck(Val, &I);
+
+        IRB.CreateStore(getCleanShadow(Val), ShadowPtr);
+        setShadow(&I, getCleanShadow(&I));
+    }
+
+    // [DONE] 12/05
+    void visitAtomicRMWInst(AtomicRMWInst &I) {
+        handleCASOrRMW(I);
+        I.setOrdering(addReleaseOrdering(I.getOrdering()));
+    }
+
+    // [DONE] 12/05
+    void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
+        handleCASOrRMW(I);
+        I.setSuccessOrdering(addReleaseOrdering(I.getSuccessOrdering()));
+    }
+
+    // [DONE] 12/05
+    /// Instrument llvm.memmove
+    ///
+    /// At this point we don't know if llvm.memmove will be inlined or not.
+    /// If we don't instrument it and it gets inlined,
+    /// our interceptor will not kick in and we will lose the memmove.
+    /// If we instrument the call here, but it does not get inlined,
+    /// we will memove the shadow twice: which is bad in case
+    /// of overlapping regions. So, we simply lower the intrinsic to a call.
+    ///
+    /// Similar situation exists for memcpy and memset.
+    void visitMemMoveInst(MemMoveInst &I) {
+        getShadow(I.getArgOperand(1)); // Ensure shadow initialized
+        IRBuilder<> IRB(&I);
+        IRB.CreateCall(CQMS.MemmoveFn,
+                    {I.getArgOperand(0), I.getArgOperand(1),
+                        IRB.CreateIntCast(I.getArgOperand(2), CQMS.IntptrTy, false)});
+        I.eraseFromParent();
+    }
+
+    // [DONE] 12/05
+    /// Instrument memcpy
+    ///
+    /// Similar to memmove: avoid copying shadow twice. This is somewhat
+    /// unfortunate as it may slowdown small constant memcpys.
+    /// FIXME: consider doing manual inline for small constant sizes and proper
+    /// alignment.
+    ///
+    /// Note: This also handles memcpy.inline, which promises no calls to external
+    /// functions as an optimization. However, with instrumentation enabled this
+    /// is difficult to promise; additionally, we know that the MSan runtime
+    /// exists and provides __cqmsan_memcpy(). Therefore, we assume that with
+    /// instrumentation it's safe to turn memcpy.inline into a call to
+    /// __cqmsan_memcpy(). Should this be wrong, such as when implementing memcpy()
+    /// itself, instrumentation should be disabled with the no_sanitize attribute.
+    void visitMemCpyInst(MemCpyInst &I) {
+        getShadow(I.getArgOperand(1)); // Ensure shadow initialized
+        IRBuilder<> IRB(&I);
+        IRB.CreateCall(CQMS.MemcpyFn,
+                    {I.getArgOperand(0), I.getArgOperand(1),
+                        IRB.CreateIntCast(I.getArgOperand(2), CQMS.IntptrTy, false)});
+        I.eraseFromParent();
+    }
+
+    // [DONE] 12/05
+    // Same as memcpy.
+    void visitMemSetInst(MemSetInst &I) {
+        IRBuilder<> IRB(&I);
+        IRB.CreateCall(
+            CQMS.MemsetFn,
+            {I.getArgOperand(0),
+            IRB.CreateIntCast(I.getArgOperand(1), IRB.getInt32Ty(), false),
+            IRB.CreateIntCast(I.getArgOperand(2), CQMS.IntptrTy, false)});
+        I.eraseFromParent();
+    }
+
+    // [DONE] 12/05
+    void visitVAStartInst(VAStartInst &I) { VAHelper->visitVAStartInst(I); }
+
+    // [DONE] 12/05
+    void visitVACopyInst(VACopyInst &I) { VAHelper->visitVACopyInst(I); }
+
+    // [DONE] 12/05
+    /// Handle vector store-like intrinsics.
+    ///
+    /// Instrument intrinsics that look like a simple SIMD store: writes memory,
+    /// has 1 pointer argument and 1 vector argument, returns void.
+    bool handleVectorStoreIntrinsic(IntrinsicInst &I) {
+        assert(I.arg_size() == 2);
+
+        IRBuilder<> IRB(&I);
+        Value *Addr = I.getArgOperand(0);
+        Value *Shadow = getShadow(&I, 1);
+        Value *ShadowPtr;
+
+        // We don't know the pointer alignment (could be unaligned SSE store!).
+        // Have to assume to worst case.
+        ShadowPtr = getShadowPtr(
+            Addr, IRB, Shadow->getType(), Align(1), /*isStore*/ true);
+        IRB.CreateAlignedStore(Shadow, ShadowPtr, Align(1));
+        
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+        
+        return true;
+    }
+
+    // [DONE] 12/05
+    /// Handle vector load-like intrinsics.
+    ///
+    /// Instrument intrinsics that look like a simple SIMD load: reads memory,
+    /// has 1 pointer argument, returns a vector.
+    bool handleVectorLoadIntrinsic(IntrinsicInst &I) {
+        assert(I.arg_size() == 1);
+
+        IRBuilder<> IRB(&I);
+        Value *Addr = I.getArgOperand(0);
+
+        Type *ShadowTy = getShadowTy(&I);
+        Value *ShadowPtr = nullptr;
+        const Align Alignment = Align(1);
+        
+        ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
+        LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
+        
+        setShadow(&I, LoadedShadow);
+        
+        // same push logic as visitLoadInst
+        pushShadowCheck(LoadedShadow, &I);
+        
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+
+        return true;
+    }
+
+    // [DONE] 12/05
+    /// Heuristically instrument unknown intrinsics.
+    ///
+    /// The main purpose of this code is to do something reasonable with all
+    /// random intrinsics we might encounter, most importantly - SIMD intrinsics.
+    /// We recognize several classes of intrinsics by their argument types and
+    /// ModRefBehaviour and apply special instrumentation when we are reasonably
+    /// sure that we know what the intrinsic does.
+    ///
+    /// We special-case intrinsics where this approach fails. See llvm.bswap
+    /// handling as an example of that.
+    bool handleUnknownIntrinsic(IntrinsicInst &I) {
+        unsigned NumArgOperands = I.arg_size();
+        if (NumArgOperands == 0)
+            return false;
+
+        if (NumArgOperands == 2 && I.getArgOperand(0)->getType()->isPointerTy() &&
+            I.getArgOperand(1)->getType()->isVectorTy() &&
+            I.getType()->isVoidTy() && !I.onlyReadsMemory()) {
+            // This looks like a vector store.
+            return handleVectorStoreIntrinsic(I);
+        }
+
+        if (NumArgOperands == 1 && I.getArgOperand(0)->getType()->isPointerTy() &&
+            I.getType()->isVectorTy() && I.onlyReadsMemory()) {
+            // This looks like a vector load.
+            return handleVectorLoadIntrinsic(I);
+        }
+
+        // FIXME: detect and handle SSE maskstore/maskload
+        return false;
+    }
+
+    // [DONE] 12/05
+    void handleLifetimeStart(IntrinsicInst &I) {
+        if (!PoisonStack)
+            return;
+        AllocaInst *AI = llvm::findAllocaForValue(I.getArgOperand(1));
+        if (!AI)
+            InstrumentLifetimeStart = false;
+        LifetimeStartList.push_back(std::make_pair(&I, AI));
+    }
+
+    // [DONE] 12/05
+    void handleStmxcsr(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Addr = I.getArgOperand(0);
+        Type *Ty = IRB.getInt32Ty();
+        Value *ShadowPtr =
+            getShadowPtr(Addr, IRB, Ty, Align(1), /*isStore*/ true);
+
+        IRB.CreateStore(getCleanShadow(Ty), ShadowPtr);
+
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+    }
+
+    // [DONE] 12/05
+    void handleLdmxcsr(IntrinsicInst &I) {
+        if (!InsertChecks)
+            return;
+
+        IRBuilder<> IRB(&I);
+        Value *Addr = I.getArgOperand(0);
+        Type *Ty = IRB.getInt32Ty();
+        const Align Alignment = Align(1);
+        Value *ShadowPtr = getShadowPtr(Addr, IRB, Ty, Alignment, /*isStore*/ false);
+
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+
+        Value *Shadow = IRB.CreateAlignedLoad(Ty, ShadowPtr, Alignment, "_ldmxcsr");
+        pushShadowCheck(Shadow, &I);
+
+    }
+    
+    // [DONE] 12/05
+    void handleMaskedExpandLoad(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Ptr = I.getArgOperand(0);
+        Value *Mask = I.getArgOperand(1);
+        Value *PassThru = I.getArgOperand(2);
+
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Ptr, &I);
+            insertShadowCheck(Mask, &I);
+        }
+
+        Type *ShadowTy = getShadowTy(&I);
+        Type *ElementShadowTy = cast<VectorType>(ShadowTy)->getElementType();
+        Value *ShadowPtr =
+            getShadowPtr(Ptr, IRB, ElementShadowTy, Align(1), /*isStore*/ false);
+
+        Value *Shadow = IRB.CreateMaskedExpandLoad(
+            ShadowTy, ShadowPtr, Mask, getShadow(PassThru), "_cqmsmaskedexpload");
+
+        setShadow(&I, Shadow);
+    }
+
+    // [DONE] 12/05
+    void handleMaskedCompressStore(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Values = I.getArgOperand(0);
+        Value *Ptr = I.getArgOperand(1);
+        Value *Mask = I.getArgOperand(2);
+
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Ptr, &I);
+            insertShadowCheck(Mask, &I);
+        }
+
+        Value *Shadow = getShadow(Values);
+        Type *ElementShadowTy =
+            getShadowTy(cast<VectorType>(Values->getType())->getElementType());
+        Value *ShadowPtr =
+            getShadowPtr(Ptr, IRB, ElementShadowTy, Align(1), /*isStore*/ true);
+
+        IRB.CreateMaskedCompressStore(Shadow, ShadowPtr, Mask);
+    }
+
+    // [DONE] 12/05
+    void handleMaskedGather(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Ptrs = I.getArgOperand(0);
+        const Align Alignment(
+            cast<ConstantInt>(I.getArgOperand(1))->getZExtValue());
+        Value *Mask = I.getArgOperand(2);
+        Value *PassThru = I.getArgOperand(3);
+
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Mask, &I);
+            Type *PtrsShadowTy = getShadowTy(Ptrs);
+            Value *MaskedPtrShadow = IRB.CreateSelect(
+                Mask, getShadow(Ptrs), Constant::getNullValue(PtrsShadowTy),
+                "_cqmsmaskedptrs");
+            pushShadowCheck(MaskedPtrShadow, &I);
+        }
+
+        Type *ShadowTy = getShadowTy(&I);
+        Type *ElementShadowTy = cast<VectorType>(ShadowTy)->getElementType();
+        Value *ShadowPtrs = getShadowPtr(
+            Ptrs, IRB, ElementShadowTy, Alignment, /*isStore*/ false);
+
+        Value *Shadow =
+            IRB.CreateMaskedGather(ShadowTy, ShadowPtrs, Alignment, Mask,
+                                getShadow(PassThru), "_cqmsmaskedgather");
+        setShadow(&I, Shadow);
+    }
+
+    // [DONE] 12/05
+    void handleMaskedScatter(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Values = I.getArgOperand(0);
+        Value *Ptrs = I.getArgOperand(1);
+        const Align Alignment(
+            cast<ConstantInt>(I.getArgOperand(2))->getZExtValue());
+        Value *Mask = I.getArgOperand(3);
+
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Mask, &I);
+            Type *PtrsShadowTy = getShadowTy(Ptrs);
+            Value *MaskedPtrShadow = IRB.CreateSelect(
+                Mask, getShadow(Ptrs), Constant::getNullValue(PtrsShadowTy),
+                "_cqmsmaskedptrs");
+            pushShadowCheck(MaskedPtrShadow, &I);
+        }
+
+        Value *Shadow = getShadow(Values);
+        Type *ElementShadowTy =
+            getShadowTy(cast<VectorType>(Values->getType())->getElementType());
+        Value *ShadowPtrs = getShadowPtr(
+            Ptrs, IRB, ElementShadowTy, Alignment, /*isStore*/ true);
+
+        IRB.CreateMaskedScatter(Shadow, ShadowPtrs, Alignment, Mask);
+    }
+
+    // [DONE] 12/05
+    void handleMaskedStore(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *V = I.getArgOperand(0);
+        Value *Ptr = I.getArgOperand(1);
+        const Align Alignment(
+            cast<ConstantInt>(I.getArgOperand(2))->getZExtValue());
+        Value *Mask = I.getArgOperand(3);
+        Value *Shadow = getShadow(V);
+        
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Ptr, &I);
+            insertShadowCheck(Mask, &I);
+        }
+        
+        Value *ShadowPtr;
+        ShadowPtr = getShadowPtr(
+            Ptr, IRB, Shadow->getType(), Alignment, /*isStore*/ true);
+
+        IRB.CreateMaskedStore(Shadow, ShadowPtr, Alignment, Mask);
+
+        return;
+    }
+
+    //[DONE] 12/05
+    void handleMaskedLoad(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *Ptr = I.getArgOperand(0);
+        const Align Alignment(
+            cast<ConstantInt>(I.getArgOperand(1))->getZExtValue());
+        Value *Mask = I.getArgOperand(2);
+        Value *PassThru = I.getArgOperand(3);
+
+        if (ClCheckAccessAddress) {
+            insertShadowCheck(Ptr, &I);
+            insertShadowCheck(Mask, &I);
+        }
+
+        Type *ShadowTy = getShadowTy(&I);
+        Value *ShadowPtr =
+            getShadowPtr(Ptr, IRB, ShadowTy, Alignment, /*isStore*/ false);
+        setShadow(&I, IRB.CreateMaskedLoad(ShadowTy, ShadowPtr, Alignment, Mask,
+                                        getShadow(PassThru), "_cqmsmaskedld"));
+
+        return;
+    }
+
+    // [DONE] 12/05 - Quite disaligned with 'vst' but just for readability (respect to msan 19.1.7)
+    /// Handle Arm NEON vector store intrinsics (vst{2,3,4}, vst1x_{2,3,4},
+    /// and vst{2,3,4}lane).
+    ///
+    /// Arm NEON vector store intrinsics have the output address (pointer) as the
+    /// last argument, with the initial arguments being the inputs (and lane
+    /// number for vst{2,3,4}lane). They return void.
+    void handleNEONVectorStoreIntrinsic(IntrinsicInst &I, bool useLane) {
+        IRBuilder<> IRB(&I);
+
+        // Don't use getNumOperands() because it includes the callee
+        int numArgOperands = I.arg_size();
+
+        // The last arg operand is the output (pointer)
+        assert(numArgOperands >= 1);
+        Value *Addr = I.getArgOperand(numArgOperands - 1);
+        assert(Addr->getType()->isPointerTy());
+        int skipTrailingOperands = 1;
+
+        if (ClCheckAccessAddress)
+            insertShadowCheck(Addr, &I);
+
+        // Second-last operand is the lane number (for vst{2,3,4}lane)
+        if (useLane) {
+            skipTrailingOperands++;
+            assert(numArgOperands >= static_cast<int>(skipTrailingOperands));
+            assert(isa<IntegerType>(
+                I.getArgOperand(numArgOperands - skipTrailingOperands)->getType()));
+        }
+
+        SmallVector<Value *, 8> ShadowArgs;
+        // All the initial operands are the inputs
+        for (int i = 0; i < numArgOperands - skipTrailingOperands; i++) {
+            assert(isa<FixedVectorType>(I.getArgOperand(i)->getType()));
+            Value *Shadow = getShadow(&I, i);
+            ShadowArgs.append(1, Shadow);
+        }
+
+        // CQMSan's GetShadowTy assumes the LHS is the type we want the shadow for
+        // e.g., for:
+        //     [[TMP5:%.*]] = bitcast <16 x i8> [[TMP2]] to i128
+        // we know the type of the output (and its shadow) is <16 x i8>.
+        //
+        // Arm NEON VST is unusual because the last argument is the output address:
+        //     define void @st2_16b(<16 x i8> %A, <16 x i8> %B, ptr %P) {
+        //         call void @llvm.aarch64.neon.st2.v16i8.p0
+        //                   (<16 x i8> [[A]], <16 x i8> [[B]], ptr [[P]])
+        // and we have no type information about P's operand. We must manually
+        // compute the type (<16 x i8> x 2).
+        FixedVectorType *OutputVectorTy = FixedVectorType::get(
+            cast<FixedVectorType>(I.getArgOperand(0)->getType())->getElementType(),
+            cast<FixedVectorType>(I.getArgOperand(0)->getType())->getNumElements() *
+                (numArgOperands - skipTrailingOperands));
+        Type *OutputShadowTy = getShadowTy(OutputVectorTy);
+
+        if (useLane)
+            ShadowArgs.append(1, I.getArgOperand(numArgOperands - skipTrailingOperands));
+
+        Value *OutputShadowPtr = getShadowPtr(
+            Addr, IRB, OutputShadowTy, Align(1), /*isStore*/ true);
+        ShadowArgs.append(1, OutputShadowPtr);
+
+        CallInst *CI =
+            IRB.CreateIntrinsic(IRB.getVoidTy(), I.getIntrinsicID(), ShadowArgs);
+        
+    }
+    
+    // [DONE] 12/05
+    void visitIntrinsicInst(IntrinsicInst &I) {
+        switch (I.getIntrinsicID()) {
+            case Intrinsic::lifetime_start:
+            handleLifetimeStart(I);
+            break;
+            case Intrinsic::launder_invariant_group:
+            case Intrinsic::strip_invariant_group:
+                setShadow(&I, getShadow(I.getArgOperand(0))); // Best C++ coverage with std::launder 
+            break;
+            case Intrinsic::masked_compressstore:
+                handleMaskedCompressStore(I);
+            break;
+            case Intrinsic::masked_expandload:
+            handleMaskedExpandLoad(I);
+            break;
+            case Intrinsic::masked_gather:
+                handleMaskedGather(I);
+            break;
+            case Intrinsic::masked_scatter:
+                handleMaskedScatter(I);
+            break;
+            case Intrinsic::masked_store:
+                handleMaskedStore(I);
+            break;
+            case Intrinsic::masked_load:
+                handleMaskedLoad(I);
+            break;
+            case Intrinsic::is_constant:
+                // The result of llvm.is.constant() is always defined.
+                setShadow(&I, getCleanShadow(&I));
+            break;
+            case Intrinsic::x86_sse_stmxcsr:
+                handleStmxcsr(I);
+            break;
+            case Intrinsic::x86_sse_ldmxcsr:
+                handleLdmxcsr(I);
+            break;
+            case Intrinsic::aarch64_neon_st1x2:
+            case Intrinsic::aarch64_neon_st1x3:
+            case Intrinsic::aarch64_neon_st1x4:
+            case Intrinsic::aarch64_neon_st2:
+            case Intrinsic::aarch64_neon_st3:
+            case Intrinsic::aarch64_neon_st4: {
+                handleNEONVectorStoreIntrinsic(I, false);
+                break;
+            }
+
+            case Intrinsic::aarch64_neon_st2lane:
+            case Intrinsic::aarch64_neon_st3lane:
+            case Intrinsic::aarch64_neon_st4lane: {
+                handleNEONVectorStoreIntrinsic(I, true);
+                break;
+            }
+
+            default:
+                if (!handleUnknownIntrinsic(I))
+                    visitInstruction(I);
+                break;
+        }
+    }
+
+    // [DONE] 12/05
+    void visitLibAtomicLoad(CallBase &CB) {
+        // Since we use getNextNode here, we can't have CB terminate the BB.
+        assert(isa<CallInst>(CB));
+
+        IRBuilder<> IRB(&CB);
+        Value *Size = CB.getArgOperand(0);
+        Value *SrcPtr = CB.getArgOperand(1);
+        Value *DstPtr = CB.getArgOperand(2);
+        Value *Ordering = CB.getArgOperand(3);
+        // Convert the call to have at least Acquire ordering to make sure
+        // the shadow operations aren't reordered before it.
+        Value *NewOrdering =
+            IRB.CreateExtractElement(makeAddAcquireOrderingTable(IRB), Ordering);
+        CB.setArgOperand(3, NewOrdering);
+
+        NextNodeIRBuilder NextIRB(&CB);
+        Value *SrcShadowPtr =
+            getShadowPtr(SrcPtr, NextIRB, NextIRB.getInt8Ty(), Align(1),
+                                /*isStore*/ false);
+        Value *DstShadowPtr =
+            getShadowPtr(DstPtr, NextIRB, NextIRB.getInt8Ty(), Align(1),
+                                /*isStore*/ true);
+
+        NextIRB.CreateMemCpy(DstShadowPtr, Align(1), SrcShadowPtr, Align(1), Size);
+    }
+
+    // [DONE] 12/05
+    void visitLibAtomicStore(CallBase &CB) {
+        IRBuilder<> IRB(&CB);
+        Value *Size = CB.getArgOperand(0);
+        Value *DstPtr = CB.getArgOperand(2);
+        Value *Ordering = CB.getArgOperand(3);
+        // Convert the call to have at least Release ordering to make sure
+        // the shadow operations aren't reordered after it.
+        Value *NewOrdering =
+            IRB.CreateExtractElement(makeAddReleaseOrderingTable(IRB), Ordering);
+        CB.setArgOperand(3, NewOrdering);
+
+        Value *DstShadowPtr =
+            getShadowPtr(DstPtr, IRB, IRB.getInt8Ty(), Align(1),
+                                /*isStore*/ true);
+
+        // Atomic store always paints clean shadow/origin. See file header.
+        IRB.CreateMemSet(DstShadowPtr, getCleanShadow(IRB.getInt8Ty()), Size,
+                        Align(1));
+    }
+
+    // [DONE] 12/05
+    void visitCallBase(CallBase &CB) {
+        assert(!CB.getMetadata(LLVMContext::MD_nosanitize));
+
+        // 1. Inline ASM dispatch
+        if (CB.isInlineAsm()) {
+            if (ClHandleAsmConservative)
+                visitAsmInstruction(CB);
+            else
+                visitInstruction(CB);
+            return;
+        }
+
+        // 2. LibAtomic dispatch (memory ops via TCG-style libcall)
+        LibFunc LF;
+        if (TLI->getLibFunc(CB, LF)) {
+            switch (LF) {
+                case LibFunc_atomic_load:
+                    if (!isa<CallInst>(CB)) {
+                        llvm::errs() << "CQMSAN -- cannot instrument invoke of "
+                                        "libatomic load. Ignoring!\n";
+                        break;
+                    }
+                    visitLibAtomicLoad(CB);
+                    return;
+                case LibFunc_atomic_store:
+                    visitLibAtomicStore(CB);
+                    return;
+                default:
+                    break;
+            }
+        }
+
+        // 3. Remove ReadOnly / Speculatable to prevent the optimizer from
+        //    dropping our instrumentation.
+        if (auto *Call = dyn_cast<CallInst>(&CB)) {
+            assert(!isa<IntrinsicInst>(Call) && "intrinsics are handled elsewhere");
+
+            AttributeMask B;
+            B.addAttribute(Attribute::Memory).addAttribute(Attribute::Speculatable);
+
+            Call->removeFnAttrs(B);
+            if (Function *Func = Call->getCalledFunction()) {
+                Func->removeFnAttrs(B);
+            }
+
+            maybeMarkSanitizerLibraryCallNoBuiltin(Call, TLI);
+        }
+
+        IRBuilder<> IRB(&CB);
+
+        bool MayCheckCall = CQMS.EagerChecks;
+
+        if (Function *Func = CB.getCalledFunction()) {
+            // __sanitizer_unaligned_{load,store} functions may be called by users
+            // and always expects shadows in the TLS. So don't check them.
+            MayCheckCall &= !Func->getName().starts_with("__sanitizer_unaligned_");
+        }
+
+        // 4. Argument shadow → param TLS
+        //    CompilerQEMU policy: no eager checks pre-call. UMR detection
+        //    is delegated to load-site checks.
+        unsigned ArgOffset = 0;
+        for (const auto &[i, A] : llvm::enumerate(CB.args())) {
+            if (!A->getType()->isSized()) continue;
+            if (A->getType()->isScalableTy()) continue;
+
+            unsigned Size = 0;
+            const DataLayout &DL = F.getDataLayout();
+
+            bool ByVal = CB.paramHasAttr(i, Attribute::ByVal);
+            bool NoUndef = CB.paramHasAttr(i, Attribute::NoUndef);
+            bool EagerCheck = MayCheckCall && !ByVal && NoUndef;
+            
+            if (EagerCheck) {
+                // check the argument directly instead store on TLS.
+                insertShadowCheck(A, &CB);
+                Size = DL.getTypeAllocSize(A->getType());
+            } else {
+                Value *ArgShadow = getShadow(A);
+                Value *ArgShadowBase = getShadowPtrForArgument(IRB, ArgOffset);
+
+                Value *Store = nullptr;
+                if (ByVal) {
+                    // ByVal arguments are passed by pointer to a copy on the stack.
+                    // We need to copy the shadow memory associated with that copy.
+                    assert(A->getType()->isPointerTy() &&
+                        "ByVal argument is not a pointer!");
+
+                    Size = DL.getTypeAllocSize(CB.getParamByValType(i));
+                    if (ArgOffset + Size > kParamTLSSize) break;
+
+                    const MaybeAlign ParamAlignment(CB.getParamAlign(i));
+                    MaybeAlign Alignment = std::nullopt;
+                    if (ParamAlignment)
+                        Alignment = std::min(*ParamAlignment, kShadowTLSAlignment);
+
+                    Value *AShadowPtr = getShadowPtr(A, IRB, IRB.getInt8Ty(),
+                                                    Alignment, /*isStore=*/false);
+
+                    Store = IRB.CreateMemCpy(ArgShadowBase, Alignment,
+                                            AShadowPtr, Alignment, Size);
+                } else {
+                    // Scalar / vector / ptr argument: store the shadow value
+                    // directly into the param TLS.
+                    Size = DL.getTypeAllocSize(A->getType());
+                    if (ArgOffset + Size > kParamTLSSize) break;
+
+                    Store = IRB.CreateAlignedStore(ArgShadow, ArgShadowBase,
+                                                kShadowTLSAlignment);
+                }
+
+                (void)Store;
+                assert(Store != nullptr);
+            }
+
+            assert(Size != 0);
+            ArgOffset += alignTo(Size, kShadowTLSAlignment);
+        }
+
+        // 5. VarArgs handling
+        FunctionType *FT = CB.getFunctionType();
+        if (FT->isVarArg()) {
+            VAHelper->visitCallBase(CB, IRB);
+        }
+
+        // 6. Return value handling — TrustReturn policy
+        //    External callees (declaration-only) → assume return value is clean.
+        //    In-module callees → read shadow from retval TLS (callee writes it).
+        if (!CB.getType()->isSized())
+            return;
+        if (isa<CallInst>(CB) && cast<CallInst>(CB).isMustTailCall())
+            return;
+
+        if (MayCheckCall && CB.hasRetAttr(Attribute::NoUndef)) {
+            setShadow(&CB, getCleanShadow(&CB));
+            return;
+        }
+
+        Function *CalledFunc = CB.getCalledFunction();
+        //bool TrustReturn = !CalledFunc || CalledFunc->isDeclaration();
+        bool TrustReturn = true;
+
+        if (TrustReturn) {
+            setShadow(&CB, getCleanShadow(&CB));
+            return;
+        }
+
+        // Pre-zero RetvalTLS: defensive for internal calls that might be
+        // nosanitized (do not write TLS). If the call is instrumented, it will overwrite.
+        // LLVM DSE deletes this store if it is dead.
+        IRBuilder<> IRBBefore(&CB);
+        IRBBefore.CreateAlignedStore(getCleanShadow(&CB), getShadowPtrForRetval(IRBBefore),
+                                        kShadowTLSAlignment);
+
+        // In-module callee: load shadow from retval TLS after the call.
+        //
+        // Two cases:
+        //  - CallInst: next instruction in the same BB
+        //  - InvokeInst: NormalDest BB (the "no exception" path). We insert the load
+        //    at the beginning of NormalDest, but only if NormalDest has a single
+        //    predecessor (avoids cross-edge complications).
+        BasicBlock::iterator NextInsn;
+        if (isa<CallInst>(CB)) {
+            NextInsn = ++CB.getIterator();
+            assert(NextInsn != CB.getParent()->end());
+        } else {
+            // InvokeInst: terminator of the BB. The retval is consumed in the
+            // NormalDest BB ("success" continuation; exception path goes to UnwindDest).
+            BasicBlock *NormalDest = cast<InvokeInst>(CB).getNormalDest();
+            if (!NormalDest->getSinglePredecessor()) {
+                // NormalDest has multiple predecessors (e.g., merged from multiple
+                // invokes). Inserting the retval-shadow load at its start would
+                // incorrectly apply to all incoming paths. Conservative fallback:
+                // assume clean. To improve precision we would need to split the edge
+                // between this BB and NormalDest (SplitEdge), but that introduces
+                // its own complications. See MSan upstream FIXME.
+                setShadow(&CB, getCleanShadow(&CB));
+                return;
+            }
+            NextInsn = NormalDest->getFirstInsertionPt();
+            assert(NextInsn != NormalDest->end() &&
+                "Could not find insertion point for retval shadow load");
+        }
+
+        IRBuilder<> IRBAfter(&*NextInsn);
+        Value *RetvalShadow = IRBAfter.CreateAlignedLoad(
+            getShadowTy(&CB),
+            getShadowPtrForRetval(IRBAfter),
+            kShadowTLSAlignment,
+            "_cqmsret");
+        setShadow(&CB, RetvalShadow);
+
+    }
+
+    // [DONE] 12/05
+    // Helper: detect if V is the result of a musttail call.
+    // Skip writing retval TLS for these (mustTail ABI propagates return directly).
+    static bool isAMustTailRetVal(Value *RetVal) {
+        if (auto *I = dyn_cast<BitCastInst>(RetVal)) {
+            RetVal = I->getOperand(0);
+        }
+        if (auto *I = dyn_cast<CallInst>(RetVal)) {
+            return I->isMustTailCall();
+        }
+        return false;
+    }
+
+    // [DONE] 12/05
+    void visitReturnInst(ReturnInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *RetVal = I.getReturnValue();
+        if (!RetVal) return;                       // void return
+        if (isAMustTailRetVal(RetVal)) return;     // mustTail: skip
+
+        Value *ShadowPtr = getShadowPtrForRetval(IRB);
+
+        bool HasNoUndef = F.hasRetAttribute(Attribute::NoUndef);
+        bool StoreShadow = !(CQMS.EagerChecks && HasNoUndef);
+        // Eager check del retval if: (a) return is noundef and the flag is active,
+        // oterwise (b) the function is "main".
+        bool EagerCheck = (CQMS.EagerChecks && HasNoUndef) || (F.getName() == "main");
+        Value *Shadow = getShadow(RetVal);
+        if (EagerCheck) {
+            // Immediate check on the return value: if shadow is clean (expected for noundef),
+            // the icmp is folded to false and DCE'd. No runtime code.
+            insertShadowCheck(RetVal, &I);
+            Shadow = getCleanShadow(RetVal);
+        }
+    
+        if (StoreShadow) {
+            IRB.CreateAlignedStore(Shadow, ShadowPtr, kShadowTLSAlignment);
+        }
+    }
+    
+    // [DONE] 11/05
+    void visitPHINode(PHINode &I) {
+        IRBuilder<> IRB(&I);
+        ShadowPHINodes.push_back(&I);
+        setShadow(&I, IRB.CreatePHI(getShadowTy(&I), I.getNumIncomingValues(), "_cqmsphi_s"));
+    }
+
+    // [DONE] 12/05
+    void poisonAllocaUserspace(AllocaInst &I, IRBuilder<> &IRB, Value *Len) {
+        if (PoisonStack && ClPoisonStackWithCall) {
+            IRB.CreateCall(CQMS.CQMSanPoisonStackFn, {&I, Len});
+        } else {
+            Value *ShadowBase = getShadowPtr(
+                &I, IRB, IRB.getInt8Ty(), Align(1), /*isStore*/ true);
+
+            Value *PoisonValue = IRB.getInt8(PoisonStack ? ClPoisonStackPattern : 0);
+            IRB.CreateMemSet(ShadowBase, PoisonValue, Len, I.getAlign());
+        }
+    }
+    
+    // [DONE] 12/05
+    void instrumentAlloca(AllocaInst &I, Instruction *InsPoint = nullptr) {
+        if (!InsPoint)
+            InsPoint = &I;
+        
+        NextNodeIRBuilder IRB(InsPoint);
+        const DataLayout &DL = F.getDataLayout();
+        TypeSize TS = DL.getTypeAllocSize(I.getAllocatedType());
+        Value *Len = IRB.CreateTypeSize(CQMS.IntptrTy, TS);
+        if (I.isArrayAllocation())
+            Len = IRB.CreateMul(Len,
+                        IRB.CreateZExtOrTrunc(I.getArraySize(), CQMS.IntptrTy));
+        
+        poisonAllocaUserspace(I, IRB, Len);
+    }
+    
+    // [DONE] 12/05
+    void visitAllocaInst(AllocaInst &I) {
+        setShadow(&I, getCleanShadow(&I));
+        // We'll get to this alloca later unless it's poisoned at the corresponding
+        // llvm.lifetime.start.
+        AllocaSet.insert(&I);
+    }
+
+    void instrumentAsmArgument(Value *Operand, Type *ElemTy, Instruction &I,
+                                IRBuilder<> &IRB, const DataLayout &DL,
+                                bool isOutput) {
+        // For each assembly argument, we check its value for being initialized.
+        // If the argument is a pointer, we assume it points to a single element
+        // of the corresponding type (or to a 8-byte word, if the type is unsized).
+        // Each such pointer is instrumented with a call to the runtime library.
+        Type *OpType = Operand->getType();
+        // Check the operand value itself.
+        insertShadowCheck(Operand, &I);
+        if (!OpType->isPointerTy() || !isOutput) {
+            assert(!isOutput);
+            return;
+        }
+        if (!ElemTy->isSized())
+            return;
+        auto Size = DL.getTypeStoreSize(ElemTy);
+        Value *SizeVal = IRB.CreateTypeSize(CQMS.IntptrTy, Size);
+        
+        // ElemTy, derived from elementtype(), does not encode the alignment of
+        // the pointer. Conservatively assume that the shadow memory is unaligned.
+        // When Size is large, avoid StoreInst as it would expand to many
+        // instructions.
+        auto ShadowPtr =
+            getShadowPtrUserspace(Operand, IRB, IRB.getInt8Ty(), Align(1));
+        if (Size <= 32)
+            IRB.CreateAlignedStore(getCleanShadow(ElemTy), ShadowPtr, Align(1));
+        else
+            IRB.CreateMemSet(ShadowPtr, ConstantInt::getNullValue(IRB.getInt8Ty()),
+                            SizeVal, Align(1));
+        
+    }
+
+    /// Get the number of output arguments returned by pointers.
+    int getNumOutputArgs(InlineAsm *IA, CallBase *CB) {
+        int NumRetOutputs = 0;
+        int NumOutputs = 0;
+        Type *RetTy = cast<Value>(CB)->getType();
+        if (!RetTy->isVoidTy()) {
+            // Register outputs are returned via the CallInst return value.
+            auto *ST = dyn_cast<StructType>(RetTy);
+            if (ST)
+                NumRetOutputs = ST->getNumElements();
+            else
+                NumRetOutputs = 1;
+        }
+        InlineAsm::ConstraintInfoVector Constraints = IA->ParseConstraints();
+        for (const InlineAsm::ConstraintInfo &Info : Constraints) {
+            switch (Info.Type) {
+                case InlineAsm::isOutput:
+                    NumOutputs++;
+                    break;
+                default:
+                    break;
+            }
+        }
+        return NumOutputs - NumRetOutputs;
+    }
+
+    void visitAsmInstruction(Instruction &I) {
+        // Conservative inline assembly handling: check for poisoned shadow of
+        // asm() arguments, then unpoison the result and all the memory locations
+        // pointed to by those arguments.
+        // An inline asm() statement in C++ contains lists of input and output
+        // arguments used by the assembly code. These are mapped to operands of the
+        // CallInst as follows:
+        //  - nR register outputs ("=r) are returned by value in a single structure
+        //  (SSA value of the CallInst);
+        //  - nO other outputs ("=m" and others) are returned by pointer as first
+        // nO operands of the CallInst;
+        //  - nI inputs ("r", "m" and others) are passed to CallInst as the
+        // remaining nI operands.
+        // The total number of asm() arguments in the source is nR+nO+nI, and the
+        // corresponding CallInst has nO+nI+1 operands (the last operand is the
+        // function to be called).
+        const DataLayout &DL = F.getDataLayout();
+        CallBase *CB = cast<CallBase>(&I);
+        IRBuilder<> IRB(&I);
+        InlineAsm *IA = cast<InlineAsm>(CB->getCalledOperand());
+        int OutputArgs = getNumOutputArgs(IA, CB);
+        // The last operand of a CallInst is the function itself.
+        int NumOperands = CB->getNumOperands() - 1;
+
+        // Check input arguments. Doing so before unpoisoning output arguments, so
+        // that we won't overwrite uninit values before checking them.
+        for (int i = OutputArgs; i < NumOperands; i++) {
+            Value *Operand = CB->getOperand(i);
+            instrumentAsmArgument(Operand, CB->getParamElementType(i), I, IRB, DL,
+                                    /*isOutput*/ false);
+        }
+
+        // Unpoison output arguments. This must happen before the actual InlineAsm
+        // call, so that the shadow for memory published in the asm() statement
+        // remains valid.
+        for (int i = 0; i < OutputArgs; i++) {
+            Value *Operand = CB->getOperand(i);
+            instrumentAsmArgument(Operand, CB->getParamElementType(i), I, IRB, DL,
+                                    /*isOutput*/ true);
+        }
+
+        setShadow(&I, getCleanShadow(&I));
+
+    }
+
+    // [DONE] 12/05
+    void visitInstruction(Instruction &I) {
+        // Everything else (instructions not explicitly handled by the visitor):
+        // opportunistic policy → no eager checks. Just mark the result as clean.
+        // UMR detection is delegated to load-site checks (visitLoadInst).
+        LLVM_DEBUG(dbgs() << "DEFAULT: " << I << "\n");
+
+        // Skip instructions whose type is not sized (e.g. void) or whose
+        // shadow type cannot be computed (rare cases like landingpad tokens).
+        // Without this guard, setShadow may fail downstream or generate
+        // malformed IR for tokens/metadata-like values.
+        if (!I.getType()->isSized())
+            return;
+
+        setShadow(&I, getCleanShadow(&I));
+    }
+    
+};
+
+// [DONE] 12/05
+struct VarArgHelperBase : public VarArgHelper {
+    Function &F;
+    CompilerQEMUMemorySanitizer &CQMS;
+    CompilerQEMUMemorySanitizerVisitor &CQMSV;
+    SmallVector<CallInst *, 16> VAStartInstrumentationList;
+    const unsigned VAListTagSize;
+
+    VarArgHelperBase(Function &F, CompilerQEMUMemorySanitizer &CQMS,
+                    CompilerQEMUMemorySanitizerVisitor &CQMSV, unsigned VAListTagSize)
+        : F(F), CQMS(CQMS), CQMSV(CQMSV), VAListTagSize(VAListTagSize) {}
+
+    Value *getShadowAddrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset) {
+        Value *Base = IRB.CreatePointerCast(CQMS.VAArgTLS, CQMS.IntptrTy);
+        return IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
+    }
+
+    /// Compute the shadow address for a given va_arg.
+    Value *getShadowPtrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset) {
+        Value *Base = IRB.CreatePointerCast(CQMS.VAArgTLS, CQMS.IntptrTy);
+        Base = IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
+        return IRB.CreateIntToPtr(Base, CQMS.PtrTy, "_cqmsarg_va_s");
+    }
+
+    /// Compute the shadow address for a given va_arg.
+    Value *getShadowPtrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset,
+                                    unsigned ArgSize) {
+        // Make sure we don't overflow __cqmsan_va_arg_tls.
+        if (ArgOffset + ArgSize > kParamTLSSize)
+            return nullptr;
+        return getShadowPtrForVAArgument(IRB, ArgOffset);
+    }
+
+    void CleanUnusedTLS(IRBuilder<> &IRB, Value *ShadowBase,
+                      unsigned BaseOffset) {
+        // The tails of __cqmsan_va_arg_tls is not large enough to fit full
+        // value shadow, but it will be copied to backup anyway. Make it
+        // clean.
+        if (BaseOffset >= kParamTLSSize)
+            return;
+        Value *TailSize =
+            ConstantInt::getSigned(IRB.getInt32Ty(), kParamTLSSize - BaseOffset);
+        IRB.CreateMemSet(ShadowBase, ConstantInt::getNullValue(IRB.getInt8Ty()),
+                        TailSize, Align(8));
+    }
+
+    void unpoisonVAListTagForInst(IntrinsicInst &I) {
+        IRBuilder<> IRB(&I);
+        Value *VAListTag = I.getArgOperand(0);
+        const Align Alignment = Align(8);
+        auto ShadowPtr = CQMSV.getShadowPtr(
+            VAListTag, IRB, IRB.getInt8Ty(), Alignment, /*isStore*/ true);
+
+        // Unpoison the whole __va_list_tag.
+        IRB.CreateMemSet(ShadowPtr, Constant::getNullValue(IRB.getInt8Ty()),
+                        VAListTagSize, Alignment, false);
+    }
+
+    void visitVAStartInst(VAStartInst &I) override {
+        if (F.getCallingConv() == CallingConv::Win64)
+            return;
+        VAStartInstrumentationList.push_back(&I);
+        unpoisonVAListTagForInst(I);
+    }
+
+    void visitVACopyInst(VACopyInst &I) override {
+        if (F.getCallingConv() == CallingConv::Win64)
+            return;
+        unpoisonVAListTagForInst(I);
+    }
+};
+
+// [DONE] 12/05
+/// AMD64-specific implementation of VarArgHelper.
+struct VarArgAMD64Helper : public VarArgHelperBase {
+  // An unfortunate workaround for asymmetric lowering of va_arg stuff.
+  // See a comment in visitCallBase for more details.
+  static const unsigned AMD64GpEndOffset = 48; // AMD64 ABI Draft 0.99.6 p3.5.7
+  static const unsigned AMD64FpEndOffsetSSE = 176;
+  // If SSE is disabled, fp_offset in va_list is zero.
+  static const unsigned AMD64FpEndOffsetNoSSE = AMD64GpEndOffset;
+
+  unsigned AMD64FpEndOffset;
+  AllocaInst *VAArgTLSCopy = nullptr;
+  AllocaInst *VAArgTLSOriginCopy = nullptr;
+  Value *VAArgOverflowSize = nullptr;
+
+  enum ArgKind { AK_GeneralPurpose, AK_FloatingPoint, AK_Memory };
+
+    VarArgAMD64Helper(Function &F, CompilerQEMUMemorySanitizer &CQMS,
+                        CompilerQEMUMemorySanitizerVisitor &CQMSV)
+        : VarArgHelperBase(F, CQMS, CQMSV, /*VAListTagSize=*/24) {
+
+        AMD64FpEndOffset = AMD64FpEndOffsetSSE;
+        for (const auto &Attr : F.getAttributes().getFnAttrs()) {
+            if (Attr.isStringAttribute() &&
+                (Attr.getKindAsString() == "target-features")) {
+                    if (Attr.getValueAsString().contains("-sse"))
+                    AMD64FpEndOffset = AMD64FpEndOffsetNoSSE;
+                    break;
+            }
+        }
+    }
+
+    ArgKind classifyArgument(Value *arg) {
+        // A very rough approximation of X86_64 argument classification rules.
+        Type *T = arg->getType();
+        if (T->isX86_FP80Ty())
+            return AK_Memory;
+        if (T->isFPOrFPVectorTy())
+            return AK_FloatingPoint;
+        if (T->isIntegerTy() && T->getPrimitiveSizeInBits() <= 64)
+            return AK_GeneralPurpose;
+        if (T->isPointerTy())
+            return AK_GeneralPurpose;
+            
+        return AK_Memory;
+    }
+
+    // [DONE] 12/05
+    // For VarArg functions, store the argument shadow in an ABI-specific format
+    // that corresponds to va_list layout.
+    // We do this because Clang lowers va_arg in the frontend, and this pass
+    // only sees the low level code that deals with va_list internals.
+    // A much easier alternative (provided that Clang emits va_arg instructions)
+    // would have been to associate each live instance of va_list with a copy of
+    // CQMSanParamTLS, and extract shadow on va_arg() call in the argument list
+    // order.
+    void visitCallBase(CallBase &CB, IRBuilder<> &IRB) override {
+        unsigned GpOffset = 0;
+        unsigned FpOffset = AMD64GpEndOffset;
+        unsigned OverflowOffset = AMD64FpEndOffset;
+        const DataLayout &DL = F.getDataLayout();
+
+        for (const auto &[ArgNo, A] : llvm::enumerate(CB.args())) {
+            bool IsFixed = ArgNo < CB.getFunctionType()->getNumParams();
+            bool IsByVal = CB.paramHasAttr(ArgNo, Attribute::ByVal);
+
+            if (IsByVal) {
+                // ByVal arguments always go to the overflow area.
+                // Fixed arguments passed through the overflow area will be stepped
+                // over by va_start, so don't count them towards the offset.
+                if (IsFixed)
+                    continue;
+
+                assert(A->getType()->isPointerTy());
+                Type *RealTy = CB.getParamByValType(ArgNo);
+                uint64_t ArgSize = DL.getTypeAllocSize(RealTy);
+                uint64_t AlignedSize = alignTo(ArgSize, 8);
+                unsigned BaseOffset = OverflowOffset;
+                Value *ShadowBase = getShadowPtrForVAArgument(IRB, OverflowOffset);
+                OverflowOffset += AlignedSize;
+
+                if (OverflowOffset > kParamTLSSize) {
+                    CleanUnusedTLS(IRB, ShadowBase, BaseOffset);
+                    continue; // We have no space to copy shadow there.
+                }
+
+                Value *ShadowPtr =
+                    CQMSV.getShadowPtr(A, IRB, IRB.getInt8Ty(), kShadowTLSAlignment,
+                                    /*isStore*/ false);
+
+                IRB.CreateMemCpy(ShadowBase, kShadowTLSAlignment, ShadowPtr,
+                                kShadowTLSAlignment, ArgSize);
+
+            } else {
+                ArgKind AK = classifyArgument(A);
+                if (AK == AK_GeneralPurpose && GpOffset >= AMD64GpEndOffset)
+                    AK = AK_Memory;
+                if (AK == AK_FloatingPoint && FpOffset >= AMD64FpEndOffset)
+                    AK = AK_Memory;
+
+                Value *ShadowBase = nullptr;
+                switch (AK) {
+                    case AK_GeneralPurpose:
+                        ShadowBase = getShadowPtrForVAArgument(IRB, GpOffset);
+                        GpOffset += 8;
+                        assert(GpOffset <= kParamTLSSize);
+                        break;
+
+                    case AK_FloatingPoint:
+                        ShadowBase = getShadowPtrForVAArgument(IRB, FpOffset);
+                        FpOffset += 16;
+                        assert(FpOffset <= kParamTLSSize);
+                        break;
+
+                    case AK_Memory: {
+                        if (IsFixed)
+                            continue;
+
+                        uint64_t ArgSize = DL.getTypeAllocSize(A->getType());
+                        uint64_t AlignedSize = alignTo(ArgSize, 8);
+                        unsigned BaseOffset = OverflowOffset;
+                        ShadowBase = getShadowPtrForVAArgument(IRB, OverflowOffset);
+
+                        OverflowOffset += AlignedSize;
+                        if (OverflowOffset > kParamTLSSize) {
+                            // We have no space to copy shadow there.
+                            CleanUnusedTLS(IRB, ShadowBase, BaseOffset);
+                            continue;
+                        }
+                        break;
+                    }
+                }
+
+                // Take fixed arguments into account for GpOffset and FpOffset,
+                // but don't actually store shadows for them.
+                // TODO(glider): don't call get*PtrForVAArgument() for them.
+                if (IsFixed)
+                    continue;
+
+                Value *Shadow = CQMSV.getShadow(A);
+                IRB.CreateAlignedStore(Shadow, ShadowBase, kShadowTLSAlignment);
+            }
+        }
+
+        Constant *OverflowSize =
+            ConstantInt::get(IRB.getInt64Ty(), OverflowOffset - AMD64FpEndOffset);
+
+        IRB.CreateStore(OverflowSize, CQMS.VAArgOverflowSizeTLS);
+    }
+
+    void finalizeInstrumentation() override {
+        assert(!VAArgOverflowSize && !VAArgTLSCopy &&
+            "finalizeInstrumentation called twice");
+        
+        if (!VAStartInstrumentationList.empty()) {
+            // If there is a va_start in this function, make a backup copy of
+            // va_arg_tls somewhere in the function entry block.
+            IRBuilder<> IRB(CQMSV.FnPrologueEnd);
+            
+            VAArgOverflowSize =
+                IRB.CreateLoad(IRB.getInt64Ty(), CQMS.VAArgOverflowSizeTLS);
+            
+            Value *CopySize = IRB.CreateAdd(
+                ConstantInt::get(CQMS.IntptrTy, AMD64FpEndOffset), VAArgOverflowSize);
+            
+            VAArgTLSCopy = IRB.CreateAlloca(Type::getInt8Ty(*CQMS.C), CopySize);
+            VAArgTLSCopy->setAlignment(kShadowTLSAlignment);
+
+            IRB.CreateMemSet(VAArgTLSCopy, Constant::getNullValue(IRB.getInt8Ty()),
+                            CopySize, kShadowTLSAlignment, false);
+
+            Value *SrcSize = IRB.CreateBinaryIntrinsic(
+                Intrinsic::umin, CopySize,
+                ConstantInt::get(CQMS.IntptrTy, kParamTLSSize));
+            IRB.CreateMemCpy(VAArgTLSCopy, kShadowTLSAlignment, CQMS.VAArgTLS,
+                            kShadowTLSAlignment, SrcSize);
+            
+        }
+
+        // Instrument va_start.
+        // Copy va_list shadow from the backup copy of the TLS contents.
+        for (CallInst *OrigInst : VAStartInstrumentationList) {
+            NextNodeIRBuilder IRB(OrigInst);
+            Value *VAListTag = OrigInst->getArgOperand(0);
+
+            Value *RegSaveAreaPtrPtr = IRB.CreateIntToPtr(
+                IRB.CreateAdd(IRB.CreatePtrToInt(VAListTag, CQMS.IntptrTy),
+                                ConstantInt::get(CQMS.IntptrTy, 16)),
+                CQMS.PtrTy);
+            
+            Value *RegSaveAreaPtr = IRB.CreateLoad(CQMS.PtrTy, RegSaveAreaPtrPtr);
+
+            Value *RegSaveAreaShadowPtr;
+            const Align Alignment = Align(16);
+            RegSaveAreaShadowPtr =
+                    CQMSV.getShadowPtr(RegSaveAreaPtr, IRB, IRB.getInt8Ty(),
+                                        Alignment, /*isStore*/ true);
+
+            IRB.CreateMemCpy(RegSaveAreaShadowPtr, Alignment, VAArgTLSCopy, Alignment,
+                            AMD64FpEndOffset);
+            
+            Value *OverflowArgAreaPtrPtr = IRB.CreateIntToPtr(
+                IRB.CreateAdd(IRB.CreatePtrToInt(VAListTag, CQMS.IntptrTy),
+                                ConstantInt::get(CQMS.IntptrTy, 8)),
+                CQMS.PtrTy);
+
+            Value *OverflowArgAreaPtr =
+                IRB.CreateLoad(CQMS.PtrTy, OverflowArgAreaPtrPtr);
+
+            Value *OverflowArgAreaShadowPtr =
+                CQMSV.getShadowPtr(OverflowArgAreaPtr, IRB, IRB.getInt8Ty(),
+                                        Alignment, /*isStore*/ true);
+
+            Value *SrcPtr = IRB.CreateConstGEP1_32(IRB.getInt8Ty(), VAArgTLSCopy,
+                                                    AMD64FpEndOffset);
+            IRB.CreateMemCpy(OverflowArgAreaShadowPtr, Alignment, SrcPtr, Alignment,
+                            VAArgOverflowSize);
+            
+        }
+    }
+};
+
+// [DONE] 12/05
+/// A no-op implementation of VarArgHelper.
+///
+/// Used on architectures other than x86_64 where CQMSAN does not propagate
+/// shadow through variadic boundaries. To reduce false positives, this
+/// implementation still unpoisons the va_list_tag at va_start; everything
+/// else is a true no-op.
+struct VarArgNoOpHelper : public VarArgHelper {
+    Function &F;
+    CompilerQEMUMemorySanitizer &CQMS;
+    CompilerQEMUMemorySanitizerVisitor &CQMSV;
+
+    VarArgNoOpHelper(Function &F, CompilerQEMUMemorySanitizer &CQMS,
+                     CompilerQEMUMemorySanitizerVisitor &CQMSV)
+        : F(F), CQMS(CQMS), CQMSV(CQMSV) {}
+
+    void visitCallBase(CallBase &CB, IRBuilder<> &IRB) override {}
+
+    void visitVAStartInst(VAStartInst &I) override {
+        // Unpoison the va_list_tag to avoid false positives.
+        // 32 bytes is a conservative size for most non-x86_64 ABIs
+        // (AArch64 va_list_tag = 32B; smaller for PPC64/MIPS64).
+        IRBuilder<> IRB(&I);
+        Value *VAListTag = I.getArgOperand(0);
+        const Align Alignment = Align(8);
+
+        Value *ShadowPtr = CQMSV.getShadowPtr(
+            VAListTag, IRB, IRB.getInt8Ty(), Alignment, /*isStore*/ true);
+
+        IRB.CreateMemSet(ShadowPtr,
+                         Constant::getNullValue(IRB.getInt8Ty()),
+                         ConstantInt::get(CQMS.IntptrTy, 32),
+                         Alignment);
+    }
+
+    void visitVACopyInst(VACopyInst &I) override {}
+
+    void finalizeInstrumentation() override {}
+};
+
+} // end anonymous namespace 
+
+static VarArgHelper *CreateVarArgHelper(Function &Func, CompilerQEMUMemorySanitizer &CQMSan,
+                                        CompilerQEMUMemorySanitizerVisitor &Visitor) {
+    // VarArg handling is only implemented on AMD64. False positives are
+    // possible on other platforms (mitigated by VarArgNoOpHelper unpoisoning
+    // the va_list_tag at va_start).
+    Triple TargetTriple(Func.getParent()->getTargetTriple());
+
+    if (TargetTriple.getArch() == Triple::x86_64)
+        return new VarArgAMD64Helper(Func, CQMSan, Visitor);
+
+    return new VarArgNoOpHelper(Func, CQMSan, Visitor);
+}
+
+
+//____________________________________________________________________________________//
+//____________________________________________________________________________________//
+//_________________________________ LLVM PASS ________________________________________//
+//____________________________________________________________________________________//
+//____________________________________________________________________________________//
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+    return {LLVM_PLUGIN_API_VERSION, "CompilerQEMUMemorySanitizer",
+            LLVM_VERSION_STRING,
+        [](PassBuilder &PB) {
+            // 1) Manual registration: `opt -passes=cqmsan`
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "cqmsan") {
+                        CompilerQEMUMemorySanitizerOptions Opts(ClKeepGoing, ClEagerChecks);
+                        MPM.addPass(CompilerQEMUMemorySanitizerPass(Opts));
+                        return true;
+                    }
+                    return false;
+                });
+
+            // 2) Auto-injection at the END of the optimization pipeline
+            //    (consistent with MSan upstream, which uses OptimizerLastEPCallback
+            //    to prevent post-instrumentation optimizations from interfering
+            //    with shadow propagation).
+            PB.registerOptimizerLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel Level) {
+                    CompilerQEMUMemorySanitizerOptions Opts(ClKeepGoing, ClEagerChecks);
+                    MPM.addPass(CompilerQEMUMemorySanitizerPass(Opts));
+
+                    // Replicate MSan upstream's post-instrumentation cleanup pipeline.
+                    // Source: clang/lib/CodeGen/BackendUtil.cpp::addSanitizers().
+                    if (Level != OptimizationLevel::O0) {
+                        MPM.addPass(RequireAnalysisPass<GlobalsAA, Module>());
+                        FunctionPassManager FPM;
+                        FPM.addPass(EarlyCSEPass(true /* mem-ssa */));
+                        FPM.addPass(InstCombinePass());
+                        FPM.addPass(JumpThreadingPass());
+                        FPM.addPass(GVNPass());
+                        FPM.addPass(InstCombinePass());
+                        MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+                    }
+                });
+        }
+    };
+}
+
+// [DONE] 18/05
+bool CompilerQEMUMemorySanitizer::sanitizeFunction(Function &F,
+                                                   TargetLibraryInfo &TLI) {
+    if (F.getName() == kCQMSanModuleCtorName)
+        return false;
+
+    if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
+        return false;
+
+    CompilerQEMUMemorySanitizerVisitor Visitor(F, *this, TLI);
+
+    // Clear out memory attributes.
+    AttributeMask B;
+    B.addAttribute(Attribute::Memory).addAttribute(Attribute::Speculatable);
+    F.removeFnAttrs(B);
+
+    return Visitor.runOnFunction();
+}
