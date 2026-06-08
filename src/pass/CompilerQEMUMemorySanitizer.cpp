@@ -169,37 +169,42 @@ static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
 // a garbage address typically results in SEGV, but still happen
 // (e.g. only lower bits of address are garbage, or the access happens
 // early at program startup where malloc-ed memory is more likely to
-// be zeroed. As of 2012-08-28 this flag adds 20% slowdown.
+// be zeroed). As of 2012-08-28 this flag adds 20% slowdown.
 static cl::opt<bool> ClCheckAccessAddress(
     "cqmsan-check-access-address",
     cl::desc("report accesses through a pointer which has poisoned shadow"),
-    cl::Hidden, cl::init(false));  // [PERF FIX-5] era true; MSan upstream usa false.
-                                   // Toglie il check shadow sull'INDIRIZZO ad ogni
-                                   // load/store (overhead su pointer-chasing) → +6%
-                                   // ex/s su pcre2, a parità col default MSan.
+    cl::Hidden, cl::init(false));  // MSan upstream uses false.
+                                   // Removes the shadow check on the ADDRESS at every
+                                   // load/store
 
-// [ABLAZIONE — misura dell'UPPER BOUND, vedi WORKFLOW_upperbound_noload.md]
-// Default true ⇒ comportamento di tesi INVARIATO. Servono SOLO a misurare il tetto di
-// throughput del load-skipping (NON sono detector reali: con false si perde detection).
+
+/// ------------------------------------- ABLATION ------------------------------------- ///
+
+
+// [UPPER BOUND measurement]
+// Default true ⇒ default behavior UNCHANGED. They are ONLY used to measure the load-skipping throughput 
+// ceiling (they are NOT real detectors: setting false loses detection).
 //
-// ClInstrumentLoads=false : visitLoadInst non instrumenta affatto i load (niente
-//   shadow-load, niente check; lo shadow del load è trattato come pulito). È il tetto:
-//   nessuna ottimizzazione di load-skipping può andare più veloce di così.
-//   Selezione per-target: -mllvm -cqmsan-instrument-loads=0
+// ClInstrumentLoads=false : visitLoadInst does not instrument loads at all (no
+// shadow-loads, no checks; the load shadow is treated as clean). This is the ceiling:
+// no load-skipping optimization can go faster than this.
+// Per-target selection: -mllvm -cqmsan-instrument-loads=0
 static cl::opt<bool> ClInstrumentLoads(
     "cqmsan-instrument-loads",
     cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
     cl::Hidden, cl::init(true));
 
-// ClCheckLoads=false : lo shadow del load viene caricato ma il check UMR NON viene
-//   emesso. Senza propagazione lo shadow-load diventa morto e la DCE lo rimuove ⇒ in
-//   pratica collassa su instrument-loads=0 (utile per confermare che il costo è lo
-//   shadow-load, non il solo branch del check).
-//   Selezione per-target: -mllvm -cqmsan-check-loads=0
+// ClCheckLoads=false : the shadow load is loaded but the UMR check is NOT
+// issued. Without propagation, the shadow load becomes dead and the DCE removes it ⇒ in
+// practice, it collapses on instrument-loads=0 (useful for confirming that the cost is the
+// shadow load, not just the check branch).
+// Per-target selection: -mllvm -cqmsan-check-loads=0
 static cl::opt<bool> ClCheckLoads(
     "cqmsan-check-loads",
     cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
     cl::Hidden, cl::init(true));
+
+/// ------------------------------------------------------------------------------------ ///
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
@@ -1275,9 +1280,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     // [DONE] 12/05
     /// Create a clean shadow value for a given value.
-    ///
-    /// Convenzione shadow: 0 = inizializzato/definito, 1 = poisoned (come MSan).
-    /// Clean shadow = tutti zeri (getNullValue).
     Constant *getCleanShadow(Value *V) { return getCleanShadow(V->getType()); }
 
     // [DONE] 12/05
@@ -1581,19 +1583,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         BasicBlock *BB = LI->getParent();
         if (AI->getParent() != BB) return false;
 
-        // Elidere il check di un load come "clean" SOLO se uno store dominante copre
-        // ESATTAMENTE la locazione letta. Usando stripInBoundsConstantOffsets() sul
-        // puntatore dello store, uno store a `gep AI, off` verrebbe ridotto ad AI e
-        // trattato come se inizializzasse tutto l'alloca (mentre scrive solo una
-        // porzione) → un load da byte non scritti sarebbe eliso erroneamente (FALSO
-        // NEGATIVO). Richiediamo quindi: stesso puntatore del load, valore costante,
-        // e dimensione dello store >= del load.
+        // Strip a load as "clean" ONLY if a dominant store covers
+        // EXACTLY the location read. Using stripInBoundsConstantOffsets() on the
+        // store pointer, a store at `gep AI, off` would be stripped to AI and
+        // treated as if it initialized the entire alloca (while only writing a
+        // portion) → a load from unwritten bytes would be incorrectly stripped (FALSE
+        // NEGATIVE). We therefore require: same pointer as the load, constant value,
+        // and store size >= the load.
         const DataLayout &DL = LI->getModule()->getDataLayout();
         Value *LPtr = LI->getPointerOperand();
         uint64_t LSize = DL.getTypeStoreSize(LI->getType());
 
         for (Instruction *I = AI->getNextNode(); I && I != LI; I = I->getNextNode()) {
-            // Call intermedia: conservativa, abort
+            // Intermediate call: conservative, abort
             if (auto *CB = dyn_cast<CallBase>(I))
                 if (!isa<IntrinsicInst>(CB) || CB->mayWriteToMemory())
                     return false;
@@ -1602,9 +1604,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 if (SI->getPointerOperand() == LPtr &&
                     isa<Constant>(SI->getValueOperand()) &&
                     DL.getTypeStoreSize(SI->getValueOperand()->getType()) >= LSize)
-                    return true;  // copre esattamente il load → clean
-                // Qualunque altro store può aliasare o coprire solo in parte:
-                // conservativo, non elidere.
+                    return true; 
                 return false;
             }
         }
@@ -1642,9 +1642,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     void visitLoadInst(LoadInst &I) {
         assert(I.getType()->isSized() && "Load type must have size");
         assert(!I.getMetadata(LLVMContext::MD_nosanitize));
-
-        // [ABLAZIONE upper-bound] Non instrumentare affatto i load: shadow pulito, nessun
-        // accesso in memoria, nessun check. È il tetto del load-skipping. (default: ON)
+        
+        // [ABLATION upper-bound] Do not instrment loads: shadow clean, no memory access, no checks.
+        // This is the limit of the optimization of the load instrumentation.
         if (!ClInstrumentLoads) {
             setShadow(&I, getCleanShadow(&I));
             if (I.isAtomic())
@@ -1665,7 +1665,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // Register the check on the shadow of the value (deferred).
         // Use pushShadowCheck because LoadedShadow is already a shadow IR Value.
         //pushShadowCheck(LoadedShadow, &I);
-        // NEW: skip se provabile clean — e [ABLAZIONE] skip se ClCheckLoads=false.
+        // NEW: skip se provabile clean — skip if ClCheckLoads=false.
         if (!canProveLoadIsClean(&I) && ClCheckLoads) {
             pushShadowCheck(LoadedShadow, &I);
         }
