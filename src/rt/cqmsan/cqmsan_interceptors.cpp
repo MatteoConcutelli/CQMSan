@@ -1234,6 +1234,7 @@ INTERCEPTOR(int, pthread_tryjoin_np, void *thread, void **retval) {
 
 INTERCEPTOR(int, pthread_timedjoin_np, void *thread, void **retval,
             const struct timespec *abstime) {
+  ENSURE_CQMSAN_INITED();
   int res = REAL(pthread_timedjoin_np)(thread, retval, abstime);
   if (!res && retval)
     __cqmsan_unpoison(retval, sizeof(*retval));
