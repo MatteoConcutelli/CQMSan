@@ -79,3 +79,13 @@ TODO
 Attribution and provenance of all third-party code: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 [aflqmsan]: https://github.com/Heinzeen/AFL-QMSan
+
+## Citation
+
+If you use CQMSan, please cite this:
+```bibtex
+[TODO]
+```
+
+[qmsan]: https://github.com/Heinzeen/QMSan
+
