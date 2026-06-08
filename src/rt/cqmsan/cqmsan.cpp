@@ -683,8 +683,11 @@ void __cqmsan_init() {
   SetCheckUnwindCallback(CheckUnwind);
 
   __sanitizer_set_report_path(__sanitizer::common_flags()->log_path);
-  
-  InitializeInterceptors();
+
+  // Disable interceptors running with CQMSAN_NO_INTERCEPTORS=1
+  if (!getenv("CQMSAN_NO_INTERCEPTORS"))
+      InitializeInterceptors();
+
   InstallAtForkHandler();
   CheckASLR();
   InitTlsSize();
