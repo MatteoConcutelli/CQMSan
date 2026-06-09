@@ -1501,7 +1501,7 @@ int OnExit() {
   do {                                                      \
     /*GET_STORE_STACK_TRACE;*/                                  \
     /*CopyShadowAndOrigin(to, from, size, &stack);*/        \
-    //__cqmsan_unpoison(to, size + 1);                         \
+    /*__cqmsan_unpoison(to, size + 1); */                       \
   } while (false)
 
 #define COMMON_INTERCEPTOR_MMAP_IMPL(ctx, mmap, addr, length, prot, flags, fd, \
