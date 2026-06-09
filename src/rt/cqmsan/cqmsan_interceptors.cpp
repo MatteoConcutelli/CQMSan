@@ -1806,7 +1806,7 @@ void InitializeInterceptors() {
 
   
   //InitializeCommonInterceptors();
-  InitializeMemintrinsicsInterceptors();
+  InitializeMemintrinsicInterceptors();
   InitializeSignalInterceptors();
 
   INTERCEPT_FUNCTION(posix_memalign);
