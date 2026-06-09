@@ -315,7 +315,7 @@ INTERCEPTOR(char *, strncpy, char *dest, const char *src, SIZE_T n) {
     copy_size++;  // trailing \0
   char *res = REAL(strncpy)(dest, src, n);
   //CopyShadowAndOrigin(dest, src, copy_size, &stack);
-  __cqmsan_unpoison(dest + copy_size, n - copy_size);
+  __cqmsan_unpoison(dest, copy_size);
   return res;
 }
 
