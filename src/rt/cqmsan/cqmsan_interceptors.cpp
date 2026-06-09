@@ -1423,16 +1423,18 @@ int OnExit() {
 #define COMMON_INTERCEPTOR_UNPOISON_PARAM(count)  \
   UnpoisonParam(count)
 #define COMMON_INTERCEPTOR_WRITE_RANGE(ctx, ptr, size) \
-  __cqmsan_unpoison(ptr, size)
+  do {} while (false)
+//  __cqmsan_unpoison(ptr, size)
 
-#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
-  CHECK_UNPOISONED_CTX(ctx, ptr, size)
-//NEW : disable read checks in common interceptors to avoid false positives
 //#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
-//  do {} while (false)
+//  CHECK_UNPOISONED_CTX(ctx, ptr, size)
+// Disable read checks in common interceptors to avoid false positives
+#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
+  do {} while (false)
 
 #define COMMON_INTERCEPTOR_INITIALIZE_RANGE(ptr, size) \
-  __cqmsan_unpoison(ptr, size)
+  do {} while (false)
+//  __cqmsan_unpoison(ptr, size)
 #define COMMON_INTERCEPTOR_ENTER(ctx, func, ...)              \
   if (cqmsan_init_is_running)                                   \
     return REAL(func)(__VA_ARGS__);                           \
@@ -1499,7 +1501,7 @@ int OnExit() {
   do {                                                      \
     /*GET_STORE_STACK_TRACE;*/                                  \
     /*CopyShadowAndOrigin(to, from, size, &stack);*/        \
-    __cqmsan_unpoison(to, size + 1);                         \
+    //__cqmsan_unpoison(to, size + 1);                         \
   } while (false)
 
 #define COMMON_INTERCEPTOR_MMAP_IMPL(ctx, mmap, addr, length, prot, flags, fd, \
