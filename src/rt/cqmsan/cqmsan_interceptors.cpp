@@ -1423,8 +1423,7 @@ int OnExit() {
 #define COMMON_INTERCEPTOR_UNPOISON_PARAM(count)  \
   UnpoisonParam(count)
 #define COMMON_INTERCEPTOR_WRITE_RANGE(ctx, ptr, size) \
-  do {} while (false)
-//  __cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
 
 //#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
 //  CHECK_UNPOISONED_CTX(ctx, ptr, size)
@@ -1433,8 +1432,8 @@ int OnExit() {
   do {} while (false)
 
 #define COMMON_INTERCEPTOR_INITIALIZE_RANGE(ptr, size) \
-  do {} while (false)
-//  __cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
+
 #define COMMON_INTERCEPTOR_ENTER(ctx, func, ...)              \
   if (cqmsan_init_is_running)                                   \
     return REAL(func)(__VA_ARGS__);                           \
@@ -1501,7 +1500,7 @@ int OnExit() {
   do {                                                      \
     /*GET_STORE_STACK_TRACE;*/                                  \
     /*CopyShadowAndOrigin(to, from, size, &stack);*/        \
-    /*__cqmsan_unpoison(to, size + 1); */                       \
+    __cqmsan_unpoison(to, size + 1);                        \
   } while (false)
 
 #define COMMON_INTERCEPTOR_MMAP_IMPL(ctx, mmap, addr, length, prot, flags, fd, \
@@ -1512,7 +1511,7 @@ int OnExit() {
 
 #include "../sanitizer_common/sanitizer_platform_interceptors.h"
 #include "../sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc"
-#include "../sanitizer_common/sanitizer_common_interceptors.inc"
+//#include "../sanitizer_common/sanitizer_common_interceptors.inc"
 
 static __sanitizer::uptr signal_impl(int signo, __sanitizer::uptr cb);
 static int sigaction_impl(int signo, const __sanitizer_sigaction *act,
@@ -1805,7 +1804,9 @@ void InitializeInterceptors() {
 
   new(interceptor_ctx()) InterceptorContext();
 
-  InitializeCommonInterceptors();
+  // [TEST]
+  //InitializeCommonInterceptors();
+  InitializeCommonIntrinsicInterceptors();
   InitializeSignalInterceptors();
 
   INTERCEPT_FUNCTION(posix_memalign);
