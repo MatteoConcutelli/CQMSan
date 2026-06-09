@@ -4,7 +4,7 @@ CQMSan brings QMSan's _**opportunistic**_ UMR-detection strategy from the **bina
 
 |       | Level | Model | Completeness |
 |  ---  |  ---  |  ---  |      ---     |
-|**MemorySanitizer (MSan)** | compile | propagates shadow, checks at _sinks_ | precise (oracle) |
+|**[MemorySanitizer (MSan)][msan]** | compile | propagates shadow, checks at _sinks_ | precise (oracle) |
 |**[QMSan][qmsan]**| binary (QEMU) | opportunistic, checks at loads | incomplete by design |
 | **CQMSan** (this) | compile | opportunistic, checks at loads | inclomplete by design |
 
@@ -87,5 +87,6 @@ If you use CQMSan, please cite this:
 [TODO]
 ```
 
+[msan]: https://github.com/google/sanitizers/wiki/memorysanitizer
 [qmsan]: https://github.com/Heinzeen/QMSan
 
