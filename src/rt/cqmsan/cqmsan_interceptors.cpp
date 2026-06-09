@@ -309,15 +309,13 @@ INTERCEPTOR(char *, strcpy, char *dest, const char *src) {
 
 INTERCEPTOR(char *, strncpy, char *dest, const char *src, SIZE_T n) {
   ENSURE_CQMSAN_INITED();
-  // OLD:
   //GET_STORE_STACK_TRACE;
-  //SIZE_T copy_size = internal_strnlen(src, n);
-  //if (copy_size < n)
-  //  copy_size++;  // trailing \0
+  SIZE_T copy_size = internal_strnlen(src, n);
+  if (copy_size < n)
+    copy_size++;  // trailing \0
   char *res = REAL(strncpy)(dest, src, n);
   //CopyShadowAndOrigin(dest, src, copy_size, &stack);
-  //__cqmsan_unpoison(dest + copy_size, n - copy_size);
-  __cqmsan_unpoison(dest, n);
+  __cqmsan_unpoison(dest + copy_size, n - copy_size);
   return res;
 }
 
