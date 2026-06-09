@@ -1805,8 +1805,8 @@ void InitializeInterceptors() {
   new(interceptor_ctx()) InterceptorContext();
 
   
-  InitializeCommonInterceptors();
-  InitializeCommonIntrinsicInterceptors();
+  //InitializeCommonInterceptors();
+  InitializeMemintrinsicsInterceptors();
   InitializeSignalInterceptors();
 
   INTERCEPT_FUNCTION(posix_memalign);
