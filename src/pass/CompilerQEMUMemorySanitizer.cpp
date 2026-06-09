@@ -208,7 +208,6 @@ static cl::opt<bool> ClInstrumentStores(
     "cqmsan-instrument-stores",
     cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
     cl::Hidden, cl::init(true));
-)
 
 /// ------------------------------------------------------------------------------------ ///
 
