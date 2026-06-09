@@ -1511,7 +1511,7 @@ int OnExit() {
 
 #include "../sanitizer_common/sanitizer_platform_interceptors.h"
 #include "../sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc"
-//#include "../sanitizer_common/sanitizer_common_interceptors.inc"
+#include "../sanitizer_common/sanitizer_common_interceptors.inc"
 
 static __sanitizer::uptr signal_impl(int signo, __sanitizer::uptr cb);
 static int sigaction_impl(int signo, const __sanitizer_sigaction *act,
@@ -1804,8 +1804,8 @@ void InitializeInterceptors() {
 
   new(interceptor_ctx()) InterceptorContext();
 
-  // [TEST]
-  //InitializeCommonInterceptors();
+  
+  InitializeCommonInterceptors();
   InitializeCommonIntrinsicInterceptors();
   InitializeSignalInterceptors();
 
