@@ -334,7 +334,9 @@ INTERCEPTOR(char *, stpcpy, char *dest, const char *src) {
 INTERCEPTOR(char *, stpncpy, char *dest, const char *src, SIZE_T n) {
   ENSURE_CQMSAN_INITED();
   //GET_STORE_STACK_TRACE;
-  SIZE_T copy_size = Min(n, internal_strnlen(src, n) + (n>strnlen?1:0));
+  SIZE_T copy_size = internal_strnlen(src, n);
+  if (copy_size < n)
+    copy_size++;  // trailing \0
   char *res = REAL(stpncpy)(dest, src, n);
   //CopyShadowAndOrigin(dest, src, copy_size, &stack);
   __cqmsan_unpoison(dest, copy_size);
