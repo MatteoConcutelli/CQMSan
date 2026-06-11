@@ -1145,7 +1145,7 @@ static void SignalAction(int signo, void *si, void *uc) {
   SignalHandlerScope signal_handler_scope;
   ScopedThreadLocalStateBackup stlsb;
   UnpoisonParam(3);
-  __cqmsan_unpoison(si, sizeof(__sanitizer_sigaction));
+  __cqmsan_unpoison(si, sizeof(__sanitizer_siginfo));
   __cqmsan_unpoison(uc, ucontext_t_sz(uc));
 
   typedef void (*sigaction_cb)(int, void *, void *);
