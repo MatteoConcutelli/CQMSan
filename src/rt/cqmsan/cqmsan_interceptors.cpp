@@ -297,11 +297,11 @@ INTERCEPTOR(void, malloc_stats, void) {
 
 INTERCEPTOR(char *, strcpy, char *dest, const char *src) {
   ENSURE_CQMSAN_INITED();
-  GET_STORE_STACK_TRACE;
+  //GET_STORE_STACK_TRACE;
   SIZE_T n = __sanitizer::internal_strlen(src);
   CHECK_UNPOISONED_STRING(src + n, 0);
   char *res = REAL(strcpy)(dest, src);
-  CopyShadowAndOrigin(dest, src, n + 1, &stack);
+  //CopyShadowAndOrigin(dest, src, n + 1, &stack);
   __cqmsan_unpoison(dest, n + 1);
 
   return res;
@@ -309,13 +309,13 @@ INTERCEPTOR(char *, strcpy, char *dest, const char *src) {
 
 INTERCEPTOR(char *, strncpy, char *dest, const char *src, SIZE_T n) {
   ENSURE_CQMSAN_INITED();
-  GET_STORE_STACK_TRACE;
+  //GET_STORE_STACK_TRACE;
   SIZE_T copy_size = internal_strnlen(src, n);
   if (copy_size < n)
     copy_size++;  // trailing \0
   char *res = REAL(strncpy)(dest, src, n);
-  CopyShadowAndOrigin(dest, src, copy_size, &stack);
-  __cqmsan_unpoison(dest, copy_size);
+  //CopyShadowAndOrigin(dest, src, copy_size, &stack);
+  __cqmsan_unpoison(dest, n); // unpoison the whole destination buffer since strncpy write \0
   return res;
 }
 
@@ -1502,8 +1502,8 @@ int OnExit() {
 
 #define COMMON_INTERCEPTOR_COPY_STRING(ctx, to, from, size) \
   do {                                                      \
-    GET_STORE_STACK_TRACE;                                  \
-    CopyShadowAndOrigin(to, from, size, &stack);            \
+    /*GET_STORE_STACK_TRACE;*/                                  \
+    /*CopyShadowAndOrigin(to, from, size, &stack);*/            \
     __cqmsan_unpoison(to, size + 1);                        \
     /* To disable: (void)(ctx); (void)(to); (void)(from); (void)(size); */ \
   } while (false)
