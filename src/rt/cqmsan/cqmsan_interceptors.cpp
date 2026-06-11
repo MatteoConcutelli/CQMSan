@@ -1425,8 +1425,8 @@ int OnExit() {
 #define COMMON_INTERCEPTOR_UNPOISON_PARAM(count)  \
   UnpoisonParam(count)
 #define COMMON_INTERCEPTOR_WRITE_RANGE(ctx, ptr, size) \
-  do { (void)(ctx); (void)(ptr); (void)(size); } while (false)
-//__cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
+// To disable:  do { (void)(ctx); (void)(ptr); (void)(size); } while (false)
 
 //#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
 //  CHECK_UNPOISONED_CTX(ctx, ptr, size)
@@ -1435,8 +1435,8 @@ int OnExit() {
   do {} while (false)
 
 #define COMMON_INTERCEPTOR_INITIALIZE_RANGE(ptr, size) \
-  do { (void)(ptr); (void)(size); } while (false)
-//__cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
+// To disable : do { (void)(ptr); (void)(size); } while (false)
 
 #define COMMON_INTERCEPTOR_ENTER(ctx, func, ...)              \
   if (cqmsan_init_is_running)                                   \
@@ -1502,10 +1502,10 @@ int OnExit() {
 
 #define COMMON_INTERCEPTOR_COPY_STRING(ctx, to, from, size) \
   do {                                                      \
-    /*GET_STORE_STACK_TRACE;*/                                  \
-    /*CopyShadowAndOrigin(to, from, size, &stack);*/        \
-    /*__cqmsan_unpoison(to, size + 1); */                       \
-    (void)(ctx); (void)(to); (void)(from); (void)(size); \
+    GET_STORE_STACK_TRACE;                                  \
+    CopyShadowAndOrigin(to, from, size, &stack);            \
+    __cqmsan_unpoison(to, size + 1);                        \
+    /* To disable: (void)(ctx); (void)(to); (void)(from); (void)(size); */ \
   } while (false)
 
 #define COMMON_INTERCEPTOR_MMAP_IMPL(ctx, mmap, addr, length, prot, flags, fd, \
