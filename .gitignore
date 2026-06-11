@@ -1,0 +1,3 @@
+# Copia locale del runtime/pass upstream di MemorySanitizer (LLVM), usata solo come
+# riferimento per i confronti — non va versionata.
+original-msan/
