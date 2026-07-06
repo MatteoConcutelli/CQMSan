@@ -124,7 +124,7 @@ static cl::opt<bool> ClColdWarning(
     // It may be hot if the program is small and the warning is triggered often.
 
 static cl::opt<bool> ClTrustReturn(
-    "cmsan-trust-return",
+    "cqmsan-trust-return",
     cl::desc("Trust return values from functions"),
     cl::Hidden, cl::init(false));
 
@@ -233,7 +233,7 @@ static cl::opt<bool> ClInstrumentStores(
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
-    cl::Hidden, cl::init(false)); // avoid using TLS for noundef arguments
+    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
     // upstream default false
 
 static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
