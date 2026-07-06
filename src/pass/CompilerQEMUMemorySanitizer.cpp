@@ -32,6 +32,7 @@
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -61,6 +62,8 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/SpecialCaseList.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -69,6 +72,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -113,11 +117,25 @@ static cl::opt<bool> ClFastWarning(
              "fuzzing campaigns; not recommended for developer debugging."),
     cl::Hidden, cl::init(true));
 
+static cl::opt<bool> ClColdWarning(
+    "cqmsan-cold-warning",
+    cl::desc("Mark warning handler as cold (keep out of I-cache hot path)."),
+    cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
+    // It may be hot if the program is small and the warning is triggered often.
+
+static cl::opt<bool> ClTrustReturn(
+    "cmsan-trust-return",
+    cl::desc("Trust return values from functions"),
+    cl::Hidden, cl::init(false));
+
+
 // [OPTIMIZATION] 22/05
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
-    cl::desc("Group shadow checks per basic block (Opt-3)."),
-    cl::Hidden, cl::init(true));
+    cl::desc("Group shadow checks per basic block."),
+    cl::Hidden, cl::init(false)); 
+    // TODO - aggiustare la soundness di isImmediateEssentialSink()
+    // per poter usare questa flag
 
 static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
     cl::desc("keep going after reporting a UMR"),
@@ -155,11 +173,13 @@ static cl::opt<bool> ClHandleLifetimeIntrinsics("cqmsan-handle-lifetime-intrinsi
 // passed into an assembly call. Note that this may cause false positives.
 // Because it's impossible to figure out the array sizes, we can only unpoison
 // the first sizeof(type) bytes for each type* pointer.
-// [TODO] implement the use of this
-// Reduces the false positives
 static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
     cl::desc("conservative handling of inline assembly"), cl::Hidden,
-    cl::init(true));
+    cl::init(false));
+    // when true it reduces the false positives, but it may cause false negatives 
+    // (e.g. if the inline assembly does not initialize the entire array)
+    // So in opportunistic mode we leave it to false, to avoid false negatives and 
+    // let the fuzzer find and filter the False positives. 
 
 
 /* CHECK SHADOW ADDRESS */
@@ -213,7 +233,8 @@ static cl::opt<bool> ClInstrumentStores(
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
-    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
+    cl::Hidden, cl::init(false)); // avoid using TLS for noundef arguments
+    // upstream default false
 
 static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
 cl::desc(
@@ -352,7 +373,7 @@ private:
     void createUserspaceApi(Module &M, const TargetLibraryInfo &TLI);
     void initializeCallbacks(Module &M, const TargetLibraryInfo &TLI);
 
-    bool Recover; // If true, continue after the error
+    bool Recover; // If true, continue after the error (ClKeepGoing)
     bool EagerChecks;
 
     Triple TargetTriple; // Linux/x86_64 etc.
@@ -444,8 +465,8 @@ template <class T> T getOptOrDefault(const cl::opt<T> &Opt, T Default) {
 // [DONE] 11/05
 CompilerQEMUMemorySanitizerOptions::CompilerQEMUMemorySanitizerOptions(bool R,
     bool EagerChecks)
-    : Recover(getOptOrDefault(ClKeepGoing, R)),
-      EagerChecks(getOptOrDefault(ClEagerChecks, EagerChecks)) {}
+    : Recover(ClKeepGoing),
+      EagerChecks(ClEagerChecks) {}
 
 // [DONE] 11/05
 PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
@@ -505,16 +526,19 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     IRBuilder<> IRB(*C);
 
     StringRef WarningFnName = Recover ? "__cqmsan_warning" : "__cqmsan_warning_noreturn";
-    // [OPTIMIZATION] 22/05
+    // [OPTIMIZATION] 22/05 - warning fast sarebbe anche no_return..
     WarningFnName = ClFastWarning ? "__cqmsan_warning_fast" : WarningFnName;
 
-    // [OPTIMIZATION] 22/05 — Opt-1/Opt-5: warning handler attributes
+    // [OPTIMIZATION] 22/05 — warning handler attributes
     // Cold: keep warning callsites out of I-cache hot path (.text.cold layout)
     // NoUnwind: warning never throws C++ exceptions, omit unwind tables
     // NoReturn: only for the noreturn variant — fast/keep-going return normally
-    AttributeList Attrs = AttributeList()
-        .addFnAttribute(*C, Attribute::Cold)
-        .addFnAttribute(*C, Attribute::NoUnwind);
+    AttributeList Attrs = AttributeList();
+    if (ClColdWarning) {
+        Attrs.addFnAttribute(*C, Attribute::Cold);
+    }
+
+    //    .addFnAttribute(*C, Attribute::NoUnwind);
     if (!Recover && !ClFastWarning) {
         Attrs = Attrs.addFnAttribute(*C, Attribute::NoReturn);
     }
@@ -918,6 +942,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         LLVM_DEBUG(dbgs() << "DONE:\n" << F);
     }
 
+    // TODO - controllare la correttezza di questa funzione, non è chiaro se sia sufficiente per tutti i casi
     bool isImmediateEssentialSink(Instruction *OrigIns) const {
         // Indirect call: ptr deve essere checked PRIMA della call execution
         if (auto *CB = dyn_cast<CallBase>(OrigIns))
@@ -932,12 +957,14 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     void materializeChecks() {
+
         if (!ClBBCoalescedChecks) {
-            materializeChecksLegacy();   // codice attuale
+            materializeChecksLegacy();   // original path
             return;
         }
 
-        // Opt-3 path
+        // TODO - risolvere la soundness di isImmediateEssentialSink() per arrivare in questo punto
+        // Optimization: coalesce all checks in a BB into a single check at the terminator.
         DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;
 
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
@@ -1885,14 +1912,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return false;
     }
 
-    // [DONE] 12/05
+    // [DONE] 06/07
     void handleLifetimeStart(IntrinsicInst &I) {
         if (!PoisonStack)
             return;
-        AllocaInst *AI = llvm::findAllocaForValue(I.getArgOperand(1));
+        AllocaInst *AI = llvm::findAllocaForValue(I.getArgOperand(1)); // puntatore = arg1
         if (!AI)
-            InstrumentLifetimeStart = false;
-        LifetimeStartList.push_back(std::make_pair(&I, AI));
+            InstrumentLifetimeStart = false;   // fallback: rinuncia al lifetime-based
+        else
+            LifetimeStartList.push_back(std::make_pair(&I, AI));
     }
 
     // [DONE] 12/05
@@ -2312,7 +2340,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         // 4. Argument shadow → param TLS
-        //    CompilerQEMU policy: no eager checks pre-call. UMR detection
+        //    policy: no eager checks pre-call. UMR detection
         //    is delegated to load-site checks.
         unsigned ArgOffset = 0;
         for (const auto &[i, A] : llvm::enumerate(CB.args())) {
@@ -2379,7 +2407,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         // 6. Return value handling — TrustReturn policy
-        //    External callees (declaration-only) → assume return value is clean.
+        //    if ClTrustReturn → clean; else → pre-zero + load dalla TLS
         //    In-module callees → read shadow from retval TLS (callee writes it).
         if (!CB.getType()->isSized())
             return;
@@ -2393,9 +2421,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
         Function *CalledFunc = CB.getCalledFunction();
         //bool TrustReturn = !CalledFunc || CalledFunc->isDeclaration();
-        bool TrustReturn = true;
+        //bool TrustReturn = true;
 
-        if (TrustReturn) {
+        if (ClTrustReturn) {
             setShadow(&CB, getCleanShadow(&CB));
             return;
         }
@@ -2481,8 +2509,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             insertShadowCheck(RetVal, &I);
             Shadow = getCleanShadow(RetVal);
         }
-    
-        if (StoreShadow) {
+        
+        
+        if (StoreShadow && !ClTrustReturn) {
             IRB.CreateAlignedStore(Shadow, ShadowPtr, kShadowTLSAlignment);
         }
     }
@@ -3053,6 +3082,70 @@ llvmGetPassPluginInfo() {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Ignorelist (equivalente compile-time del "no_lib" di QMSan).
+//
+// QMSan filtra a RUNTIME in base al PC (msan-giovese.h): se l'accesso non
+// proviene dall'app, salta il check. CQMSan è caricato via -fpass-plugin
+// (non -fsanitize=memory), quindi non passa per l'ignorelist standard di
+// Clang: il filtro va fatto qui, dentro il pass, PRIMA di costruire il
+// Visitor (che oggi imposta Attribute::SanitizeMemory incondizionatamente,
+// vedi il costruttore di CompilerQEMUMemorySanitizerVisitor).
+//
+// Attivazione (opt-in, nessun cambiamento di comportamento se non impostata):
+//   CQMSAN_IGNORELIST=/path/to/list.txt
+// Sintassi del file = SpecialCaseList standard di LLVM (stessa di
+// -fsanitize-ignorelist=), righe senza intestazione [sezione] valgono per
+// qualunque query:
+//   src:GLOB   esclude ogni funzione il cui file sorgente (da debug info)
+//              soddisfa il glob, es.  src:*runner.cc
+//   fun:GLOB   esclude ogni funzione il cui nome IR soddisfa il glob
+//
+// Una funzione ignorata NON riceve alcuna instrumentazione (niente poison
+// di stack/alloca, niente shadow-store, niente check sui load) — è come se
+// il plugin non fosse stato applicato a quella funzione. Attenzione: senza
+// propagazione (0=init) una funzione ignorata che scrive un buffer lascia
+// la sua shadow a 0 (clean); se quei dati erano uninit e vengono letti da
+// codice instrumentato, l'UMR è perso (falso negativo). Va usata solo su
+// codice che non produce valori consumati a valle (harness/driver), MAI
+// sulle funzioni bersaglio della fuzzing.
+// ---------------------------------------------------------------------------
+static const SpecialCaseList *getCQMSanIgnorelist() {
+    static const std::unique_ptr<SpecialCaseList> List = [] {
+        const char *Path = std::getenv("CQMSAN_IGNORELIST");
+        if (!Path || !*Path)
+            return std::unique_ptr<SpecialCaseList>();
+
+        auto FS = vfs::getRealFileSystem();
+        std::string Error;
+        std::unique_ptr<SpecialCaseList> SCL =
+            SpecialCaseList::create({Path}, *FS, Error);
+        if (!SCL)
+            report_fatal_error(Twine("CQMSAN_IGNORELIST: impossibile leggere '") +
+                                Path + "': " + Error);
+        return SCL;
+    }();
+    return List.get();
+}
+
+static bool isFunctionIgnored(const Function &F) {
+    const SpecialCaseList *IgnoreList = getCQMSanIgnorelist();
+    if (!IgnoreList)
+        return false; // env var non impostata: nessun cambiamento di comportamento.
+
+    if (IgnoreList->inSection("cqmsan", "fun", F.getName()))
+        return true;
+
+    if (const DISubprogram *SP = F.getSubprogram()) {
+        std::string SourceFile = SP->getFilename().str();
+        if (!SP->getDirectory().empty())
+            SourceFile = SP->getDirectory().str() + "/" + SourceFile;
+        if (IgnoreList->inSection("cqmsan", "src", SourceFile))
+            return true;
+    }
+    return false;
+}
+
 // [DONE] 18/05
 bool CompilerQEMUMemorySanitizer::sanitizeFunction(Function &F,
                                                    TargetLibraryInfo &TLI) {
@@ -3060,6 +3153,9 @@ bool CompilerQEMUMemorySanitizer::sanitizeFunction(Function &F,
         return false;
 
     if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
+        return false;
+
+    if (isFunctionIgnored(F))
         return false;
 
     CompilerQEMUMemorySanitizerVisitor Visitor(F, *this, TLI);
