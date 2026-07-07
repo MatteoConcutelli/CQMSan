@@ -535,7 +535,7 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     // NoReturn: only for the noreturn variant — fast/keep-going return normally
     AttributeList Attrs = AttributeList();
     if (ClColdWarning) {
-        Attrs.addFnAttribute(*C, Attribute::Cold);
+        Attrs = Attrs.addFnAttribute(*C, Attribute::Cold);
     }
 
     //    .addFnAttribute(*C, Attribute::NoUnwind);
@@ -2340,7 +2340,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         // 4. Argument shadow → param TLS
-        //    policy: no eager checks pre-call. UMR detection
+        //    policy: eager checks pre-call. UMR detection
         //    is delegated to load-site checks.
         unsigned ArgOffset = 0;
         for (const auto &[i, A] : llvm::enumerate(CB.args())) {
