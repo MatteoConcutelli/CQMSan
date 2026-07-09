@@ -58,13 +58,13 @@ SANITIZER_INTERFACE_ATTRIBUTE __attribute__((noreturn)) void
 __cqmsan_warning_with_origin_noreturn(u32 origin);
 
 SANITIZER_INTERFACE_ATTRIBUTE
-void __cqmsan_maybe_warning_1(u8 s, u32 o);
+void __cqmsan_maybe_warning_fast_1(u8 s, u32 o);
 SANITIZER_INTERFACE_ATTRIBUTE
-void __cqmsan_maybe_warning_2(u16 s, u32 o);
+void __cqmsan_maybe_warning_fast_2(u16 s, u32 o);
 SANITIZER_INTERFACE_ATTRIBUTE
-void __cqmsan_maybe_warning_4(u32 s, u32 o);
+void __cqmsan_maybe_warning_fast_4(u32 s, u32 o);
 SANITIZER_INTERFACE_ATTRIBUTE
-void __cqmsan_maybe_warning_8(u64 s, u32 o);
+void __cqmsan_maybe_warning_fast_8(u64 s, u32 o);
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __cqmsan_maybe_store_origin_1(u8 s, void *p, u32 o);

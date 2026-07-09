@@ -91,14 +91,17 @@ using namespace llvm;
 
 #define DEBUG_TYPE "cqmsan"
 
+// TODO - not used
 DEBUG_COUNTER(DebugInsertCheck, "cqmsan-insert-check",
     "Controls which checks to insert");
 
 DEBUG_COUNTER(DebugInstrumentInstruction, "cqmsan-instrument-instruction",
     "Controls which instruction to instrument");
 
-static const Align kShadowTLSAlignment = Align(8);
 
+// Thread Local Storage buffers handling //
+
+static const Align kShadowTLSAlignment = Align(8);
 // These constants must be kept in sync with the ones in cqmsan.h.
 static const unsigned kParamTLSSize = 800;
 static const unsigned kRetvalTLSSize = 800;
@@ -106,9 +109,10 @@ static const unsigned kRetvalTLSSize = 800;
 // Accesses sizes are powers of two: 1, 2, 4, 8.
 static const size_t kNumberOfAccessSizes = 4;
 
-// ------------------------------- FLAGS ----------------------------------
 
-// [OPTIMIZATION] 22/05
+// ------------- FLAGS --------------- //
+
+// [OPTIMIZATION]
 static cl::opt<bool> ClFastWarning(
     "cqmsan-fast-warning",
     cl::desc("Use bitmap-only warning handler (__cqmsan_warning_fast) instead "
@@ -117,25 +121,28 @@ static cl::opt<bool> ClFastWarning(
              "fuzzing campaigns; not recommended for developer debugging."),
     cl::Hidden, cl::init(true));
 
+// [PARAMETIZATION]
 static cl::opt<bool> ClColdWarning(
     "cqmsan-cold-warning",
     cl::desc("Mark warning handler as cold (keep out of I-cache hot path)."),
-    cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
+    cl::Hidden, cl::init(true)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
     // It may be hot if the program is small and the warning is triggered often.
 
+// [PARAMETRIZATION]
+// TODO - understand if this is correct for CQMSan
 static cl::opt<bool> ClTrustReturn(
     "cqmsan-trust-return",
     cl::desc("Trust return values from functions"),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
 
 
-// [OPTIMIZATION] 22/05
+// [OPTIMIZATION - PARAMETRIZATION]
+// TODO - understand if this is correct for CQMSan
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
     cl::desc("Group shadow checks per basic block."),
     cl::Hidden, cl::init(false)); 
-    // TODO - aggiustare la soundness di isImmediateEssentialSink()
-    // per poter usare questa flag
+    // TODO - adjust and validate the soundess of isImmediateEssentialSink()
 
 static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
     cl::desc("keep going after reporting a UMR"),
@@ -198,11 +205,9 @@ static cl::opt<bool> ClCheckAccessAddress(
                                    // load/store
 
 
-/// ------------------------------------- ABLATION ------------------------------------- ///
-
-
-// [UPPER BOUND measurement]
-// Default true ⇒ default behavior UNCHANGED. They are ONLY used to measure the load-skipping throughput 
+// [ABLATION]
+// Default true ⇒ default behavior UNCHANGED. 
+// ONLY used to measure the load-skipping throughput 
 // ceiling (they are NOT real detectors: setting false loses detection).
 //
 // ClInstrumentLoads=false : visitLoadInst does not instrument loads at all (no
@@ -236,6 +241,8 @@ static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
     // upstream default false
 
+// When there will be too much instrumentation, use callbacks instead of inline checks.
+// This is a heuristic to avoid code size blowup and compile time blowup.
 static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
 cl::desc(
     "If the function being instrumented requires more than "
@@ -272,7 +279,6 @@ static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
     cl::Hidden, cl::init(0));
 
 
-
 // [Disallignment with 19.x version] --> disabled for benchmarking vs 19.1.7 msan that does not have this flag
 // [NOT IMPLEMENTED]
 // Reduce false negatives since it precisely poisrons partially undefined constant vectors.
@@ -285,12 +291,14 @@ static cl::opt<bool> ClPoisonUndefVectors("cqmsan-poison-undef-vectors",
     cl::Hidden, cl::init(false));
 
 // "Use of uninitialized value at %s...", stack_name
-// [TODO] implement the use of this
+// TODO - not used
 static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
     cl::desc("Print name of local stack variable"),
     cl::Hidden, cl::init(false));
 
 /* ----- END FLAGS ----- */
+
+
 
 // Define the constructor name and the init function name of the runtime library
 const char kCQMSanModuleCtorName[] = "cqmsan.module_ctor";
@@ -320,7 +328,7 @@ namespace {
         0               // ShadowBase
     };
 
-    /* [TODO] future work add platform-specific memory map parameters*/
+    /* [TODO] future work add platform-specific memory map parameters */
 
 };
 
@@ -362,7 +370,7 @@ private:
     friend struct CompilerQEMUMemorySanitizerVisitor;
 
     // Handle variadic functions and their calling convenctions (for different architectures).
-    // [DONE] For now Linux x86_64 only
+    // TODO - For now Linux x86_64 only
     friend struct VarArgHelperBase;
     friend struct VarArgAMD64Helper;
     // For unknown architectures
@@ -406,7 +414,7 @@ private:
     /// CQMSan runtime replacements for memmove, memcpy and memset.
     FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
 
-    // [TODO]: implement this
+    // TODO - implement this
     FunctionCallee CQMSanInstrumentAsmStoreFn;
     
     // Memory map parameters used in application-to-shadow calculation.
@@ -418,7 +426,7 @@ private:
 
 };
 
-// [DONE] 11/05
+// [DONE]
 /// \brief Inserts a global constructor into the module to initialize the CQMSan runtime.
 ///
 /// This function ensures that the runtime initialization function
@@ -462,13 +470,13 @@ template <class T> T getOptOrDefault(const cl::opt<T> &Opt, T Default) {
 
 // ___________________________CompilerQEMUMemorySanitizer___________________________//
 
-// [DONE] 11/05
+// [DONE]
 CompilerQEMUMemorySanitizerOptions::CompilerQEMUMemorySanitizerOptions(bool R,
     bool EagerChecks)
     : Recover(ClKeepGoing),
       EagerChecks(ClEagerChecks) {}
 
-// [DONE] 11/05
+// [DONE]
 PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
 
     insertModuleCtor(M); // ensure the __cqmsan_init is called before main()
@@ -498,7 +506,7 @@ PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysis
     return PA;
 }
 
-// [DONE] 11/05
+// [DONE]
 void CompilerQEMUMemorySanitizerPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
   static_cast<PassInfoMixin<CompilerQEMUMemorySanitizerPass> *>(this)->printPipeline(
@@ -511,7 +519,7 @@ void CompilerQEMUMemorySanitizerPass::printPipeline(
   OS << '>';
 }
 
-// [DONE] 11/05
+// [DONE]
 // Used for declaring globals as "__cqmsan_retval_tls"...
 static Constant *getOrInsertGlobal(Module &M, StringRef Name, Type *Ty) {
   return M.getOrInsertGlobal(Name, Ty, [&] {
@@ -521,15 +529,16 @@ static Constant *getOrInsertGlobal(Module &M, StringRef Name, Type *Ty) {
   });
 }
 
-// [DONE] 11/05
+// [DONE]
 void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibraryInfo &TLI) {
     IRBuilder<> IRB(*C);
 
     StringRef WarningFnName = Recover ? "__cqmsan_warning" : "__cqmsan_warning_noreturn";
-    // [OPTIMIZATION] 22/05 - warning fast sarebbe anche no_return..
+    // [OPTIMIZATION] - warning fast sarebbe __cqmsan_warning ottimizzato..
     WarningFnName = ClFastWarning ? "__cqmsan_warning_fast" : WarningFnName;
+    // TODO - future work: add a noreturn variant of the fast warning handler, to avoid the stack unwind and keep going after the warning.
 
-    // [OPTIMIZATION] 22/05 — warning handler attributes
+    // [OPTIMIZATION] - warning handler attributes
     // Cold: keep warning callsites out of I-cache hot path (.text.cold layout)
     // NoUnwind: warning never throws C++ exceptions, omit unwind tables
     // NoReturn: only for the noreturn variant — fast/keep-going return normally
@@ -551,14 +560,15 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
                         ArrayType::get(IRB.getInt64Ty(), kRetvalTLSSize / 8));
 
     ParamTLS =
-        getOrInsertGlobal(M, "__cqmsan_param_tls",
+      getOrInsertGlobal(M, "__cqmsan_param_tls",
                             ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
 
     VAArgTLS =
       getOrInsertGlobal(M, "__cqmsan_va_arg_tls",
                         ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
 
-    VAArgOverflowSizeTLS = getOrInsertGlobal(M, "__cqmsan_va_arg_overflow_size_tls",
+    VAArgOverflowSizeTLS = 
+      getOrInsertGlobal(M, "__cqmsan_va_arg_overflow_size_tls",
                                            IRB.getIntPtrTy(M.getDataLayout()));
     
     // obtain __cqmsan_maybe_warning_X functions (X=1,2,4,8)
@@ -567,8 +577,16 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
         AccessSizeIndex++) {
 
         unsigned AccessSize = 1 << AccessSizeIndex;
+        
+        //std::string FunctionName;
+        //if (ClFastWarning) {
+        //    FunctionName = "__cqmsan_maybe_warning_fast_" + itostr(AccessSize);
+        //} else {
+        //    FunctionName = "__cqmsan_maybe_warning_" + itostr(AccessSize);
+        //}
+        std::string FunctionName = ClFastWarning ? "__cqmsan_maybe_warning_fast_" : "__cqmsan_maybe_warning_";
+        FunctionName += itostr(AccessSize);
 
-        std::string FunctionName = "__cqmsan_maybe_warning_" + itostr(AccessSize);
         MaybeWarningFn[AccessSizeIndex] = M.getOrInsertFunction(
             FunctionName, TLI.getAttrList(C, {0, 1}, /*Signed=*/false),
             IRB.getVoidTy(), IRB.getIntNTy(AccessSize * 8), IRB.getInt32Ty());
@@ -598,7 +616,7 @@ void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLib
                                             TLI.getAttrList(C, {1}, /*Signed=*/true),
                                             PtrTy, PtrTy, IRB.getInt32Ty(), IntptrTy);
     
-    // [TODO] future work: use this
+    // TODO - future work: use this
     CQMSanInstrumentAsmStoreFn = M.getOrInsertFunction("__cqmsan_instrument_asm_store", 
         IRB.getVoidTy(), PtrTy, IntptrTy);
 
@@ -871,7 +889,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // Path INLINE: split + warning
             Value *Cmp = convertToBool(ConvertedShadow, IRB, "_cqmscmp");
             Instruction *CheckTerm = SplitBlockAndInsertIfThen(
-                Cmp, &*IRB.GetInsertPoint(), !CQMS.Recover, CQMS.ColdCallWeights);
+                Cmp, &*IRB.GetInsertPoint(), !CQMS.Recover && !ClFastWarning, CQMS.ColdCallWeights);
             IRB.SetInsertPoint(CheckTerm);
             insertWarningFn(IRB);
         }

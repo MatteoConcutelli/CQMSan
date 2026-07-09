@@ -542,32 +542,40 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(
 using namespace __cqmsan;
 
 // [DONE] 13/05
-//#define CQMSAN_MAYBE_WARNING(type, size)              \
-//  void __cqmsan_maybe_warning_##size(type s, __sanitizer::u32 o) { \
-//    GET_CALLER_PC_BP;                               \
-//    if (UNLIKELY(s)) {                              \
-//      PrintWarningWithOrigin(pc, bp, o);            \
-//      if (__cqmsan::flags()->halt_on_error) {       \
-//        Die();                                      \
-//      }                                             \
-//    }                                               \
-//  }
-
-// [DONE] 13/05 - optimized version with early exit if s is zero, to avoid the overhead 
-// of GET_CALLER_PC_BP and PrintWarningWithOrigin in the common case of no warning.
-#define CQMSAN_MAYBE_WARNING(type, size) \
-    void __cqmsan_maybe_warning_##size(type s, __sanitizer::u32 o) { \
-      if (LIKELY(!s)) return; \
-      GET_CALLER_PC_BP; \
-      PrintWarningWithOrigin(pc, bp, o); \
-      if (__cqmsan::flags()->halt_on_error) Die(); \
-    }
-
+#define CQMSAN_MAYBE_WARNING(type, size)              \
+  void __cqmsan_maybe_warning_##size(type s, __sanitizer::u32 o) { \
+    GET_CALLER_PC_BP;                               \
+    if (UNLIKELY(s)) {                              \
+      PrintWarningWithOrigin(pc, bp, o);            \
+      if (__cqmsan::flags()->halt_on_error) {       \
+        Die();                                      \
+      }                                             \
+    }                                               \
+  }
 
 CQMSAN_MAYBE_WARNING(u8, 1)
 CQMSAN_MAYBE_WARNING(u16, 2)
 CQMSAN_MAYBE_WARNING(u32, 4)
 CQMSAN_MAYBE_WARNING(u64, 8)
+
+// [OPTIMIZED]
+// Version with early exit if s is zero, to avoid the overhead 
+// of GET_CALLER_PC_BP and PrintWarningWithOrigin in the common case of no warning.
+#define CQMSAN_MAYBE_WARNING_FAST(type, size) \
+    void __cqmsan_maybe_warning_fast_##size(type s, __sanitizer::u32 o) { \
+      if (LIKELY(!s)) return; \
+      GET_CALLER_PC_BP; \
+      GET_FATAL_STACK_TRACE_PC_BP(pc, bp); \
+      __cqmsan::cqmsan_update_map(&stack); \
+      ++cqmsan_report_count; \
+      if (__cqmsan::flags()->halt_on_error) Die(); \
+    }
+
+
+CQMSAN_MAYBE_WARNING_FAST(u8, 1)
+CQMSAN_MAYBE_WARNING_FAST(u16, 2)
+CQMSAN_MAYBE_WARNING_FAST(u32, 4)
+CQMSAN_MAYBE_WARNING_FAST(u64, 8)
 
 // [DONE] 13/05 - cutted directly the API for storing origin
 //#define CQMSAN_MAYBE_STORE_ORIGIN(type, size)                       \

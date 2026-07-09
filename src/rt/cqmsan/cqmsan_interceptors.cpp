@@ -1425,8 +1425,9 @@ int OnExit() {
 #define COMMON_INTERCEPTOR_UNPOISON_PARAM(count)  \
   UnpoisonParam(count)
 #define COMMON_INTERCEPTOR_WRITE_RANGE(ctx, ptr, size) \
-/* For disabling: */ do { (void)(ctx); (void)(ptr); (void)(size); } while (false)
-//  __cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
+/* For disabling: do { (void)(ctx); (void)(ptr); (void)(size); } while (false)
+*/
 
 //#define COMMON_INTERCEPTOR_READ_RANGE(ctx, ptr, size) \
 //  CHECK_UNPOISONED_CTX(ctx, ptr, size)
@@ -1435,8 +1436,9 @@ int OnExit() {
   do {} while (false)
 
 #define COMMON_INTERCEPTOR_INITIALIZE_RANGE(ptr, size) \
-/* For disabling:*/  do { (void)(ptr); (void)(size); } while (false)
-//  __cqmsan_unpoison(ptr, size)
+  __cqmsan_unpoison(ptr, size)
+/* For disabling:  do { (void)(ptr); (void)(size); } while (false)
+*/
 
 #define COMMON_INTERCEPTOR_ENTER(ctx, func, ...)              \
   if (cqmsan_init_is_running)                                   \
