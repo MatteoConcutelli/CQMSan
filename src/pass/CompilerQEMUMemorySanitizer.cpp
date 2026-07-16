@@ -3129,7 +3129,9 @@ llvmGetPassPluginInfo() {
 // sulle funzioni bersaglio della fuzzing.
 // ---------------------------------------------------------------------------
 static const SpecialCaseList *getCQMSanIgnorelist() {
+    
     static const std::unique_ptr<SpecialCaseList> List = [] {
+
         const char *Path = std::getenv("CQMSAN_IGNORELIST");
         if (!Path || !*Path)
             return std::unique_ptr<SpecialCaseList>();
@@ -3138,11 +3140,15 @@ static const SpecialCaseList *getCQMSanIgnorelist() {
         std::string Error;
         std::unique_ptr<SpecialCaseList> SCL =
             SpecialCaseList::create({Path}, *FS, Error);
+
         if (!SCL)
             report_fatal_error(Twine("CQMSAN_IGNORELIST: impossibile leggere '") +
                                 Path + "': " + Error);
+
         return SCL;
+
     }();
+
     return List.get();
 }
 
@@ -3156,10 +3162,13 @@ static bool isFunctionIgnored(const Function &F) {
 
     if (const DISubprogram *SP = F.getSubprogram()) {
         std::string SourceFile = SP->getFilename().str();
+        
         if (!SP->getDirectory().empty())
             SourceFile = SP->getDirectory().str() + "/" + SourceFile;
+        
         if (IgnoreList->inSection("cqmsan", "src", SourceFile))
             return true;
+
     }
     return false;
 }

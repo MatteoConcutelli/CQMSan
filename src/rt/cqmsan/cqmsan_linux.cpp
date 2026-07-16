@@ -331,13 +331,13 @@ void CQMsanTSDDtor(void *tsd) {
 static void BeforeFork() {
   // Usually we lock ThreadRegistry, but cqmsan does not have one.
   LockAllocator();
-  StackDepotLockBeforeFork();
-  ChainedOriginDepotBeforeFork();
+  //StackDepotLockBeforeFork();
+  //ChainedOriginDepotBeforeFork();
 }
 
 static void AfterFork(bool fork_child) {
-  ChainedOriginDepotAfterFork(fork_child);
-  StackDepotUnlockAfterFork(fork_child);
+  //ChainedOriginDepotAfterFork(fork_child);
+  //StackDepotUnlockAfterFork(fork_child);
   UnlockAllocator();
   // Usually we unlock ThreadRegistry, but cqmsan does not have one.
   VReport(2, "AfterFork tid: %llu\n", GetTid());

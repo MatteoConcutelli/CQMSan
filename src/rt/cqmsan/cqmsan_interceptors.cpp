@@ -115,6 +115,29 @@ struct DlsymAlloc : public DlSymAllocator<DlsymAlloc> {
     if (!IsInInterceptorScope()) CHECK_UNPOISONED_0(x, n); \
   } while (0)
 
+// same as __cqmsan_warning_fast
+// TODO - for now is not used, but we can use it in the future to avoid stack unwinding for UMRs
+#define CHECK_UNPOISONED_0_FAST(x, n) \
+  do {                                                            \
+    if (__cqmsan::IsInSymbolizerOrUnwider())                        \
+      break;                                                     \
+    sptr __offset = __cqmsan_test_shadow(x, n);                    \
+    if (__offset >= 0 && __cqmsan::flags()->report_umrs) {         \
+      GET_CALLER_PC_BP;                                           \
+      GET_FATAL_STACK_TRACE_PC_BP(pc, bp);                        \
+      __cqmsan::cqmsan_update_map(&stack);                        \
+      ++cqmsan_report_count;                                      \
+      if (__cqmsan::flags()->halt_on_error) {                       \
+        Die();                                                    \
+      }                                                           \
+    }                                                             \
+  } while (0)
+
+#define CHECK_UNPOISONED_FAST(x, n)                              \
+  do {                                                          \
+    if (!IsInInterceptorScope()) CHECK_UNPOISONED_0_FAST(x, n); \
+  } while (0)
+
 #define CHECK_UNPOISONED_STRING_OF_LEN(x, len, n)               \
   CHECK_UNPOISONED((x),                                         \
     __sanitizer::common_flags()->strict_string_checks ? (len) + 1 : (n) )
