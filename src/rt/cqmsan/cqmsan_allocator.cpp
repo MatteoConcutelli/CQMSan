@@ -37,7 +37,9 @@ struct Metadata {
 // and releasing shadow/origin memory pages.
 struct CQMsanMapUnmapCallback {
   // This callback is called when a new memory mapping is created.
+  // no-op
   void OnMap(__sanitizer::uptr p, __sanitizer::uptr size) const {}
+  // no-op 
   void OnMapSecondary(__sanitizer::uptr p, __sanitizer::uptr size, __sanitizer::uptr user_begin,
                       __sanitizer::uptr user_size) const {}
   void OnUnmap(__sanitizer::uptr p, __sanitizer::uptr size) const {

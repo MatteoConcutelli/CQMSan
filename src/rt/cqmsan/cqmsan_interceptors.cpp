@@ -112,7 +112,7 @@ struct DlsymAlloc : public DlSymAllocator<DlsymAlloc> {
 // interceptor.
 #define CHECK_UNPOISONED(x, n)                             \
   do {                                                     \
-    if (!IsInInterceptorScope()) CHECK_UNPOISONED_0(x, n); \
+    if (!IsInInterceptorScope()) CHECK_UNPOISONED_0_FAST(x, n); /*TODO - forced the fast path here*/\
   } while (0)
 
 // same as __cqmsan_warning_fast
@@ -133,6 +133,7 @@ struct DlsymAlloc : public DlSymAllocator<DlsymAlloc> {
     }                                                             \
   } while (0)
 
+// TODO - not used 
 #define CHECK_UNPOISONED_FAST(x, n)                              \
   do {                                                          \
     if (!IsInInterceptorScope()) CHECK_UNPOISONED_0_FAST(x, n); \
@@ -173,7 +174,7 @@ INTERCEPTOR(void *, memccpy, void *dest, const void *src, int c, SIZE_T n) {
   void *res = REAL(memccpy)(dest, src, c, n);
   CHECK(!res || (res >= dest && res <= (char *)dest + n));
   SIZE_T sz = res ? (char *)res - (char *)dest : n;
-  //CHECK_UNPOISONED(src, sz);
+  CHECK_UNPOISONED(src, sz);
   __cqmsan_unpoison(dest, sz);
   return res;
 }
@@ -1753,7 +1754,7 @@ INTERCEPTOR(wchar_t *, wcsncpy, wchar_t *dest, const wchar_t *src, SIZE_T n) {
 // REAL(memset), etc.
 void __cqmsan_unpoison(const void *a, __sanitizer::uptr size) {
   if (!MEM_IS_APP(a)) return;
-  SetShadow(a, size, 0);
+  SetShadow(a, size, (u8)0);
 }
 
 // [DONE]
@@ -1775,7 +1776,7 @@ void __cqmsan_unpoison_param(__sanitizer::uptr n) { UnpoisonParam(n); }
 // [DONE]
 void __cqmsan_clear_and_unpoison(void *a, __sanitizer::uptr size) {
   REAL(memset)(a, 0, size);
-  SetShadow(a, size, 0);
+  SetShadow(a, size, (u8)0);
 }
 
 void *__cqmsan_memcpy(void *dest, const void *src, SIZE_T n) {
@@ -1930,10 +1931,10 @@ void InitializeInterceptors() {
   INTERCEPT_FUNCTION(mbrtowc);
   INTERCEPT_FUNCTION(wcslen);
   INTERCEPT_FUNCTION(wcsnlen);
-  INTERCEPT_FUNCTION(wcschr);
+  // pure read -INTERCEPT_FUNCTION(wcschr);
   INTERCEPT_FUNCTION(wcscpy);
   INTERCEPT_FUNCTION(wcsncpy);
-  INTERCEPT_FUNCTION(wcscmp);
+  // pure read - INTERCEPT_FUNCTION(wcscmp);
   INTERCEPT_FUNCTION(getenv);
   INTERCEPT_FUNCTION(setenv);
   INTERCEPT_FUNCTION(putenv);

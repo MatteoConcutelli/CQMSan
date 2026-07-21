@@ -26,4 +26,4 @@ Flags *flags();
 
 }  // namespace __cqmsan
 
-#endif  // QMSAN_FLAGS_H
+#endif  // CQMSAN_FLAGS_H

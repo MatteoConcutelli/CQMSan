@@ -516,6 +516,22 @@ void cqmsan_update_map(__sanitizer::BufferedStackTrace* stack){
 }
 //#endif
 
+// PC-only map update: NO stack unwind.
+// Feeds the AFL edge coverage (ERROR + PC_EDGE) and the two-tier signal
+// ([MAP_SIZE-1]=0xff) using only the caller PC. Drops CS/CS_EDGE (the XOR
+// callstack context), which required the expensive full unwind per firing and
+// was a low-quality (order-insensitive, self-cancelling) signal anyway.
+// Selected at compile time by the pass flag ClPCOnly (picks the _pconly symbols).
+void cqmsan_update_map_pc (__sanitizer::uptr pc){
+
+    cqmsan_area_ptr[ pc % MAP_SIZE] |= CQMSAN_AFL_ERROR;
+    //edges between instructions
+    cqmsan_area_ptr[((last_edge >> 1) ^ pc ) % MAP_SIZE]
+                    |= CQMSAN_AFL_PC_EDGE;
+    last_edge = pc;
+    //lastly, set this to 0xff so that AFL knows we found something
+    cqmsan_area_ptr[MAP_SIZE - 1] = 0xff;
+
 }  // namespace __cqmsan
 
 // [DONE] 13/05
@@ -577,6 +593,23 @@ CQMSAN_MAYBE_WARNING_FAST(u16, 2)
 CQMSAN_MAYBE_WARNING_FAST(u32, 4)
 CQMSAN_MAYBE_WARNING_FAST(u64, 8)
 
+extern "C" {
+#define CQMSAN_MAYBE_WARNING_FAST_PCONLY(type, size) \
+  void __cqmsan_maybe_warning_fast_pconly_##size(type s, __sanitizer::u32 o) { \
+    if (LIKELY(!s)) return; \
+    GET_CALLER_PC_BP; \
+    __cqmsan::cqmsan_update_map_pc(pc); \
+    ++cqmsan_report_count; \
+    if (__cqmsan::flags()->halt_on_error) Die(); \
+  }
+
+CQMSAN_MAYBE_WARNING_FAST_PCONLY(u8, 1)
+CQMSAN_MAYBE_WARNING_FAST_PCONLY(u16, 2)
+CQMSAN_MAYBE_WARNING_FAST_PCONLY(u32, 4)
+CQMSAN_MAYBE_WARNING_FAST_PCONLY(u64, 8)
+
+} // extern "C"
+
 // [DONE] 13/05 - cutted directly the API for storing origin
 //#define CQMSAN_MAYBE_STORE_ORIGIN(type, size)                       \
   void __cqmsan_maybe_store_origin_##size(type s, void *p, __sanitizer::u32 o) { \
@@ -598,6 +631,16 @@ CQMSAN_MAYBE_WARNING_FAST(u64, 8)
 
 #include "sanitizer_symbolizer.h"
 #include "cqmsan_origin.h"  // where is defined Origin::FromRawId, used in PrintWarningWithOrigin
+
+void __cqmsan_warning_fast_pconly() {
+  GET_CALLER_PC_BP;
+  __cqmsan::cqmsan_update_map_pc(pc);
+  ++cqmsan_report_count;
+
+  if (__cqmsan::flags()->halt_on_error) {
+    Die();
+  }
+}
 
 // [OPTIMIZATION] 22/05
 void __cqmsan_warning_fast() {

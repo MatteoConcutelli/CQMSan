@@ -112,6 +112,12 @@ static const size_t kNumberOfAccessSizes = 4;
 
 // ------------- FLAGS --------------- //
 
+static cl::opt<bool> ClPCOnly(
+    "cqmsan_pc-only",
+    cl::desc("Fast warning updated the AFL map by PC only (no unwind, no CS_EDGE)."
+             "Requires -cqmsan-fast-warning. "),
+    cl::Hidden, cl::init(false));
+
 // [OPTIMIZATION]
 static cl::opt<bool> ClFastWarning(
     "cqmsan-fast-warning",
@@ -538,6 +544,10 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     WarningFnName = ClFastWarning ? "__cqmsan_warning_fast" : WarningFnName;
     // TODO - future work: add a noreturn variant of the fast warning handler, to avoid the stack unwind and keep going after the warning.
 
+    if (ClFastWarning && ClPCOnly) {
+        WarningFnName = "__cqmsan_warning_fast_pconly";
+    }
+
     // [OPTIMIZATION] - warning handler attributes
     // Cold: keep warning callsites out of I-cache hot path (.text.cold layout)
     // NoUnwind: warning never throws C++ exceptions, omit unwind tables
@@ -585,6 +595,10 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
         //    FunctionName = "__cqmsan_maybe_warning_" + itostr(AccessSize);
         //}
         std::string FunctionName = ClFastWarning ? "__cqmsan_maybe_warning_fast_" : "__cqmsan_maybe_warning_";
+
+        if (ClFastWarning && ClPCOnly) {
+            FunctionName = "__cqmsan_maybe_warning_fast_pconly_";
+        }
         FunctionName += itostr(AccessSize);
 
         MaybeWarningFn[AccessSizeIndex] = M.getOrInsertFunction(
@@ -3101,32 +3115,56 @@ llvmGetPassPluginInfo() {
 }
 
 // ---------------------------------------------------------------------------
-// Ignorelist (equivalente compile-time del "no_lib" di QMSan).
+// Compile-time function ignorelist.
 //
-// QMSan filtra a RUNTIME in base al PC (msan-giovese.h): se l'accesso non
-// proviene dall'app, salta il check. CQMSan è caricato via -fpass-plugin
-// (non -fsanitize=memory), quindi non passa per l'ignorelist standard di
-// Clang: il filtro va fatto qui, dentro il pass, PRIMA di costruire il
-// Visitor (che oggi imposta Attribute::SanitizeMemory incondizionatamente,
-// vedi il costruttore di CompilerQEMUMemorySanitizerVisitor).
+// WHY THIS EXISTS:
+// CQMSan runs as an out-of-tree pass loaded with -fpass-plugin, NOT via
+// -fsanitize=memory. That has two consequences the frontend would normally
+// handle for us:
+//   1. Clang never attaches Attribute::SanitizeMemory to functions, so the
+//      Visitor force-adds it unconditionally (see the Visitor constructor).
+//   2. Clang never consults a sanitizer ignorelist, so nothing is excluded.
+// Combined, that means EVERY function gets instrumented, including code that
+// must not be. This gate restores the exclusion: sanitizeFunction() calls it
+// BEFORE building the Visitor, so an ignored function never reaches the
+// force-add and stays completely untouched.
 //
-// Attivazione (opt-in, nessun cambiamento di comportamento se non impostata):
-//   CQMSAN_IGNORELIST=/path/to/list.txt
-// Sintassi del file = SpecialCaseList standard di LLVM (stessa di
-// -fsanitize-ignorelist=), righe senza intestazione [sezione] valgono per
-// qualunque query:
-//   src:GLOB   esclude ogni funzione il cui file sorgente (da debug info)
-//              soddisfa il glob, es.  src:*runner.cc
-//   fun:GLOB   esclude ogni funzione il cui nome IR soddisfa il glob
+// This is the compile-time analogue of QMSan's runtime exclusion of non-app
+// code. Difference in granularity: QMSan filters dynamically, per memory
+// access, by PC; this filters statically, all-or-nothing per function. Same
+// intent (skip non-target code), coarser knob.
 //
-// Una funzione ignorata NON riceve alcuna instrumentazione (niente poison
-// di stack/alloca, niente shadow-store, niente check sui load) — è come se
-// il plugin non fosse stato applicato a quella funzione. Attenzione: senza
-// propagazione (0=init) una funzione ignorata che scrive un buffer lascia
-// la sua shadow a 0 (clean); se quei dati erano uninit e vengono letti da
-// codice instrumentato, l'UMR è perso (falso negativo). Va usata solo su
-// codice che non produce valori consumati a valle (harness/driver), MAI
-// sulle funzioni bersaglio della fuzzing.
+// TWO LAYERS:
+//   - A hardcoded default that is ALWAYS active (the equivalent of upstream
+//     msan_ignorelist.txt). Currently just __gxx_personality_*: it is invoked
+//     by the uninitialized/uninstrumented C++ unwinder, so instrumenting it
+//     produces false positives on every exception unwind.
+//   - An opt-in list from the CQMSAN_IGNORELIST env var. Same file syntax as
+//     -fsanitize-ignorelist= (LLVM SpecialCaseList). Lines with no [section]
+//     header apply to any query:
+//         fun:GLOB   skip functions whose IR name matches GLOB
+//         src:GLOB   skip functions whose source file matches GLOB
+//     Not set => no extra exclusions (pure opt-in, no behavior change).
+//     Note: src: only works with debug info (-g); the path is reconstructed
+//     from DISubprogram and may not match the frontend's src: semantics, so
+//     prefer wide globs (src:*runner.cc*) over exact paths.
+//
+// EFFECT AND DANGER:
+// An ignored function receives NO instrumentation at all (no stack/alloca
+// poisoning, no shadow stores, no load checks) — as if the plugin never ran
+// on it. Because we do not propagate shadow (0 = initialized), this cuts BOTH
+// ways depending on the buffer's shadow baseline:
+//   - False negative: an ignored function writes a clean-baseline buffer
+//     (stack/global). Its shadow stays 0. If the data was actually uninit and
+//     is later read by instrumented code, the UMR is lost.
+//   - False positive: an ignored function fills a poisoned-baseline buffer
+//     (e.g. heap from malloc, which the allocator poisons) via its own
+//     compiled stores. The shadow stays poisoned, so instrumented code reading
+//     it reports a spurious UMR (wasted Valgrind replay). Mitigated when the
+//     fill goes through an intercepted libc call (memcpy/read/...), since the
+//     interceptor unpoisons the destination.
+// Rule of thumb: only ignore harness/driver code that does not produce values
+// consumed downstream. NEVER ignore the fuzz-target functions.
 // ---------------------------------------------------------------------------
 static const SpecialCaseList *getCQMSanIgnorelist() {
     
@@ -3142,7 +3180,7 @@ static const SpecialCaseList *getCQMSanIgnorelist() {
             SpecialCaseList::create({Path}, *FS, Error);
 
         if (!SCL)
-            report_fatal_error(Twine("CQMSAN_IGNORELIST: impossibile leggere '") +
+            report_fatal_error(Twine("CQMSAN_IGNORELIST: unable to read '") +
                                 Path + "': " + Error);
 
         return SCL;
@@ -3153,22 +3191,23 @@ static const SpecialCaseList *getCQMSanIgnorelist() {
 }
 
 static bool isFunctionIgnored(const Function &F) {
-    const SpecialCaseList *IgnoreList = getCQMSanIgnorelist();
-    if (!IgnoreList)
-        return false; // env var non impostata: nessun cambiamento di comportamento.
-
-    if (IgnoreList->inSection("cqmsan", "fun", F.getName()))
+    StringRef FuncName = F.getName();
+    // Default ignorelist: ALWAYS active (equivalent to msan_ignorelist.txt)
+    if (FuncName.starts_with("__gxx_personality"))
         return true;
 
+    // Optional layer from env var
+    const SpecialCaseList *IgnoreList = getCQMSanIgnorelist();
+    if (!IgnoreList)
+        return false;
+    if (IgnoreList->inSection("cqmsan", "fun", FuncName))
+        return true;
     if (const DISubprogram *SP = F.getSubprogram()) {
         std::string SourceFile = SP->getFilename().str();
-        
         if (!SP->getDirectory().empty())
             SourceFile = SP->getDirectory().str() + "/" + SourceFile;
-        
         if (IgnoreList->inSection("cqmsan", "src", SourceFile))
             return true;
-
     }
     return false;
 }
