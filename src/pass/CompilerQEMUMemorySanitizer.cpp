@@ -489,7 +489,6 @@ PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysis
 
     // get the function analysis manager from the module analysis manager
     auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-
     bool Modified = false;
 
     // Foreach function in the module, apply the CompilerQEMUMemorySanitizer instrumentation
@@ -557,7 +556,7 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
         Attrs = Attrs.addFnAttribute(*C, Attribute::Cold);
     }
 
-    //    .addFnAttribute(*C, Attribute::NoUnwind);
+    Attrs = Attrs.addFnAttribute(*C, Attribute::NoUnwind);
     if (!Recover && !ClFastWarning) {
         Attrs = Attrs.addFnAttribute(*C, Attribute::NoReturn);
     }
@@ -807,8 +806,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         PoisonUndef = SanitizeFunction && ClPoisonUndef;
         // [Disallignment with 19.x version]
         //PoisonUndefVectors = SanitizeFunction && ClPoisonUndefVectors;
-
-        removeUnreachableBlocks(F); // Remove unreachable blocks from the function.
+        
+        // In the presence of unreachable blocks, we may see Phi nodes with
+        // incoming nodes from such blocks. Since InstVisitor skips unreachable
+        // blocks, such nodes will not have any shadow value associated with them.
+        // It's easier to remove unreachable blocks than deal with missing shadow.
+        removeUnreachableBlocks(F); 
 
         CQMS.initializeCallbacks(*F.getParent(), TLI);
         // prologue delineation
@@ -849,7 +852,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 (&I == FnPrologueEnd || I.comesBefore(FnPrologueEnd));
     }
 
-    // [DONE] 11/05
+    // [DONE] 24/07
     void materializeStores() {
         
         for (StoreInst *SI : StoreList) {
@@ -865,9 +868,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
             Value *ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ true);
         
-            StoreInst *NewSI = IRB.CreateAlignedStore(Shadow, ShadowPtr, Alignment);
+            [[maybe_unused]] StoreInst *NewSI = IRB.CreateAlignedStore(Shadow, ShadowPtr, Alignment);
             LLVM_DEBUG(dbgs() << "  STORE: " << *NewSI << "\n");
-            (void)NewSI;
             
             if (SI->isAtomic())
                 SI->setOrdering(addReleaseOrdering(SI->getOrdering()));
@@ -909,8 +911,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
     }
 
-    // [DONE] 11/05
-    void materializeInstructionChecks( ArrayRef<ShadowAndInsertPoint> InstructionChecks) {
+    // [DONE] 24/07
+    void materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint> InstructionChecks) {
         const DataLayout &DL = F.getDataLayout();
         
         Instruction *OrigIns = InstructionChecks.front().OrigIns;
@@ -923,9 +925,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             
             if (auto *ConstantShadow = dyn_cast<Constant>(ConvertedShadow)) {
                 if (!ClCheckConstantShadow || ConstantShadow->isZeroValue()) {
+                    // Skip, value is initialized or const shadow is ignored.
                     continue;
                 }
                 
+                // known non-zero constant shadow value: emit warning immediately (at runtime)
                 if (llvm::isKnownNonZero(ConvertedShadow, DL)) {
                     insertWarningFn(IRB);
                     if (!CQMS.Recover)
@@ -948,6 +952,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             IRBuilder<> IRB(OrigIns);
             materializeOneCheck(IRB, Shadow);
         }
+
     }
 
     // [DONE] 11/05
@@ -1338,7 +1343,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     Constant *getCleanShadow(Type *OrigTy) {
         Type *ShadowTy = getShadowTy(OrigTy);
         if (!ShadowTy)
-        return nullptr;
+            return nullptr;
         return Constant::getNullValue(ShadowTy);
     }
 
@@ -1405,10 +1410,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }  
 
         // Handle fully undefined values
-        if (UndefValue *U = dyn_cast<UndefValue>(V)) {
+        if ([[maybe_unused]] UndefValue *U = dyn_cast<UndefValue>(V)) {
             Value *AllOnes = PoisonUndef ? getPoisonedShadow(V) : getCleanShadow(V);
             LLVM_DEBUG(dbgs() << "Undef: " << *U << " ==> " << *AllOnes << "\n");
-            (void)U;
             return AllOnes;
         }
 
@@ -1465,7 +1469,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                             const Align CopyAlign = std::min(ArgAlign, kShadowTLSAlignment);
                             Value *Cpy = EntryIRB.CreateMemCpy( CpShadowPtr, CopyAlign, Base, CopyAlign, Size);
                             LLVM_DEBUG(dbgs() << "  ByValCpy: " << *Cpy << "\n");
-                            (void)Cpy;
                         }
                     }
 
@@ -1486,7 +1489,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             return ShadowPtr;
         }
         
-        // For everything else the shadow is one.
+        // For everything else the shadow is clean.
         return getCleanShadow(V);
 
     }
@@ -1711,8 +1714,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // This is the limit of the optimization of the load instrumentation.
         if (!ClInstrumentLoads) {
             setShadow(&I, getCleanShadow(&I));
-            if (I.isAtomic())
-                I.setOrdering(addAcquireOrdering(I.getOrdering()));
             return;
         }
 
@@ -1721,17 +1722,20 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         Value *Addr = I.getPointerOperand();
         const Align Alignment = I.getAlign();
 
-        // Load the shadow of the value
-        Value *ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
-        LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
-        setShadow(&I, LoadedShadow);
+        bool insertedShadowLoad = false;
+        if (canProveLoadIsClean(&I)) {
+            LLVM_DEBUG(dbgs() << "Load is provably clean: " << I << "\n");
+            setShadow(&I, getCleanShadow(&I));
+        } else {
+            
+            Value *ShadowPtr = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
+            LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
+            setShadow(&I, LoadedShadow);
+            insertedShadowLoad = true;
 
-        // Register the check on the shadow of the value (deferred).
-        // Use pushShadowCheck because LoadedShadow is already a shadow IR Value.
-        //pushShadowCheck(LoadedShadow, &I);
-        // NEW: skip se provabile clean — skip if ClCheckLoads=false.
-        if (!canProveLoadIsClean(&I) && ClCheckLoads) {
-            pushShadowCheck(LoadedShadow, &I);
+            if (ClCheckLoads)
+                pushShadowCheck(LoadedShadow, &I);
+
         }
 
         // Optional: check that the load address is fully defined.
@@ -1742,7 +1746,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // Atomic correctness: Instrumented loads add a shadow load BEFORE
         // the original load. To ensure happens-before between the two, the ordering
         // of the original load must be at least acquired.
-        if (I.isAtomic())
+        if (insertedShadowLoad && I.isAtomic())
             I.setOrdering(addAcquireOrdering(I.getOrdering()));
         
     }
@@ -1754,6 +1758,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// materializeStores() function
     void visitStoreInst(StoreInst &I) {
         if (!ClInstrumentStores) return;
+        
         StoreList.push_back(&I);
         // Optional: check that the store destination address is fully defined.
         // Captures UMR on uninitialized address (e.g., `int *p; *p = 1;`).
@@ -2577,6 +2582,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         const DataLayout &DL = F.getDataLayout();
         TypeSize TS = DL.getTypeAllocSize(I.getAllocatedType());
         Value *Len = IRB.CreateTypeSize(CQMS.IntptrTy, TS);
+        
         if (I.isArrayAllocation())
             Len = IRB.CreateMul(Len,
                         IRB.CreateZExtOrTrunc(I.getArraySize(), CQMS.IntptrTy));
@@ -3077,6 +3083,7 @@ llvmGetPassPluginInfo() {
             LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
             // 1) Manual registration: `opt -passes=cqmsan`
+            /*
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
@@ -3087,7 +3094,8 @@ llvmGetPassPluginInfo() {
                     }
                     return false;
                 });
-
+            */
+           
             // 2) Auto-injection at the END of the optimization pipeline
             //    (consistent with MSan upstream, which uses OptimizerLastEPCallback
             //    to prevent post-instrumentation optimizations from interfering
