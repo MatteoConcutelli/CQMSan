@@ -34,6 +34,9 @@ void __cqmsan_warning();
 SANITIZER_INTERFACE_ATTRIBUTE
 void __cqmsan_warning_fast();
 
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_warning_fast_pconly();
+
 // Print a warning and die.
 // Instrumentation inserts calls to this function when building in "fast" mode
 // (i.e. -mllvm -cqmsan-keep-going)
@@ -65,6 +68,17 @@ SANITIZER_INTERFACE_ATTRIBUTE
 void __cqmsan_maybe_warning_fast_4(u32 s, u32 o);
 SANITIZER_INTERFACE_ATTRIBUTE
 void __cqmsan_maybe_warning_fast_8(u64 s, u32 o);
+
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_maybe_warning_fast_pconly_1(u8 s, u32 o);
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_maybe_warning_fast_pconly_2(u16 s, u32 o);
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_maybe_warning_fast_pconly_4(u32 s, u32 o);
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_maybe_warning_fast_pconly_8(u64 s, u32 o);
+
+
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __cqmsan_maybe_store_origin_1(u8 s, void *p, u32 o);
