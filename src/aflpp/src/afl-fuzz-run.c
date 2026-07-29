@@ -102,7 +102,7 @@ int logged = 0;
 int valgrind_mode = 0;
 
 int check_msan_trace(afl_state_t *afl, u8* trace){
-  if (memcmp(trace, afl->msan_traces, MAP_SIZE) == 0) return 0;
+  // if (memcmp(trace, afl->msan_traces, MAP_SIZE) == 0) return 0;
 
   int i = MAP_SIZE -1, heavyweight_needed = 0;
 #ifdef QMSAN_FLAGGING
@@ -111,6 +111,9 @@ int check_msan_trace(afl_state_t *afl, u8* trace){
   while(i--){
     u8 new = trace[i];
     u8 old = afl->msan_traces[i];
+
+    // OTPIMIZATION - 07/26
+    // if (new == old) continue;
 
   //in this mode, we just check for the byte to contain something
   //useful if we just want to consider one property (e.g. edges)
@@ -251,7 +254,7 @@ int check_msan_trace(afl_state_t *afl, u8* trace){
 
 //TODO: this should be moved in afl-fuzz.c and made a one-time thing.
 //      Also, in general, we should not rely on .cur_inpuut, instead
-//      we sahould make a generic cmdline with some fmt stuff and call it.
+//      we should make a generic cmdline with some fmt stuff and call it.
 void init_cmdline(afl_state_t *afl){
 
     //int i = 0;

@@ -112,6 +112,10 @@ static const size_t kNumberOfAccessSizes = 4;
 
 // ------------- FLAGS --------------- //
 
+static cl::opt<bool> ClSkipProvableCleanLoads("cqmsan-skip-provable-clean-loads",
+    cl::desc("Skip loads that can be proven to be clean (no UMR)"),
+    cl::Hidden, cl::init(false));
+
 static cl::opt<bool> ClPCOnly(
     "cqmsan_pc-only",
     cl::desc("Fast warning updated the AFL map by PC only (no unwind, no CS_EDGE)."
@@ -941,6 +945,13 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return false;
     }
 
+    // Helper
+    Value *normalizeShadow(IRBuilder<> &IRB, Value *S) {
+        if (S->getType()->isVectorTy())
+            S = IRB.CreateOrReduce(S);
+        return IRB.CreateICmpNE(S, Constant::getNullValue(S->getType()));
+    }
+
     void materializeChecks() {
 
         if (!ClBBCoalescedChecks) {
@@ -949,6 +960,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         // TODO - risolvere la soundness di isImmediateEssentialSink() per arrivare in questo punto
+        // rende grossolano il feedback ad AFL
         // Optimization: coalesce all checks in a BB into a single check at the terminator.
         DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;
 
@@ -982,13 +994,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
             materializeOneCheck(IRB, Accumulated);
         }
-    }
-
-    // Helper
-    Value *normalizeShadow(IRBuilder<> &IRB, Value *S) {
-        if (S->getType()->isVectorTy())
-            S = IRB.CreateOrReduce(S);
-        return IRB.CreateICmpNE(S, Constant::getNullValue(S->getType()));
     }
 
     bool runOnFunction() {
@@ -1257,7 +1262,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return IRB.CreateIntToPtr(Base, IRB.getPtrTy(0), "_cqmsarg");
     }
 
-    // [TODO] 12/05 Now it is just a place older since we do not propagate the return value --> clean
     /// Compute the shadow address for a retval.
     Value *getShadowPtrForRetval(IRBuilder<> &IRB) {
         return IRB.CreatePointerCast(CQMS.RetvalTLS, IRB.getPtrTy(0), "_cqmsret");
@@ -1344,81 +1348,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
         
         if (Argument *A = dyn_cast<Argument>(V)) {
-        
             return getCleanShadow(V);
-            /*
-            // For arguments we compute the shadow on demand and store it in the map.
-            Value *&ShadowPtr = ShadowMap[V];
-            if (ShadowPtr) return ShadowPtr;   // if the shadow is already set, return it
-
-            Function *F = A->getParent();   // caller function
-            IRBuilder<> EntryIRB(FnPrologueEnd); // IRBuilder to insert instructions at the end of the function prologue
-            // (after parameters setup instructions)
-
-            unsigned ArgOffset = 0; // offset of the argument in the ParamTLS buffer
-            const DataLayout &DL = F->getDataLayout();
-
-            for (auto &FArg : F->args()) {
-                // Non-sized and scalable types are not supported by the shadow mapping (assume clean).
-                if (!FArg.getType()->isSized() || FArg.getType()->isScalableTy()) {
-                    LLVM_DEBUG(dbgs() << (FArg.getType()->isScalableTy()
-                                                ? "vscale not fully supported\n"
-                                                : "Arg is not sized\n"));
-                    if (A == &FArg) {
-                        ShadowPtr = getCleanShadow(V);
-                        break;
-                    }
-                    continue;
-                }
-
-                unsigned Size = FArg.hasByValAttr()
-                                    ? DL.getTypeAllocSize(FArg.getParamByValType())
-                                    : DL.getTypeAllocSize(FArg.getType());
-                
-                // Find A in the args 
-                if (A == &FArg) {
-                    bool Overflow = ArgOffset + Size > kParamTLSSize; // check if the argument fits in the ParamTLS buffer
-                    
-                    // The argument is passed via memory/stack (byval). We need to copy the shadow of the argument. 
-                    if (FArg.hasByValAttr()) { 
-                        // ByVal pointer itself has clean shadow. We copy the actual
-                        // argument shadow to the underlying memory.
-                        // Figure out maximal valid memcpy alignment.
-                        const Align ArgAlign = DL.getValueOrABITypeAlignment(FArg.getParamAlign(), FArg.getParamByValType());
-                        Value *CpShadowPtr = getShadowPtr(V, EntryIRB, EntryIRB.getInt8Ty(), ArgAlign, isStore=true);
-                        
-                        // handle the overflow of the TLS buffer (assume clean).
-                        if (Overflow) {
-                            // ParamTLS overflow.
-                            EntryIRB.CreateMemSet( CpShadowPtr, Constant::getNullValue(EntryIRB.getInt8Ty()),
-                                                                                    Size, ArgAlign);
-                        } else {
-                            // memcpy shadow ByVal from Param TLS
-                            Value *Base = getShadowPtrForArgument(EntryIRB, ArgOffset);
-                            const Align CopyAlign = std::min(ArgAlign, kShadowTLSAlignment);
-                            Value *Cpy = EntryIRB.CreateMemCpy( CpShadowPtr, CopyAlign, Base, CopyAlign, Size);
-                            LLVM_DEBUG(dbgs() << "  ByValCpy: " << *Cpy << "\n");
-                        }
-                    }
-
-                    if (Overflow || FArg.hasByValAttr() || (CQMS.EagerChecks && FArg.hasAttribute(Attribute::NoUndef))) {
-                        ShadowPtr = getCleanShadow(V);
-                    } else {
-                        // Shadow over TLS
-                        Value *Base = getShadowPtrForArgument(EntryIRB, ArgOffset);
-                        ShadowPtr = EntryIRB.CreateAlignedLoad(getShadowTy(&FArg), Base, kShadowTLSAlignment);
-                    }
-                    LLVM_DEBUG(dbgs() << "  ARG:    " << FArg << " ==> " << *ShadowPtr << "\n");
-                    break;
-                }
-
-                ArgOffset += alignTo(Size, kShadowTLSAlignment); // sum the size of the current argument
-            }
-            assert(ShadowPtr && "Could not find shadow for an argument");
-            return ShadowPtr;
-        */
         }
-        
         
         // For everything else the shadow is clean.
         return getCleanShadow(V);
@@ -1610,7 +1541,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     bool canProveLoadIsClean(LoadInst *LI) {
         // [TODO] if this work, implement this flag then
-        //if (!ClSkipProvableCleanLoads) return false;
+        if (!ClSkipProvableCleanLoads) return false;
 
         // R1
         if (isLoadFromGlobalConstant(LI)) return true;
@@ -2193,69 +2124,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // and always expects shadows in the TLS. So don't check them.
             MayCheckCall &= !Func->getName().starts_with("__sanitizer_unaligned_");
         }
-
-        // 4. Argument shadow → param TLS
-        //    policy: eager checks pre-call. UMR detection
-        //    is delegated to load-site checks.
-        // unsigned ArgOffset = 0;
-        // for (const auto &[i, A] : llvm::enumerate(CB.args())) {
-        //     if (!A->getType()->isSized()) continue;
-        //     if (A->getType()->isScalableTy()) continue;
-
-        //     unsigned Size = 0;
-        //     const DataLayout &DL = F.getDataLayout();
-
-        //     bool ByVal = CB.paramHasAttr(i, Attribute::ByVal);
-        //     bool NoUndef = CB.paramHasAttr(i, Attribute::NoUndef);
-        //     // EagerCheck is true if we want to check the argument directly instead of storing it in TLS.
-        //     bool EagerCheck = MayCheckCall /*&& !ByVal && NoUndef*/; // TODO - forced EagerCheck
-
-            
-        //     if (EagerCheck) {
-        //         // check the argument directly instead store on TLS.
-        //         insertShadowCheck(A, &CB);
-        //         Size = DL.getTypeAllocSize(A->getType());
-        //     } else {
-        //         Value *ArgShadow = getShadow(A); // take the shadow of the argument from the TLS
-        //         Value *ArgShadowBase = getShadowPtrForArgument(IRB, ArgOffset);
-
-        //         Value *Store = nullptr;
-        //         if (ByVal) {
-        //             // ByVal arguments are passed by pointer to a copy on the stack.
-        //             // We need to copy the shadow memory associated with that copy.
-        //             assert(A->getType()->isPointerTy() &&
-        //                 "ByVal argument is not a pointer!");
-
-        //             Size = DL.getTypeAllocSize(CB.getParamByValType(i));
-        //             if (ArgOffset + Size > kParamTLSSize) break;
-
-        //             const MaybeAlign ParamAlignment(CB.getParamAlign(i));
-        //             MaybeAlign Alignment = std::nullopt;
-        //             if (ParamAlignment)
-        //                 Alignment = std::min(*ParamAlignment, kShadowTLSAlignment);
-
-        //             Value *AShadowPtr = getShadowPtr(A, IRB, IRB.getInt8Ty(),
-        //                                             Alignment, /*isStore=*/false);
-
-        //             Store = IRB.CreateMemCpy(ArgShadowBase, Alignment,
-        //                                     AShadowPtr, Alignment, Size);
-        //         } else {
-        //             // Scalar / vector / ptr argument: store the shadow value
-        //             // directly into the param TLS.
-        //             Size = DL.getTypeAllocSize(A->getType());
-        //             if (ArgOffset + Size > kParamTLSSize) break;
-
-        //             Store = IRB.CreateAlignedStore(ArgShadow, ArgShadowBase,
-        //                                         kShadowTLSAlignment);
-        //         }
-
-        //         (void)Store;
-        //         assert(Store != nullptr);
-        //     }
-
-        //     assert(Size != 0);
-        //     ArgOffset += alignTo(Size, kShadowTLSAlignment);
-        // }
 
         // 5. VarArgs handling — SIZE-ONLY (opportunistic).
         //    No shadow is propagated: the helper only tells the callee how big
