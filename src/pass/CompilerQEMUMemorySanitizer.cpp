@@ -141,9 +141,7 @@ static cl::opt<bool> ClTrustReturn(
     cl::desc("Trust return values from functions"),
     cl::Hidden, cl::init(true));
 
-
-// [OPTIMIZATION - PARAMETRIZATION]
-// TODO - understand if this is correct for CQMSan
+// [OPTIMIZATION]
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
     cl::desc("Group shadow checks per basic block."),
@@ -162,7 +160,6 @@ static cl::opt<bool> ClPoisonStack("cqmsan-poison-stack",
 static cl::opt<bool> ClPoisonStackWithCall("cqmsan-poison-stack-with-call",
     cl::desc("poison uninitialized stack variables with a call"),
     cl::Hidden, cl::init(false));   // enable only for debug
-    // [TODO] future work: implement the use of this integrating CQMsanUnpoisonAllocaFn...
 
 static cl::opt<int> ClPoisonStackPattern("cqmsan-poison-stack-pattern",
     cl::desc("poison uninitialized stack variables with the given pattern"),
@@ -194,9 +191,6 @@ static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
     // So in opportunistic mode we leave it to false, to avoid false negatives and 
     // let the fuzzer find and filter the False positives. 
 
-
-/* CHECK SHADOW ADDRESS */
-
 // This flag controls whether we check the shadow of the address
 // operand of load or store. Such bugs are very rare, since load from
 // a garbage address typically results in SEGV, but still happen
@@ -210,8 +204,56 @@ static cl::opt<bool> ClCheckAccessAddress(
                                    // Removes the shadow check on the ADDRESS at every
                                    // load/store
 
+static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
+    cl::desc("check arguments and return values at function call boundaries"),
+    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
+    // upstream default false
 
-// [ABLATION]
+// When there will be too much instrumentation, use callbacks instead of inline checks.
+// This is a heuristic to avoid code size blowup and compile time blowup.
+static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
+cl::desc(
+    "If the function being instrumented requires more than "
+    "this number of checks and origin stores, use callbacks instead of "
+    "inline checks (-1 means never use callbacks)."),
+cl::Hidden, cl::init(3500));
+
+// Reduce possible false negatives when true, avoiding the skip of costant shadow values
+static cl::opt<bool> ClCheckConstantShadow("cqmsan-check-constant-shadow",
+    cl::desc("Insert checks for constant shadow values"),
+    cl::Hidden, cl::init(true));
+
+// This is off by default because of a bug in gold:
+// https://sourceware.org/bugzilla/show_bug.cgi?id=19002
+static cl::opt<bool> ClWithComdat("cqmsan-with-comdat",
+        cl::desc("Place MSan constructors in comdat sections"),
+        cl::Hidden, cl::init(false));
+
+/* SHADOW MAPPING */
+// TODO - future work is to handle these 3 options.
+
+// These options allow to specify custom memory map parameters
+// See MemoryMapParams for details.
+static cl::opt<uint64_t> ClAndMask("cqmsan-and-mask",
+    cl::desc("Define custom CQMSan AndMask"),
+    cl::Hidden, cl::init(0));
+
+static cl::opt<uint64_t> ClXorMask("cqmsan-xor-mask",
+    cl::desc("Define custom CQMSan XorMask"),
+    cl::Hidden, cl::init(0));
+
+static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
+    cl::desc("Define custom CQMSan ShadowBase"),
+    cl::Hidden, cl::init(0));
+
+// "Use of uninitialized value at %s...", stack_name
+// TODO - not used
+static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
+    cl::desc("Print name of local stack variable"),
+    cl::Hidden, cl::init(false));
+
+/// ------------------------------ABLATION--------------------------------------------- ///
+
 // Default true ⇒ default behavior UNCHANGED. 
 // ONLY used to measure the load-skipping throughput 
 // ceiling (they are NOT real detectors: setting false loses detection).
@@ -242,75 +284,12 @@ static cl::opt<bool> ClInstrumentStores(
 
 /// ------------------------------------------------------------------------------------ ///
 
-static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
-    cl::desc("check arguments and return values at function call boundaries"),
-    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
-    // upstream default false
-
-// When there will be too much instrumentation, use callbacks instead of inline checks.
-// This is a heuristic to avoid code size blowup and compile time blowup.
-static cl::opt<int> ClInstrumentationWithCallThreshold("cqmsan-instrumentation-with-call-threshold",
-cl::desc(
-    "If the function being instrumented requires more than "
-    "this number of checks and origin stores, use callbacks instead of "
-    "inline checks (-1 means never use callbacks)."),
-cl::Hidden, cl::init(3500));
-
-// Reduce possible false negatives when true, avoiding the skip of costant shadow values
-static cl::opt<bool> ClCheckConstantShadow("cqmsan-check-constant-shadow",
-    cl::desc("Insert checks for constant shadow values"),
-    cl::Hidden, cl::init(true));
-
-// This is off by default because of a bug in gold:
-// https://sourceware.org/bugzilla/show_bug.cgi?id=19002
-static cl::opt<bool> ClWithComdat("cqmsan-with-comdat",
-        cl::desc("Place MSan constructors in comdat sections"),
-        cl::Hidden, cl::init(false));
-
-/* SHADOW MAPPING */
-// [TODO] future work is to handle these 3 options.
-
-// These options allow to specify custom memory map parameters
-// See MemoryMapParams for details.
-static cl::opt<uint64_t> ClAndMask("cqmsan-and-mask",
-    cl::desc("Define custom CQMSan AndMask"),
-    cl::Hidden, cl::init(0));
-
-static cl::opt<uint64_t> ClXorMask("cqmsan-xor-mask",
-    cl::desc("Define custom CQMSan XorMask"),
-    cl::Hidden, cl::init(0));
-
-static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
-    cl::desc("Define custom CQMSan ShadowBase"),
-    cl::Hidden, cl::init(0));
-
-
-// [Disallignment with 19.x version] --> disabled for benchmarking vs 19.1.7 msan that does not have this flag
-// [NOT IMPLEMENTED]
-// Reduce false negatives since it precisely poisrons partially undefined constant vectors.
-static cl::opt<bool> ClPoisonUndefVectors("cqmsan-poison-undef-vectors",
-    cl::desc("Precisely poison partially undefined constant vectors. "
-            "If false (legacy behavior), the entire vector is "
-            "considered fully initialized, which may lead to false "
-            "negatives. Fully undefined constant vectors are "
-            "unaffected by this flag (see -cqmsan-poison-undef)."),
-    cl::Hidden, cl::init(false));
-
-// "Use of uninitialized value at %s...", stack_name
-// TODO - not used
-static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
-    cl::desc("Print name of local stack variable"),
-    cl::Hidden, cl::init(false));
-
-/* ----- END FLAGS ----- */
-
-
 
 // Define the constructor name and the init function name of the runtime library
 const char kCQMSanModuleCtorName[] = "cqmsan.module_ctor";
 const char kCQMSanInitName[] = "__cqmsan_init";
 
-namespace {
+namespace { // architecture memory map parameters
 
     // Memory map parameters used in application-to-shadow address calculation.
     // Offset = (Addr & ~AndMask) ^ XorMask
@@ -379,22 +358,20 @@ private:
     // TODO - For now Linux x86_64 only
     friend struct VarArgHelperBase;
     friend struct VarArgAMD64Helper;
-    // For unknown architectures
-    friend struct VarArgNoOpHelper;
-    // [TODO] future work, support other architectures
+    friend struct VarArgNoOpHelper; // For unknown architectures
 
     void initializeModule(Module &M);
     void createUserspaceApi(Module &M, const TargetLibraryInfo &TLI);
     void initializeCallbacks(Module &M, const TargetLibraryInfo &TLI);
 
-    bool Recover; // If true, continue after the error (ClKeepGoing)
+    bool Recover;           // If true, continue after the error (ClKeepGoing)
     bool EagerChecks;
 
-    Triple TargetTriple; // Linux/x86_64 etc.
+    Triple TargetTriple;    // Linux/x86_64 etc.
     LLVMContext *C;
 
-    Type *IntptrTy; // i64 on x86_64
-    PointerType *PtrTy; // ptr type
+    Type *IntptrTy;         // i64 on x86_64
+    PointerType *PtrTy;     // ptr type
 
     /// TLS shadow channels ///
     /// Thread-local shadow storage for function parameters.
@@ -409,7 +386,8 @@ private:
     /// Are the instrumentation callbacks set up?
     bool CallbacksInitialized = false;
 
-    /// FunctionCallee for runtime helpers ///
+    /// FunctionCallee for runtime HELPERS ///
+    
     // These arrays are indexed by log2(AccessSize).
     FunctionCallee MaybeWarningFn[kNumberOfAccessSizes];
 
@@ -419,9 +397,6 @@ private:
     FunctionCallee CQMSanPoisonStackFn;
     /// CQMSan runtime replacements for memmove, memcpy and memset.
     FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
-
-    // TODO - implement this
-    FunctionCallee CQMSanInstrumentAsmStoreFn;
     
     // Memory map parameters used in application-to-shadow calculation.
     const MemoryMapParams *MapParams;
@@ -432,7 +407,6 @@ private:
 
 };
 
-// [DONE]
 /// \brief Inserts a global constructor into the module to initialize the CQMSan runtime.
 ///
 /// This function ensures that the runtime initialization function
@@ -476,13 +450,11 @@ template <class T> T getOptOrDefault(const cl::opt<T> &Opt, T Default) {
 
 // ___________________________CompilerQEMUMemorySanitizer___________________________//
 
-// [DONE]
 CompilerQEMUMemorySanitizerOptions::CompilerQEMUMemorySanitizerOptions(bool R,
     bool EagerChecks)
     : Recover(ClKeepGoing),
       EagerChecks(ClEagerChecks) {}
 
-// [DONE]
 PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
 
     insertModuleCtor(M); // ensure the __cqmsan_init is called before main()
@@ -509,9 +481,9 @@ PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysis
     // make changes that require GlobalsAA to be invalidated.
     PA.abandon<GlobalsAA>();
     return PA;
+
 }
 
-// [DONE]
 void CompilerQEMUMemorySanitizerPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
   static_cast<PassInfoMixin<CompilerQEMUMemorySanitizerPass> *>(this)->printPipeline(
@@ -524,7 +496,6 @@ void CompilerQEMUMemorySanitizerPass::printPipeline(
   OS << '>';
 }
 
-// [DONE]
 // Used for declaring globals as "__cqmsan_retval_tls"...
 static Constant *getOrInsertGlobal(Module &M, StringRef Name, Type *Ty) {
   return M.getOrInsertGlobal(Name, Ty, [&] {
@@ -537,7 +508,7 @@ static Constant *getOrInsertGlobal(Module &M, StringRef Name, Type *Ty) {
 void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibraryInfo &TLI) {
     IRBuilder<> IRB(*C);
 
-    // [OPTIMIZATION] - warning fast sarebbe __cqmsan_warning ottimizzato.
+    // [OPTIMIZATION]
     // TODO - future work: add a noreturn variant of the fast warning handler, to avoid the stack unwind and keep going after the warning.
     StringRef WarningFnName = Recover ? "__cqmsan_warning" : "__cqmsan_warning_noreturn";
     if (ClFastWarning && ClPCOnly)
@@ -550,16 +521,16 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     // NoUnwind: warning never throws C++ exceptions, omit unwind tables
     // NoReturn: only for the noreturn variant — fast/keep-going return normally
     AttributeList Attrs = AttributeList();
+    Attrs = Attrs.addFnAttribute(*C, Attribute::NoUnwind);
     if (ClColdWarning) {
         Attrs = Attrs.addFnAttribute(*C, Attribute::Cold);
     }
 
-    Attrs = Attrs.addFnAttribute(*C, Attribute::NoUnwind);
     if (!Recover && !ClFastWarning) {
         Attrs = Attrs.addFnAttribute(*C, Attribute::NoReturn);
     }
+
     WarningFn = M.getOrInsertFunction(WarningFnName, Attrs, IRB.getVoidTy());
-    
 
     // Create the global TLS variables.    
     RetvalTLS =
@@ -615,14 +586,10 @@ void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLib
     // Initialize callbacks that are common for kernel and userspace
     // instrumentation.
     MemmoveFn = M.getOrInsertFunction("__cqmsan_memmove", PtrTy, PtrTy, PtrTy, IntptrTy);
-    MemcpyFn = M.getOrInsertFunction("__cqmsan_memcpy", PtrTy, PtrTy, PtrTy, IntptrTy); 
-    MemsetFn = M.getOrInsertFunction("__cqmsan_memset",
+    MemcpyFn  = M.getOrInsertFunction("__cqmsan_memcpy", PtrTy, PtrTy, PtrTy, IntptrTy); 
+    MemsetFn  = M.getOrInsertFunction("__cqmsan_memset",
                                             TLI.getAttrList(C, {1}, /*Signed=*/true),
                                             PtrTy, PtrTy, IRB.getInt32Ty(), IntptrTy);
-    
-    // TODO - future work: use this
-    CQMSanInstrumentAsmStoreFn = M.getOrInsertFunction("__cqmsan_instrument_asm_store", 
-        IRB.getVoidTy(), PtrTy, IntptrTy);
 
     createUserspaceApi(M, TLI);
     CallbacksInitialized = true;
@@ -633,17 +600,15 @@ void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLib
 ///
 /// inserts a call to __cqmsan_init to the module's constructor list.
 void CompilerQEMUMemorySanitizer::initializeModule(Module &M) {
-    auto &DL = M.getDataLayout();         // wich endianness, size of types, etc.
-    
-    TargetTriple = llvm::Triple(M.getTargetTriple());   // which OS, arch, etc.
-  
-    bool ShadowPassed = ClShadowBase.getNumOccurrences() > 0;
+    auto &DL            = M.getDataLayout();                       // wich endianness, size of types, etc.
+    TargetTriple        = llvm::Triple(M.getTargetTriple());   // which OS, arch, etc.
+    bool ShadowPassed   = ClShadowBase.getNumOccurrences() > 0;
     
     // Check the overrides first
     if (ShadowPassed) {
-        CustomMapParams.AndMask = ClAndMask;
-        CustomMapParams.XorMask = ClXorMask;
-        CustomMapParams.ShadowBase = ClShadowBase;
+        CustomMapParams.AndMask     = ClAndMask;
+        CustomMapParams.XorMask     = ClXorMask;
+        CustomMapParams.ShadowBase  = ClShadowBase;
         MapParams = &CustomMapParams;
     } else {
         switch (TargetTriple.getOS()) {
@@ -670,7 +635,6 @@ void CompilerQEMUMemorySanitizer::initializeModule(Module &M) {
     
     if (Recover) {
         M.getOrInsertGlobal("__cqmsan_keep_going", IRB.getInt32Ty(), [&] {
-            
             return new GlobalVariable(M, IRB.getInt32Ty(), true,
                                     GlobalValue::WeakODRLinkage,
                                     IRB.getInt32(Recover), "__cqmsan_keep_going");
@@ -716,7 +680,7 @@ struct CompilerQEMUMemorySanitizerVisitor;
 static VarArgHelper *CreateVarArgHelper(Function &Func, CompilerQEMUMemorySanitizer &CQMSan,
                                         CompilerQEMUMemorySanitizerVisitor &Visitor);
 
-// [DONE] 11/05
+
 static unsigned TypeSizeToSizeIndex(TypeSize TS) {
     if (TS.isScalable())
         // Scalable types unconditionally take slowpaths.
@@ -939,8 +903,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
     }
-
-    // [DONE] 11/05
+    
     void materializeChecksLegacy() {
 #ifndef NDEBUG
     // For assert below.
@@ -961,7 +924,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         I = J;
     }
 
-        LLVM_DEBUG(dbgs() << "DONE:\n" << F);
+        //LLVM_DEBUG(dbgs() << "DONE:\n" << F);
     }
 
     // TODO - controllare la correttezza di questa funzione, non è chiaro se sia sufficiente per tutti i casi
@@ -1028,7 +991,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return IRB.CreateICmpNE(S, Constant::getNullValue(S->getType()));
     }
 
-    // [DONE] 11/05
     bool runOnFunction() {
 
         // Iterate all BBs in depth-first order and create shadow instructions
@@ -1076,11 +1038,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return true;
     }
 
-    // [DONE] 11/05
     /// Compute the shadow type that corresponds to a given Value.
     Type *getShadowTy(Value *V) { return getShadowTy(V->getType()); }
 
-    // [DONE] 11/05
     /// Compute the shadow type that corresponds to a given Type.
     Type *getShadowTy(Type *OrigTy) {
 
@@ -1121,7 +1081,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return IntegerType::get(*CQMS.C, TypeSize);
     }
 
-    // [DONE] 11/05
     /// Extract combined shadow of struct elements as a bool
     Value *collapseStructShadow(StructType *Struct, Value *Shadow,
                                 IRBuilder<> &IRB) {
@@ -1142,7 +1101,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return Aggregator;
     }
 
-    // [DONE] 11/05
     /// Extract combined shadow of array elements.
     /// Returns scalar shadow != 0 if any element is poisoned.
     Value *collapseArrayShadow(ArrayType *Array, Value *Shadow,
@@ -1162,7 +1120,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return Aggregator;
     }
 
-    // // [DONE] 11/05
     /// Convert a shadow value to its flattened scalar form.
     /// The resulting value can be used to check initialization (e.g., via comparison with 0).
     /// Note: this does not itself apply poisoned/unpoisoned logic — just aggregation.
@@ -1187,7 +1144,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return V;
     }
     
-    // [DONE] 11/05
     // Convert a scalar value to an i1 by comparing with 0
     Value *convertToBool(Value *V, IRBuilder<> &IRB, const Twine &name = "") {
         Type *VTy = V->getType();
@@ -1469,13 +1425,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     }
     
-    // [DONE] 12/05
     /// Get the shadow for i-th argument of the instruction I.
     Value *getShadow(Instruction *I, int i) {
         return getShadow(I->getOperand(i));
     }
 
-    // [DONE] 12/05
     /// Remember the place where a shadow check should be inserted.
     ///
     /// This location will be later instrumented with a check that will print a
@@ -1495,7 +1449,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         InstrumentationList.push_back(ShadowAndInsertPoint(Shadow, OrigIns));
     }
 
-    // [DONE] 12/05
     /// Remember the place where a shadow check should be inserted.
     ///
     /// This location will be later instrumented with a check that will print a
@@ -1512,7 +1465,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         pushShadowCheck(Shadow, OrigIns);
     }
 
-    // [DONE] 12/05
     AtomicOrdering addReleaseOrdering(AtomicOrdering a) {
         switch (a) {
             case AtomicOrdering::NotAtomic:
@@ -1530,7 +1482,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         llvm_unreachable("Unknown ordering");
     }
 
-    // [DONE] 12/05
     Value *makeAddReleaseOrderingTable(IRBuilder<> &IRB) {
       constexpr int NumOrderings = (int)AtomicOrderingCABI::seq_cst + 1;
       uint32_t OrderingTable[NumOrderings] = {};
@@ -1548,7 +1499,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
       return ConstantDataVector::get(IRB.getContext(), OrderingTable);
     }
 
-    // [DONE] 12/05
     AtomicOrdering addAcquireOrdering(AtomicOrdering a) {
         switch (a) {
             case AtomicOrdering::NotAtomic:
@@ -1566,7 +1516,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         llvm_unreachable("Unknown ordering");
     }
 
-    // [DONE] 12/05
     Value *makeAddAcquireOrderingTable(IRBuilder<> &IRB)
     {
       constexpr int NumOrderings = (int)AtomicOrderingCABI::seq_cst + 1;
@@ -1588,7 +1537,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // ------------------- Visitors.
     using InstVisitor<CompilerQEMUMemorySanitizerVisitor>::visit;
 
-    // [DONE] 12/05
     /// \brief Visitor entry point for each individual statement.
     ///
     /// This function acts as a preliminary filter and collector. It is called
@@ -1676,7 +1624,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return false;
     }
 
-    // [DONE] 12/05
     /// Instrument LoadInst
     ///
     /// Loads the corresponding shadow and (optionally) origin.
@@ -1728,7 +1675,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         
     }
 
-    // [DONE] 12/05
     /// Instrument StoreInst
     /// 
     /// Just collect all the store instructions for successively instrument them with
@@ -2390,42 +2336,48 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     // Helper: detect if V is the result of a musttail call.
     // Skip writing retval TLS for these (mustTail ABI propagates return directly).
-    // static bool isAMustTailRetVal(Value *RetVal) {
-    //     if (auto *I = dyn_cast<BitCastInst>(RetVal)) {
-    //         RetVal = I->getOperand(0);
-    //     }
-    //     if (auto *I = dyn_cast<CallInst>(RetVal)) {
-    //         return I->isMustTailCall();
-    //     }
-    //     return false;
-    // }
+    static bool isAMustTailRetVal(Value *RetVal) {
+        if (auto *I = dyn_cast<BitCastInst>(RetVal)) {
+            RetVal = I->getOperand(0);
+        }
+        if (auto *I = dyn_cast<CallInst>(RetVal)) {
+            return I->isMustTailCall();
+        }
+        return false;
+    }
 
-    // [DONE] 28/07 - Removed since we trus the return value, only instrument loads and stores
-    // void visitReturnInst(ReturnInst &I) {
-    //     IRBuilder<> IRB(&I);
-    //     Value *RetVal = I.getReturnValue();
-    //     if (!RetVal) return;                       // void return
-    //     if (isAMustTailRetVal(RetVal)) return;     // mustTail: skip
+    // [OPPORTUNISTIC 2026-07-29] Lightweight return-value SINK check.
+    //
+    // Why this exists: removing eager return handling entirely (no check, no
+    // retval-TLS store — see visitCallBase's TrustReturn fast path) left one
+    // real, measured soundness gap: a local that mem2reg promotes straight to a
+    // register (never touching memory, e.g. `int x; if (c) x = 5; return x;`)
+    // can carry a PHI with a genuine `undef` incoming edge all the way to a
+    // `ret`, with NO load ever occurring on that path — so check-at-load can
+    // never observe it. Census across 4 targets (re2, json, pcre2, c-ares)
+    // found this pattern live on 2/4 (pcre2 2/80 = 2.5%, c-ares 1/41 = 2.4% of
+    // phi-valued returns) — small but real and reproducible.
+    //
+    // The fix is a SINK check, symmetric to why PHI itself is kept: it costs
+    // nothing extra at runtime for the ~100% of returns whose shadow is
+    // provably clean (constant-shadow checks are folded/DCE'd — same argument
+    // as the old eager-check comment), and it does NOT reintroduce the
+    // retval-TLS propagation machinery: the caller side is untouched, still
+    // always assumes clean (ClTrustReturn policy in visitCallBase, unchanged).
+    // Gated on NoUndef exactly like the old eager-check was, to keep the
+    // false-positive surface unchanged (a non-noundef return is not asserted
+    // to be fully defined by the ABI, so we must not flag it opportunistically).
+    void visitReturnInst(ReturnInst &I) {
+        Value *RetVal = I.getReturnValue();
+        if (!RetVal) return;                       // void return
+        if (isAMustTailRetVal(RetVal)) return;     // mustTail
 
-    //     Value *ShadowPtr = getShadowPtrForRetval(IRB);
-
-    //     bool HasNoUndef = F.hasRetAttribute(Attribute::NoUndef);
-    //     bool StoreShadow = !(CQMS.EagerChecks && HasNoUndef);
-    //     // Eager check del retval if: (a) return is noundef and the flag is active,
-    //     // oterwise (b) the function is "main".
-    //     bool EagerCheck = (CQMS.EagerChecks && HasNoUndef) || (F.getName() == "main");
-    //     Value *Shadow = getShadow(RetVal);
-    //     if (EagerCheck) {
-    //         // Immediate check on the return value: if shadow is clean (expected for noundef),
-    //         // the icmp is folded to false and DCE'd. No runtime code.
-    //         insertShadowCheck(RetVal, &I);
-    //         Shadow = getCleanShadow(RetVal);
-    //     }
-        
-    //     if (StoreShadow && !ClTrustReturn) {
-    //         IRB.CreateAlignedStore(Shadow, ShadowPtr, kShadowTLSAlignment);
-    //     }
-    // }
+        if (F.hasRetAttribute(Attribute::NoUndef)) {
+            setShadow(&I, getCleanShadow(&I));
+            return;
+        }
+        // No retval-TLS store: the caller always assumes clean (ClTrustReturn=true)
+    }
     
     void visitPHINode(PHINode &I) {
         IRBuilder<> IRB(&I);
@@ -2844,7 +2796,6 @@ struct VarArgAMD64Helper : public VarArgHelperBase {
     }
 };
 
-// [DONE] 12/05
 /// A no-op implementation of VarArgHelper.
 ///
 /// Used on architectures other than x86_64 where CQMSAN does not propagate
@@ -3048,7 +2999,6 @@ static bool isFunctionIgnored(const Function &F) {
     return false;
 }
 
-// [DONE] 18/05
 bool CompilerQEMUMemorySanitizer::sanitizeFunction(Function &F,
                                                    TargetLibraryInfo &TLI) {
     if (F.getName() == kCQMSanModuleCtorName)
