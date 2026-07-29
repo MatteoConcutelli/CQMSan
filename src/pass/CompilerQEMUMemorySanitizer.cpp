@@ -2240,10 +2240,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         if (!RetVal) return;                       // void return
         if (isAMustTailRetVal(RetVal)) return;     // mustTail
 
-        if (F.hasRetAttribute(Attribute::NoUndef)) {
-            setShadow(&I, getCleanShadow(&I));
-            return;
-        }
+        if (F.hasRetAttribute(Attribute::NoUndef)) 
+            insertShadowCheck(RetVal, &I);
+        
         // No retval-TLS store: the caller always assumes clean (ClTrustReturn=true)
     }
     
