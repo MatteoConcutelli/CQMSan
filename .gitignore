@@ -2,3 +2,4 @@
 # riferimento per i confronti — non va versionata.
 original-msan/
 docs/
+src/aflpp/src/afl-fuzz-bitmap.c
