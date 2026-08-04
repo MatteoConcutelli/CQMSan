@@ -249,6 +249,8 @@ extern "C" void __libc_free(void *ptr);
 static const __sanitizer::uptr kHeaderWords = 2; // [delta-to-base][requested_size]
 // header minimum dimension
 static const __sanitizer::uptr kMinHeaderSlot = kHeaderWords * sizeof(__sanitizer::uptr); // 16 on x86_64
+// magic value to detect glibc-path allocations in AllocationBegin/AllocationSize
+static const __sanitizer::uptr kHeaderMagic = 0x43514D53414E00ULL; // random not probable value // TODO
 
 // Mirrors glibc's own M_MMAP_THRESHOLD default: allocations at/above this are
 // likely individually mmap'd by glibc itself, making a real page-release
@@ -262,6 +264,7 @@ static inline void *CQMsanGlibcHeaderToUser(void *raw, __sanitizer::uptr header_
   void *user = reinterpret_cast<char *>(raw) + header_slot;
   reinterpret_cast<__sanitizer::uptr *>(user)[-1] = size;
   reinterpret_cast<__sanitizer::uptr *>(user)[-2] = header_slot;
+  reinterpret_cast<__sanitizer::uptr *>(user)[-3] = kHeaderMagic; // canary
   return user;
 }
 
@@ -512,6 +515,8 @@ static void *CQMsanCalloc(__sanitizer::BufferedStackTrace *stack, __sanitizer::u
   return CQMsanAllocate(stack, nmemb * size, sizeof(u64), true);
 }
 
+
+
 #ifdef CQMSAN_GLIBC_ALLOC
 // Known limitation vs the original (which supports INTERIOR pointers via
 // allocator.GetBlockBegin): this glibc-path version only recognizes EXACT
@@ -519,9 +524,18 @@ static void *CQMsanCalloc(__sanitizer::BufferedStackTrace *stack, __sanitizer::u
 // start from an interior pointer without the sanitizer allocator's own
 // bookkeeping. Not exercised today: no target in this project calls the
 // __sanitizer_get_allocated_begin/malloc_usable_size family itself.
+// As a conseguence, if a user calls free() on an interior pointer, the glibc-path allocator
+// will not recognize it as a valid allocation and will report a double-free
+// or invalid free error. This is a known limitation of the glibc-path allocator.
 static const void *AllocationBegin(const void *p) {
-  if (!p)
-    return nullptr;
+  if (!p) return nullptr;
+  
+  if (((const __sanitizer::uptr *)p)[-3] != kHeaderMagic) {
+    Report("CQMSAN: malloc_usable_size/AllocationSize on a pointer that is not "
+           "the start of an allocation (possible internal pointer to hanlde): %p\n", p);
+    Die();   // abort
+  }
+
   __sanitizer::uptr size = reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
   if (size == 0)
     return nullptr;
@@ -532,7 +546,7 @@ static __sanitizer::uptr AllocationSizeFast(const void *p) {
   return reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
 }
 
-#else
+#else // CQMSAN_GLIBC_ALLOC
 
 static const void *AllocationBegin(const void *p) {
   if (!p)
@@ -554,6 +568,8 @@ static __sanitizer::uptr AllocationSizeFast(const void *p) {
 }
 
 #endif // CQMSAN_GLIBC_ALLOC
+
+
 
 static __sanitizer::uptr AllocationSize(const void *p) {
   if (!p)
