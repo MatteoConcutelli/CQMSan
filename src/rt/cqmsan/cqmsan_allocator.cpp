@@ -42,6 +42,7 @@ struct CQMsanMapUnmapCallback {
   // no-op 
   void OnMapSecondary(__sanitizer::uptr p, __sanitizer::uptr size, __sanitizer::uptr user_begin,
                       __sanitizer::uptr user_size) const {}
+
   void OnUnmap(__sanitizer::uptr p, __sanitizer::uptr size) const {
     __cqmsan_unpoison((void *)p, size);
 
@@ -189,6 +190,194 @@ void CQMsanThreadLocalMallocStorage::CommitBack() {
   allocator.DestroyCache(GetAllocatorCache(this));
 }
 
+// GLIBC-passthrough allocator
+#ifdef CQMSAN_GLIBC_ALLOC
+// ============================================================================
+// Reduced-scope "glibc passthrough" allocator. Bypasses sanitizer_common's
+// CombinedAllocator (arenas/metadata/thread caches/spinlocks) entirely,
+// using __libc_malloc/__libc_calloc/__libc_memalign/__libc_free, while
+// preserving poison_in_malloc/poison_in_free semantics manually.
+//
+//   - Headers: [delta-to-base][size] right
+//     before the user pointer. `delta-to-base` lets us support alignment
+//     requests (memalign/posix_memalign/aligned_alloc/valloc/pvalloc) with
+//     the SAME free()/realloc() code path as plain malloc — for those,
+//     delta-to-base = header_slot = Max(alignment, 2*sizeof(uptr)), and the
+//     block is obtained via __libc_memalign(alignment, header_slot+size) so
+//     the user pointer (raw+header_slot) is still `alignment`-aligned (valid
+//     because header_slot is itself a multiple of `alignment` whenever
+//     alignment > 2*sizeof(uptr), and constant 2*sizeof(uptr)=16 otherwise —
+//     already exceeding glibc's own natural malloc alignment guarantee, so
+//     plain malloc/calloc is used instead of memalign for that common case).
+//
+//   - Origin tracking restored (gated on __cqmsan_get_track_origins(), which
+//     is already a cheap flag read — this project keeps it OFF by default,
+//     so this costs nothing extra unless it's ever turned on).
+//
+//   - IsRssLimitExceeded() check restored (identical cost to what the
+//     ORIGINAL path already pays — this was a pure omission, not a trade).
+//
+//   - AllocationSize/AllocationBegin (below, shared code) now read from this
+//     same header instead of allocator.GetMetaData — was a known gap
+//     (malloc_usable_size would have misbehaved on a glibc-path pointer).
+//
+//   - Proactive shadow-memory release-to-OS on free, mirroring what
+//     CQMsanMapUnmapCallback::OnUnmap already does for the ORIGINAL
+//     allocator's secondary (large) allocations — but SIZE-GATED
+//     (kShadowReleaseThreshold, matching glibc's own M_MMAP_THRESHOLD
+//     default of 128KB) so the hot path (small, short-lived allocations,
+//     which dominate a workload like libxml2 parsing) pays ZERO extra
+//     syscalls; only allocations large enough that glibc itself likely
+//     mmap'd them directly pay this cost — same trade the ORIGINAL design
+//     already makes for its own primary/secondary split.
+// ============================================================================
+
+extern "C" void *__libc_malloc(__sanitizer::uptr size);
+extern "C" void *__libc_calloc(__sanitizer::uptr nmemb, __sanitizer::uptr size);
+extern "C" void __libc_free(void *ptr);
+
+// NOTE: deliberately NOT using __libc_memalign here. Unlike __libc_malloc/
+// __libc_calloc/__libc_free (confirmed unintercepted — grep
+// cqmsan_interceptors.cpp), __libc_memalign IS ALSO wrapped by this
+// runtime's own INTERCEPTOR(void*, __libc_memalign, ...). 
+// 
+// Calling it here would re-enter cqmsan_memalign -> CQMsanAllocate 
+// -> __libc_memalign -> ... — infinite recursion (hit and fixed during 
+// this same pass). Alignment is instead implemented by over-allocating
+// via plain __libc_malloc/__libc_calloc and rounding the returned pointer up.
+
+static const __sanitizer::uptr kHeaderWords = 2; // [delta-to-base][requested_size]
+// header minimum dimension
+static const __sanitizer::uptr kMinHeaderSlot = kHeaderWords * sizeof(__sanitizer::uptr); // 16 on x86_64
+
+// Mirrors glibc's own M_MMAP_THRESHOLD default: allocations at/above this are
+// likely individually mmap'd by glibc itself, making a real page-release
+// meaningful; below it they live in a heap arena glibc reuses internally, so
+// releasing shadow pages for them would be a wasted syscall on the hot path.
+static const __sanitizer::uptr kShadowReleaseThreshold = 128 * 1024; // 128KB
+
+
+static inline void *CQMsanGlibcHeaderToUser(void *raw, __sanitizer::uptr header_slot,
+                                            __sanitizer::uptr size) {
+  void *user = reinterpret_cast<char *>(raw) + header_slot;
+  reinterpret_cast<__sanitizer::uptr *>(user)[-1] = size;
+  reinterpret_cast<__sanitizer::uptr *>(user)[-2] = header_slot;
+  return user;
+}
+
+static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer::uptr size, __sanitizer::uptr alignment,
+                          bool zero) {
+
+  if (UNLIKELY(size > max_malloc_size)) {
+    if (AllocatorMayReturnNull()) {
+      Report("WARNING: CompilerQEMUMemorySanitizer failed to allocate 0x%zx bytes\n", size);
+      return nullptr; 
+    }
+    GET_FATAL_STACK_TRACE_IF_EMPTY(stack);
+    ReportAllocationSizeTooBig(size, max_malloc_size, stack);
+  }
+
+  if (UNLIKELY(IsRssLimitExceeded())) {
+    if (AllocatorMayReturnNull())
+      return nullptr;
+    GET_FATAL_STACK_TRACE_IF_EMPTY(stack);
+    ReportRssLimitExceeded(stack);
+  }
+
+  bool needs_align = alignment > kMinHeaderSlot; 
+  // true for function that return non-default alignment (memalign, posix_memalign, malloc...) 
+  // Worst case, the next `alignment` boundary is up to (alignment-1) bytes
+  // past where the header would naturally end — over-allocate that much
+  // slack so a valid [header][aligned user data] layout always fits.
+
+  __sanitizer::uptr real_size = needs_align ? 
+                                    (kMinHeaderSlot + size + alignment - 1) : (kMinHeaderSlot + size);
+  
+  void *raw = zero ? __libc_calloc(1, real_size) : __libc_malloc(real_size); // raw = header + user_data
+  if (UNLIKELY(!raw)) {
+    SetAllocatorOutOfMemory();
+    if (AllocatorMayReturnNull())
+      return nullptr;
+    GET_FATAL_STACK_TRACE_IF_EMPTY(stack);
+    ReportOutOfMemory(size, stack);
+  }
+
+  __sanitizer::uptr header_slot;
+  if (needs_align) {
+    __sanitizer::uptr candidate = reinterpret_cast<__sanitizer::uptr>(raw) + kMinHeaderSlot;
+    __sanitizer::uptr aligned = RoundUpTo(candidate, alignment); // align from user data start, not header start
+    header_slot = aligned - reinterpret_cast<__sanitizer::uptr>(raw);    // user_data - raw = header
+  } else {
+    header_slot = kMinHeaderSlot;
+  }
+
+  void *allocated = CQMsanGlibcHeaderToUser(raw, header_slot, size);
+
+  if (zero) {
+    // __libc_calloc above already zeroed the WHOLE real_size buffer
+    // (header + any allignment padding + user region), so `allocated` is
+    // genuinely zeroed regardless of needs_align - no extra memset needed.
+    //__cqmsan_clear_and_unpoison(allocated, size); // calloc → shadow CLEAN -> avoid to call memset again.
+    SetShadow(allocated, size, (u8)0);
+
+  } else if (flags()->poison_in_malloc) {
+    __cqmsan_poison(allocated, size);   // not initialized heap
+    
+    if (__cqmsan_get_track_origins()) {
+      stack->tag = __sanitizer::StackTrace::TAG_ALLOC;
+      Origin o = Origin::CreateHeapOrigin(stack);
+      __cqmsan_set_origin(allocated, size, o.raw_id());
+    }
+
+  }
+  
+  UnpoisonParam(2);
+  RunMallocHooks(allocated, size);
+  return allocated;
+}
+
+void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p) {
+  DCHECK(p);  //debug check
+  UnpoisonParam(1);
+  RunFreeHooks(p);
+
+  __sanitizer::uptr size = reinterpret_cast<__sanitizer::uptr *>(p)[-1];
+  __sanitizer::uptr header_slot = reinterpret_cast<__sanitizer::uptr *>(p)[-2];
+  void *raw = reinterpret_cast<char *>(p) - header_slot;
+
+  if (flags()->poison_in_free) {
+    __cqmsan_poison(p, size);
+    if (__cqmsan_get_track_origins()) {
+      stack->tag = __sanitizer::StackTrace::TAG_DEALLOC;
+      Origin o = Origin::CreateHeapOrigin(stack);
+      __cqmsan_set_origin(p, size, o.raw_id());
+    }
+  }
+
+  __libc_free(raw);
+  // Size-gated proactive shadow release (mirrors CQMsanMapUnmapCallback::OnUnmap
+  // for the ORIGINAL allocator's secondary/large allocations)
+  if (size >= kShadowReleaseThreshold) {
+    __sanitizer::uptr shadow_p = MEM_TO_SHADOW(reinterpret_cast<__sanitizer::uptr>(p));
+    ReleaseMemoryPagesToOS(shadow_p, shadow_p + size);
+  }
+}
+
+static void *CQMsanReallocateGlibc(__sanitizer::BufferedStackTrace *stack, void *old_p,
+                            __sanitizer::uptr new_size, __sanitizer::uptr alignment) {
+
+  __sanitizer::uptr old_size = reinterpret_cast<__sanitizer::uptr *>(old_p)[-1];
+  __sanitizer::uptr copy_size = Min(new_size, old_size);
+  void *new_p = CQMsanAllocate(stack, new_size, alignment, false);
+  if (new_p) {
+    CopyMemory(new_p, old_p, copy_size, stack);
+    CQMsanDeallocate(stack, old_p);
+  }
+  return new_p;
+}
+
+#else // !CQMSAN_GLIBC_ALLOC — original sanitizer_common CombinedAllocator path
+
 static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer::uptr size, __sanitizer::uptr alignment,
                           bool zero) {
   if (UNLIKELY(size > max_malloc_size)) {
@@ -205,6 +394,7 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
     GET_FATAL_STACK_TRACE_IF_EMPTY(stack);
     ReportRssLimitExceeded(stack);
   }
+  
   CQMsanThread *t = GetCurrentThread();
   void *allocated;
   if (t) {
@@ -274,6 +464,17 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
   }
 }
 
+#endif // CQMSAN_GLIBC_ALLOC
+
+#ifdef CQMSAN_GLIBC_ALLOC
+
+static void *CQMsanReallocate(__sanitizer::BufferedStackTrace *stack, void *old_p,
+                            __sanitizer::uptr new_size, __sanitizer::uptr alignment) {
+  return CQMsanReallocateGlibc(stack, old_p, new_size, alignment);
+}
+
+#else
+
 static void *CQMsanReallocate(__sanitizer::BufferedStackTrace *stack, void *old_p,
                             __sanitizer::uptr new_size, __sanitizer::uptr alignment) {
   Metadata *meta = reinterpret_cast<Metadata*>(allocator.GetMetaData(old_p));
@@ -299,6 +500,8 @@ static void *CQMsanReallocate(__sanitizer::BufferedStackTrace *stack, void *old_
   return new_p;
 }
 
+#endif
+
 static void *CQMsanCalloc(__sanitizer::BufferedStackTrace *stack, __sanitizer::uptr nmemb, __sanitizer::uptr size) {
   if (UNLIKELY(CheckForCallocOverflow(size, nmemb))) {
     if (AllocatorMayReturnNull())
@@ -308,6 +511,28 @@ static void *CQMsanCalloc(__sanitizer::BufferedStackTrace *stack, __sanitizer::u
   }
   return CQMsanAllocate(stack, nmemb * size, sizeof(u64), true);
 }
+
+#ifdef CQMSAN_GLIBC_ALLOC
+// Known limitation vs the original (which supports INTERIOR pointers via
+// allocator.GetBlockBegin): this glibc-path version only recognizes EXACT
+// allocation-start pointers — there is no registry to recover a block's
+// start from an interior pointer without the sanitizer allocator's own
+// bookkeeping. Not exercised today: no target in this project calls the
+// __sanitizer_get_allocated_begin/malloc_usable_size family itself.
+static const void *AllocationBegin(const void *p) {
+  if (!p)
+    return nullptr;
+  __sanitizer::uptr size = reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
+  if (size == 0)
+    return nullptr;
+  return p;
+}
+
+static __sanitizer::uptr AllocationSizeFast(const void *p) {
+  return reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
+}
+
+#else
 
 static const void *AllocationBegin(const void *p) {
   if (!p)
@@ -328,10 +553,13 @@ static __sanitizer::uptr AllocationSizeFast(const void *p) {
   return reinterpret_cast<Metadata *>(allocator.GetMetaData(p))->requested_size;
 }
 
+#endif // CQMSAN_GLIBC_ALLOC
+
 static __sanitizer::uptr AllocationSize(const void *p) {
   if (!p)
     return 0;
-  if (allocator.GetBlockBegin(p) != p)
+  //if (allocator.GetBlockBegin(p) != p)
+  if (AllocationBegin(p) != p)
     return 0;
   return AllocationSizeFast(p);
 }
