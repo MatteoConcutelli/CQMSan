@@ -344,6 +344,11 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
 
 void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p) {
   DCHECK(p);  //debug check
+  if (reinterpret_cast<__sanitizer::uptr *>(p)[-3] != kHeaderMagic) {
+    Report("CQMSAN: free() on a pointer that is not the start of an allocation "
+            "(interior pointer, double-free, or corrupted header): %p\n", p);
+    Die();
+  }
   UnpoisonParam(1);
   RunFreeHooks(p);
 
