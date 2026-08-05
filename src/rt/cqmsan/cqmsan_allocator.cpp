@@ -246,9 +246,10 @@ extern "C" void __libc_free(void *ptr);
 // this same pass). Alignment is instead implemented by over-allocating
 // via plain __libc_malloc/__libc_calloc and rounding the returned pointer up.
 
-static const __sanitizer::uptr kHeaderWords = 2; // [delta-to-base][requested_size]
-// header minimum dimension
-static const __sanitizer::uptr kMinHeaderSlot = kHeaderWords * sizeof(__sanitizer::uptr); // 16 on x86_64
+static const __sanitizer::uptr kHeaderWords = 3; // [delta-to-base][requested_size]
+static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(__sanitizer::uptr), 16); // 16 on x86_64
+// If the user requested alignment > kMinHeaderSlot, we will over-allocate
+
 // magic value to detect glibc-path allocations in AllocationBegin/AllocationSize
 static const __sanitizer::uptr kHeaderMagic = 0x43514D53414E00ULL; // random not probable value // TODO
 
@@ -262,9 +263,11 @@ static const __sanitizer::uptr kShadowReleaseThreshold = 128 * 1024; // 128KB
 static inline void *CQMsanGlibcHeaderToUser(void *raw, __sanitizer::uptr header_slot,
                                             __sanitizer::uptr size) {
   void *user = reinterpret_cast<char *>(raw) + header_slot;
+  // Headers
   reinterpret_cast<__sanitizer::uptr *>(user)[-1] = size;
   reinterpret_cast<__sanitizer::uptr *>(user)[-2] = header_slot;
   reinterpret_cast<__sanitizer::uptr *>(user)[-3] = kHeaderMagic; // canary
+
   return user;
 }
 
@@ -294,7 +297,7 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
   // slack so a valid [header][aligned user data] layout always fits.
 
   __sanitizer::uptr real_size = needs_align ? 
-                                    (kMinHeaderSlot + size + alignment - 1) : (kMinHeaderSlot + size);
+                                    (kMinHeaderSlot + size + (alignment - 1)) : (kMinHeaderSlot + size);
   
   void *raw = zero ? __libc_calloc(1, real_size) : __libc_malloc(real_size); // raw = header + user_data
   if (UNLIKELY(!raw)) {
@@ -307,9 +310,9 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
 
   __sanitizer::uptr header_slot;
   if (needs_align) {
-    __sanitizer::uptr candidate = reinterpret_cast<__sanitizer::uptr>(raw) + kMinHeaderSlot;
+    __sanitizer::uptr candidate = reinterpret_cast<__sanitizer::uptr>(raw) + kMinHeaderSlot; // make space for headers
     __sanitizer::uptr aligned = RoundUpTo(candidate, alignment); // align from user data start, not header start
-    header_slot = aligned - reinterpret_cast<__sanitizer::uptr>(raw);    // user_data - raw = header
+    header_slot = aligned - reinterpret_cast<__sanitizer::uptr>(raw);    // aligned_user_data - raw = header
   } else {
     header_slot = kMinHeaderSlot;
   }
