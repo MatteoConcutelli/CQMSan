@@ -259,7 +259,6 @@ static const __sanitizer::uptr kHeaderMagic = 0x43514D53414E00ULL; // random not
 // releasing shadow pages for them would be a wasted syscall on the hot path.
 static const __sanitizer::uptr kShadowReleaseThreshold = 128 * 1024; // 128KB
 
-
 static inline void *CQMsanGlibcHeaderToUser(void *raw, __sanitizer::uptr header_slot,
                                             __sanitizer::uptr size) {
   void *user = reinterpret_cast<char *>(raw) + header_slot;
@@ -308,6 +307,21 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
     ReportOutOfMemory(size, stack);
   }
 
+  // Everything below assumes MEM_TO_SHADOW(raw) lands in a mapped SHADOW
+  // region — true today because glibc's brk-heap and mmap'd allocations
+  // both land inside the APP ranges the kMemoryLayout table expects for
+  // this build's ASLR/PIE configuration (verified empirically, not just by
+  // construction — see Part 5 of the Lesson doc). Unlike the original
+  // allocator's fixed, hand-picked arena address, this is a fact about how
+  // glibc+kernel currently behave, not a guarantee this code enforces by
+  // itself — so check it explicitly instead of assuming it silently holds.
+  if (UNLIKELY(!MEM_IS_APP(reinterpret_cast<__sanitizer::uptr>(raw)))) {
+    Report("CQMSAN: glibc returned a heap pointer outside the expected APP "
+           "memory range (%p) — shadow mapping would be invalid; refusing "
+           "to poison unmapped/foreign memory.\n", raw);
+    Die();
+  }
+
   __sanitizer::uptr header_slot;
   if (needs_align) {
     __sanitizer::uptr candidate = reinterpret_cast<__sanitizer::uptr>(raw) + kMinHeaderSlot; // make space for headers
@@ -336,7 +350,7 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
     }
 
   }
-  
+
   UnpoisonParam(2);
   RunMallocHooks(allocated, size);
   return allocated;
@@ -376,6 +390,12 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
 
 static void *CQMsanReallocateGlibc(__sanitizer::BufferedStackTrace *stack, void *old_p,
                             __sanitizer::uptr new_size, __sanitizer::uptr alignment) {
+
+  if (reinterpret_cast<__sanitizer::uptr *>(old_p)[-3] != kHeaderMagic) {
+    Report("CQMSAN: realloc() on a pointer that is not the start of an allocation "
+            "(interior pointer, double-free, or corrupted header): %p\n", old_p);
+    Die();
+  }
 
   __sanitizer::uptr old_size = reinterpret_cast<__sanitizer::uptr *>(old_p)[-1];
   __sanitizer::uptr copy_size = Min(new_size, old_size);
@@ -678,6 +698,16 @@ int __cqmsan::cqmsan_posix_memalign(void **memptr, __sanitizer::uptr alignment, 
 }
 
 extern "C" {
+// NOTE (CQMSAN_GLIBC_ALLOC): allocator.GetStats() below reports the
+// sanitizer_common allocator's own counters, which stay permanently frozen
+// at ~0 under the glibc passthrough (nothing routes through `allocator`
+// anymore) — technically wrong. Left as-is deliberately: these two symbols
+// are exported ABI (sanitizer_allocator_interface.h) but have zero callers
+// anywhere in this project (checked: no target, no harness, no internal
+// sanitizer_common code calls them). Paying a real atomic-RMW cost on every
+// malloc/free to keep a counter that backs an API nobody reads contradicts
+// the whole point of the opportunistic design — not worth it unless/until
+// something actually depends on the answer being right.
 __sanitizer::uptr __sanitizer_get_current_allocated_bytes() {
   __sanitizer::uptr stats[AllocatorStatCount];
   allocator.GetStats(stats);
