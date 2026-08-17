@@ -262,6 +262,7 @@ void init_cmdline(afl_state_t *afl){
     char* ld_prefix = getenv("QEMU_LD_PREFIX");
     if(ld_prefix)
       sprintf(cmdline, "QEMU_LD_PREFIX=%s ", ld_prefix);
+      
     char* path = getenv("QMSAN_PATH");
     if(path)
       OKF("Using QMSan's accurate detector");
@@ -333,7 +334,17 @@ int qmsan_check_bugs(afl_state_t *afl){
       afl->fsrv.msan_bits[MAP_SIZE - 1] = 0;
       //use heavyweight instrumentation
       QMSAN_LOG("Potential crash detected\n");
+#ifdef QMSAN_NOOP_ACCURATE
+      // [NOOP experiment] Skip the fork+exec of the accurate detector
+      // entirely (no system() call at all) instead of paying for it against
+      // /bin/true. status=0 mirrors exactly what /bin/true would return
+      // (always exit 0), so every downstream classification/counting/dump
+      // path below is UNCHANGED -- this isolates the cost of the fork+exec
+      // itself from the cost of the decision bookkeeping in check_msan_trace.
+      int status = 0;
+#else
       int status = (int) WEXITSTATUS(system(cmdline));
+#endif
       QMSAN_LOG("[system] exit status: %d\n", status);
       //we keep going since they will be at least saved with the FP
       //we can check them later

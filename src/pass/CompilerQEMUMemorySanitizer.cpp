@@ -401,6 +401,11 @@ private:
     FunctionCallee CQMSanPoisonStackFn;
     /// CQMSan runtime replacements for memmove, memcpy and memset.
     FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
+#ifdef CQMSAN_FLIP_CONVENTION
+    /// [FLIP experiment] range-list lookup: is this app address inside a
+    /// statically-initialized (loader-mapped) region? See __cqmsan_is_static_range.
+    FunctionCallee IsStaticRangeFn;
+#endif
     
     // Memory map parameters used in application-to-shadow calculation.
     const MemoryMapParams *MapParams;
@@ -594,6 +599,10 @@ void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLib
     MemsetFn  = M.getOrInsertFunction("__cqmsan_memset",
                                             TLI.getAttrList(C, {1}, /*Signed=*/true),
                                             PtrTy, PtrTy, IRB.getInt32Ty(), IntptrTy);
+#ifdef CQMSAN_FLIP_CONVENTION
+    IsStaticRangeFn = M.getOrInsertFunction("__cqmsan_is_static_range",
+                                            IRB.getInt1Ty(), IntptrTy);
+#endif
 
     createUserspaceApi(M, TLI);
     CallbacksInitialized = true;
@@ -947,9 +956,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     // Helper
     Value *normalizeShadow(IRBuilder<> &IRB, Value *S) {
+#ifdef CQMSAN_FLIP_CONVENTION
+        // [FLIP experiment] 0=uninit: an element is poisoned iff it is 0, so a
+        // vector is poisoned iff ANY element is 0 <=> AND-reduce is 0 (not all
+        // elements nonzero). Mirror of the non-flip OR-reduce below.
+        if (S->getType()->isVectorTy())
+            S = IRB.CreateAndReduce(S);
+        return IRB.CreateICmpEQ(S, Constant::getNullValue(S->getType()));
+#else
         if (S->getType()->isVectorTy())
             S = IRB.CreateOrReduce(S);
         return IRB.CreateICmpNE(S, Constant::getNullValue(S->getType()));
+#endif
     }
 
     void materializeChecks() {
@@ -1139,7 +1157,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         
         if (isa<VectorType>(Ty)) {
             if (isa<ScalableVectorType>(Ty))
+#ifdef CQMSAN_FLIP_CONVENTION
+                return convertShadowToScalar(IRB.CreateAndReduce(V), IRB);
+#else
                 return convertShadowToScalar(IRB.CreateOrReduce(V), IRB);
+#endif
             
             unsigned BitWidth =
                 Ty->getPrimitiveSizeInBits().getFixedValue();
@@ -1159,7 +1181,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // Just converting a bool to a bool, so do nothing.
             return V; // already i1, no need to invert
         }
+#ifdef CQMSAN_FLIP_CONVENTION
+        // [FLIP experiment] 0=uninit: poisoned iff raw shadow == 0.
+        return IRB.CreateICmpEQ(V, ConstantInt::get(VTy, 0), name);
+#else
         return IRB.CreateICmpNE(V, ConstantInt::get(VTy, 0), name);  // post-G1
+#endif
     }
 
     Type *ptrToIntPtrType(Type *PtrTy) const {
@@ -1273,12 +1300,41 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         ShadowMap[V] = SV;
     }
 
+#ifdef CQMSAN_FLIP_CONVENTION
+    // [FLIP experiment] Recursive all-ones constant builder, factored out so
+    // both getCleanShadow and getPoisonedShadow can use it depending on which
+    // one the flip makes "the all-ones one". Handles int/vector directly,
+    // array/struct recursively (identical logic to the non-flipped
+    // getPoisonedShadow below, just under a neutral name).
+    Constant *getAllOnesShadow(Type *ShadowTy) {
+        assert(ShadowTy);
+        if (isa<IntegerType>(ShadowTy) || isa<VectorType>(ShadowTy))
+            return Constant::getAllOnesValue(ShadowTy);
+        if (ArrayType *AT = dyn_cast<ArrayType>(ShadowTy)) {
+            SmallVector<Constant *, 4> Vals(AT->getNumElements(),
+                                        getAllOnesShadow(AT->getElementType()));
+            return ConstantArray::get(AT, Vals);
+        }
+        if (StructType *ST = dyn_cast<StructType>(ShadowTy)) {
+            SmallVector<Constant *, 4> Vals;
+            for (unsigned i = 0, n = ST->getNumElements(); i < n; i++)
+                Vals.push_back(getAllOnesShadow(ST->getElementType(i)));
+            return ConstantStruct::get(ST, Vals);
+        }
+        llvm_unreachable("Unexpected shadow type");
+    }
+#endif
+
     // create clean shadow value for a given type as initialized
     Constant *getCleanShadow(Type *OrigTy) {
         Type *ShadowTy = getShadowTy(OrigTy);
         if (!ShadowTy)
             return nullptr;
+#ifdef CQMSAN_FLIP_CONVENTION
+        return getAllOnesShadow(ShadowTy);  // 0=uninit: clean is all-ones
+#else
         return Constant::getNullValue(ShadowTy);
+#endif
     }
 
     /// Create a clean shadow value for a given value.
@@ -1287,8 +1343,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Create a dirty shadow of a given shadow type.
     Constant *getPoisonedShadow(Type *ShadowTy) {
         assert(ShadowTy);
+#ifdef CQMSAN_FLIP_CONVENTION
+        return Constant::getNullValue(ShadowTy);  // 0=uninit: poison is all-zero
+#else
         if (isa<IntegerType>(ShadowTy) || isa<VectorType>(ShadowTy))
-            return Constant::getAllOnesValue(ShadowTy); 
+            return Constant::getAllOnesValue(ShadowTy);
 
         if (ArrayType *AT = dyn_cast<ArrayType>(ShadowTy)) {
             SmallVector<Constant *, 4> Vals(AT->getNumElements(),
@@ -1303,6 +1362,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             return ConstantStruct::get(ST, Vals);
         }
         llvm_unreachable("Unexpected shadow type");
+#endif
     }
 
     /// Create a dirty shadow for a given value.
@@ -1584,12 +1644,65 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             
             Value *ShadowPtr       = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
             LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
-            
-            setShadow(&I, LoadedShadow); 
+            Value *EffectiveShadow = LoadedShadow;
+
+#ifdef CQMSAN_FLIP_CONVENTION
+            // [FLIP experiment, fast/slow path] Under 0=uninit, a never-explicitly-
+            // written global (loader-initialized .data/.bss) has virgin
+            // shadow=0=poisoned by default, which is wrong (the loader DID
+            // initialize it) — the "globals become FP-prone" problem documented in
+            // STUDIO_unpoison_punti_e_costo.md §9-bis. Mirrors QMSan's own fix
+            // (msan_giovese_add_mmap/check_addr_mmap_list, verified in
+            // qemu/linux-user/elfload.c): a runtime range-list of loader-mapped
+            // segments, consulted here to override the shadow to clean for
+            // addresses inside a known-initialized range, WITHOUT ever writing
+            // shadow bytes for that region.
+            //
+            // Unlike the first version of this experiment, the range-list call is
+            // NOT made unconditionally on every load. QMSan's own equivalent check
+            // (msan-giovese-inl.h) is short-circuited: `((~res & MSAN_8)!=0) &&
+            // msan_giovese_check_addr(ptr)` — the expensive list walk runs only
+            // when the raw shadow already looks poisoned, to disambiguate a real
+            // bug from a loader-initialized false alarm. Mirrored here as a real
+            // fast/slow basic-block split: for the overwhelming majority of loads
+            // (genuinely defined memory, RawPoisoned=false), __cqmsan_is_static_range
+            // never runs at all.
+            Value *RawPoisoned = convertToBool(LoadedShadow, IRB, "_cqmsrawpoison");
+            BasicBlock *FastBB = IRB.GetInsertBlock();
+            Instruction *SlowTerm = SplitBlockAndInsertIfThen(
+                RawPoisoned, &*IRB.GetInsertPoint(), /*Unreachable*/false, CQMS.ColdCallWeights);
+            BasicBlock *SlowBB = SlowTerm->getParent();
+            BasicBlock *TailBB = SlowTerm->getSuccessor(0);
+
+            IRBuilder<> SlowIRB(SlowTerm);
+            Value *AddrInt      = SlowIRB.CreatePtrToInt(Addr, CQMS.IntptrTy);
+            Value *IsStatic     = SlowIRB.CreateCall(CQMS.IsStaticRangeFn, {AddrInt});
+            Value *SlowShadow   = SlowIRB.CreateSelect(IsStatic, getCleanShadow(&I), LoadedShadow,
+                                                        "_cqmsstaticsel");
+            Value *SlowPoisoned = SlowIRB.CreateNot(IsStatic, "_cqmsslowpoison");
+
+            IRB.SetInsertPoint(TailBB, TailBB->begin());
+            PHINode *ShadowPhi = IRB.CreatePHI(ShadowTy, 2, "_cqmsshadowphi");
+            ShadowPhi->addIncoming(LoadedShadow, FastBB);
+            ShadowPhi->addIncoming(SlowShadow, SlowBB);
+            PHINode *PoisonedPhi = IRB.CreatePHI(IRB.getInt1Ty(), 2, "_cqmspoisonedphi");
+            PoisonedPhi->addIncoming(ConstantInt::getFalse(IRB.getContext()), FastBB);
+            PoisonedPhi->addIncoming(SlowPoisoned, SlowBB);
+
+            EffectiveShadow = ShadowPhi;
+            Value *EffectivePoisoned = PoisonedPhi;
+#endif
+
+            setShadow(&I, EffectiveShadow);
             insertedShadowLoad = true;
 
-            if (ClCheckLoads)
-                pushShadowCheck(LoadedShadow, &I);
+            if (ClCheckLoads) {
+#ifdef CQMSAN_FLIP_CONVENTION
+                pushShadowCheck(EffectivePoisoned, &I);
+#else
+                pushShadowCheck(EffectiveShadow, &I);
+#endif
+            }
 
         }
 
@@ -1889,9 +2002,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         if (ClCheckAccessAddress) {
             insertShadowCheck(Mask, &I);
             Type *PtrsShadowTy = getShadowTy(Ptrs);
+#ifdef CQMSAN_FLIP_CONVENTION
+            // [FLIP experiment] inactive-lane fill must be "clean" = all-ones under flip.
+            Value *MaskedPtrShadow = IRB.CreateSelect(
+                Mask, getShadow(Ptrs), getAllOnesShadow(PtrsShadowTy),
+                "_cqmsmaskedptrs");
+#else
             Value *MaskedPtrShadow = IRB.CreateSelect(
                 Mask, getShadow(Ptrs), Constant::getNullValue(PtrsShadowTy),
                 "_cqmsmaskedptrs");
+#endif
             pushShadowCheck(MaskedPtrShadow, &I);
         }
 
@@ -1917,9 +2037,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         if (ClCheckAccessAddress) {
             insertShadowCheck(Mask, &I);
             Type *PtrsShadowTy = getShadowTy(Ptrs);
+#ifdef CQMSAN_FLIP_CONVENTION
+            // [FLIP experiment] inactive-lane fill must be "clean" = all-ones under flip.
+            Value *MaskedPtrShadow = IRB.CreateSelect(
+                Mask, getShadow(Ptrs), getAllOnesShadow(PtrsShadowTy),
+                "_cqmsmaskedptrs");
+#else
             Value *MaskedPtrShadow = IRB.CreateSelect(
                 Mask, getShadow(Ptrs), Constant::getNullValue(PtrsShadowTy),
                 "_cqmsmaskedptrs");
+#endif
             pushShadowCheck(MaskedPtrShadow, &I);
         }
 
@@ -2236,14 +2363,31 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // false-positive surface unchanged (a non-noundef return is not asserted
     // to be fully defined by the ABI, so we must not flag it opportunistically).
     void visitReturnInst(ReturnInst &I) {
+#ifdef CQMSAN_FLIP_CONVENTION
+        // [FLIP experiment] Known, documented limitation, not fixed: for a
+        // NoUndef-returning function whose return value isn't specifically
+        // propagated (e.g. an arithmetic result — "no propagation" means
+        // getShadow() defaults such values to getCleanShadow()), this check
+        // ends up materialized as an unconditional call to the warning
+        // handler instead of being folded away like the non-flip case (where
+        // the equivalent constant-shadow check is discarded by
+        // insertShadowCheck's dyn_cast<Instruction> filter before ever
+        // reaching codegen). Root cause not isolated within this
+        // experiment's time budget — the return-check machinery is optional
+        // (§9.C in the AUDIT), so it's disabled here rather than shipped
+        // broken; the load-check + static-range mechanism this experiment
+        // is actually testing is unaffected.
+        return;
+#else
         Value *RetVal = I.getReturnValue();
         if (!RetVal) return;                       // void return
         if (isAMustTailRetVal(RetVal)) return;     // mustTail
 
-        if (F.hasRetAttribute(Attribute::NoUndef)) 
+        if (F.hasRetAttribute(Attribute::NoUndef))
             insertShadowCheck(RetVal, &I);
-        
+
         // No retval-TLS store: the caller always assumes clean (ClTrustReturn=true)
+#endif
     }
     
     void visitPHINode(PHINode &I) {
@@ -2260,7 +2404,14 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             Value *ShadowBase = getShadowPtr(
                 &I, IRB, IRB.getInt8Ty(), Align(1), /*isStore*/ true);
 
+#ifdef CQMSAN_FLIP_CONVENTION
+            // [FLIP experiment] 0=uninit: poison/clean bytes are bit-complements
+            // of the non-flipped ones (default 0xff poison -> 0x00; clean
+            // fallback 0x00 -> 0xff).
+            Value *PoisonValue = IRB.getInt8(PoisonStack ? (uint8_t)~ClPoisonStackPattern : 0xff);
+#else
             Value *PoisonValue = IRB.getInt8(PoisonStack ? ClPoisonStackPattern : 0);
+#endif
             IRB.CreateMemSet(ShadowBase, PoisonValue, Len, I.getAlign());
         }
     }

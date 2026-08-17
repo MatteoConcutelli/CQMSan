@@ -338,11 +338,35 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
     // (header + any allignment padding + user region), so `allocated` is
     // genuinely zeroed regardless of needs_align - no extra memset needed.
     //__cqmsan_clear_and_unpoison(allocated, size); // calloc → shadow CLEAN -> avoid to call memset again.
+#ifdef CQMSAN_FLIP_CONVENTION
+    // [FLIP audit fix] This bypasses __cqmsan_clear_and_unpoison (whose
+    // kCleanByte IS flip-aware) to skip the redundant data memset — but the
+    // hardcoded (u8)0 below was never updated for the flip's clean=all-ones.
+    // Found during audit: latent FP on every calloc() under flip, only in
+    // this CQMSAN_GLIBC_ALLOC path (the CombinedAllocator path a few hundred
+    // lines below already goes through the flip-aware wrapper correctly).
+    SetShadow(allocated, size, (u8)-1);
+#else
     SetShadow(allocated, size, (u8)0);
+#endif
 
+#ifdef CQMSAN_FLIP_CONVENTION
+    // [FLIP experiment] Under 0=uninit, mirrors QMSan's own design (NDSS'25,
+    // "Runtime Helper Component": QMSan poisons only on free, never on
+    // malloc). The invariant this relies on: memory never touched before is
+    // already poisoned by the OS-zero-fill default (0=uninit), and memory
+    // recycled from a previous allocation is already poisoned by THAT
+    // allocation's own free()-time poisoning below — so there is nothing
+    // left to actively (re-)poison here. This only holds if poison_in_free
+    // is also active; if it's off, fall back to poisoning at malloc time,
+    // since a recycled chunk would otherwise retain a stale "clean" shadow
+    // from its previous owner.
+  } else if (flags()->poison_in_malloc && !flags()->poison_in_free) {
+#else
   } else if (flags()->poison_in_malloc) {
+#endif
     __cqmsan_poison(allocated, size);   // not initialized heap
-    
+
     if (__cqmsan_get_track_origins()) {
       stack->tag = __sanitizer::StackTrace::TAG_ALLOC;
       Origin o = Origin::CreateHeapOrigin(stack);
@@ -453,7 +477,17 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
       __cqmsan_clear_and_unpoison(allocated, size);
     else
       __cqmsan_unpoison(allocated, size);  // Mem is already unoed.
+#ifdef CQMSAN_FLIP_CONVENTION
+    // [FLIP experiment] See the CQMSAN_GLIBC_ALLOC branch above for the
+    // rationale: under 0=uninit, malloc-time poisoning is redundant once
+    // free-time poisoning is active (fresh-from-OS memory is already
+    // poisoned by default; recycled memory is already poisoned from its
+    // last free()). Falls back to poisoning at malloc if poison_in_free is
+    // off, since then the invariant doesn't hold.
+  } else if (flags()->poison_in_malloc && !flags()->poison_in_free) {
+#else
   } else if (flags()->poison_in_malloc) {
+#endif
     __cqmsan_poison(allocated, size);
     if (__cqmsan_get_track_origins()) {
       stack->tag = __sanitizer::StackTrace::TAG_ALLOC;

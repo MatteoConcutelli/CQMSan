@@ -532,6 +532,8 @@ void cqmsan_update_map_pc (__sanitizer::uptr pc){
     //lastly, set this to 0xff so that AFL knows we found something
     cqmsan_area_ptr[MAP_SIZE - 1] = 0xff;
 
+}
+
 }  // namespace __cqmsan
 
 // [DONE] 13/05
@@ -558,10 +560,20 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(
 using namespace __cqmsan;
 
 // [DONE] 13/05
+#ifdef CQMSAN_FLIP_CONVENTION
+// [FLIP experiment] 0=uninit: mirrors convertToBool/normalizeShadow, which
+// warn iff the (possibly multi-bit) shadow is EXACTLY zero, not "any bit
+// zero" -- this call-based path must match that polarity or every
+// range-exempted clean value (all-ones) gets flagged as poisoned.
+#define CQMSAN_MAYBE_WARNING_TRIGGERED(s) (!(s))
+#else
+#define CQMSAN_MAYBE_WARNING_TRIGGERED(s) (s)
+#endif
+
 #define CQMSAN_MAYBE_WARNING(type, size)              \
   void __cqmsan_maybe_warning_##size(type s, __sanitizer::u32 o) { \
     GET_CALLER_PC_BP;                               \
-    if (UNLIKELY(s)) {                              \
+    if (UNLIKELY(CQMSAN_MAYBE_WARNING_TRIGGERED(s))) { \
       PrintWarningWithOrigin(pc, bp, o);            \
       if (__cqmsan::flags()->halt_on_error) {       \
         Die();                                      \
@@ -579,7 +591,7 @@ CQMSAN_MAYBE_WARNING(u64, 8)
 // of GET_CALLER_PC_BP and PrintWarningWithOrigin in the common case of no warning.
 #define CQMSAN_MAYBE_WARNING_FAST(type, size) \
     void __cqmsan_maybe_warning_fast_##size(type s, __sanitizer::u32 o) { \
-      if (LIKELY(!s)) return; \
+      if (LIKELY(!CQMSAN_MAYBE_WARNING_TRIGGERED(s))) return; \
       GET_CALLER_PC_BP; \
       GET_FATAL_STACK_TRACE_PC_BP(pc, bp); \
       __cqmsan::cqmsan_update_map(&stack); \
@@ -596,7 +608,7 @@ CQMSAN_MAYBE_WARNING_FAST(u64, 8)
 extern "C" {
 #define CQMSAN_MAYBE_WARNING_FAST_PCONLY(type, size) \
   void __cqmsan_maybe_warning_fast_pconly_##size(type s, __sanitizer::u32 o) { \
-    if (LIKELY(!s)) return; \
+    if (LIKELY(!CQMSAN_MAYBE_WARNING_TRIGGERED(s))) return; \
     GET_CALLER_PC_BP; \
     __cqmsan::cqmsan_update_map_pc(pc); \
     ++cqmsan_report_count; \
@@ -646,7 +658,7 @@ void __cqmsan_warning_fast_pconly() {
 void __cqmsan_warning_fast() {
   GET_CALLER_PC_BP;
   GET_FATAL_STACK_TRACE_PC_BP(pc, bp);
-  
+
   __cqmsan::cqmsan_update_map(&stack);
   ++cqmsan_report_count;
 
@@ -717,6 +729,95 @@ static void CheckUnwind() {
   stack.Print();
 }
 
+#ifdef CQMSAN_FLIP_CONVENTION
+// [FLIP experiment] Under 0=uninit, a never-explicitly-written global has
+// virgin shadow=0=poisoned, which is wrong (the loader DID initialize it).
+// Mirrors QMSan's own fix, verified in its real source
+// (qemu/linux-user/elfload.c -> msan_giovese_add_mmap on every PT_LOAD
+// segment at ELF-load time; msan-lists.h's check_addr_mmap_list for the
+// lookup): register every loaded PT_LOAD segment's [start,end) range ONCE,
+// before the forkserver's fork() point (so every child inherits the list
+// for free, no per-exec rebuild), and treat any address in that range as
+// clean regardless of its actual shadow byte — no eager clean-memset for
+// globals, no dirtied CoW pages, matching QMSan's mechanism exactly.
+namespace {
+
+struct StaticRange { __sanitizer::uptr start, end; };
+
+constexpr int kMaxStaticRanges = 256;
+
+StaticRange g_static_ranges[kMaxStaticRanges];
+
+int g_num_static_ranges = 0;
+
+int g_tls_segments_seen = 0;
+int g_tls_ranges_added = 0;
+
+int CollectPhdrRanges(struct dl_phdr_info *info, __sanitizer::uptr size, void *) {
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+
+    if (phdr->p_type == PT_LOAD) {
+      if (g_num_static_ranges >= kMaxStaticRanges) return 0;
+      __sanitizer::uptr start = info->dlpi_addr + phdr->p_vaddr;
+      // p_memsz (not p_filesz) covers the .bss tail past the file image —
+      // exactly the "loader zero-initializes this" region we need to exempt.
+      __sanitizer::uptr end = start + phdr->p_memsz;
+      g_static_ranges[g_num_static_ranges++] = {start, end};
+      continue;
+    }
+
+    // [TLS] A PT_TLS segment's OWN address (dlpi_addr + p_vaddr) is the
+    // on-disk TEMPLATE glibc copies from when a thread starts — NOT where
+    // TLS variables actually live at runtime. The real, per-thread block is
+    // a separately-allocated region (initial-exec/local-exec: offset from
+    // the thread pointer), unrelated to any PT_LOAD/PT_TLS file address.
+    // `dlpi_tls_data` (glibc dl_iterate_phdr extension) gives exactly that:
+    // "the address of the CALLING thread's instance of this module's
+    // PT_TLS segment ... if it has been allocated in the calling thread."
+    // Registering that address+size here (once, in the single thread that
+    // runs before the forkserver's fork() point) exempts TLS-backed
+    // "clean-by-loader-copy" data (__thread globals, libc/libstdc++
+    // internals like errno/locale state) the same way PT_LOAD does for
+    // ordinary globals — without which they'd default to poisoned=0 under
+    // the flip and false-positive on every read.
+    if (phdr->p_type == PT_TLS) {
+      g_tls_segments_seen++;
+      // dlpi_tls_data was added after the original struct — guard on `size`
+      // per glibc's own documented convention, don't read past what the
+      // caller actually populated.
+      if (size < sizeof(struct dl_phdr_info)) continue;
+      if (!info->dlpi_tls_data) continue;  // not allocated for this thread yet
+      if (g_num_static_ranges >= kMaxStaticRanges) return 0;
+      __sanitizer::uptr start = reinterpret_cast<__sanitizer::uptr>(info->dlpi_tls_data);
+      __sanitizer::uptr end = start + phdr->p_memsz;
+      g_static_ranges[g_num_static_ranges++] = {start, end};
+      g_tls_ranges_added++;
+    }
+  }
+  return 0;
+}
+
+void InitStaticRangeList() {
+  g_num_static_ranges = 0;
+  g_tls_segments_seen = 0;
+  g_tls_ranges_added = 0;
+  
+  dl_iterate_phdr(CollectPhdrRanges, nullptr);
+  VPrintf(1, "cqmsan [FLIP]: %d static ranges registered (%d PT_TLS segments seen, %d TLS ranges added)\n",
+          g_num_static_ranges, g_tls_segments_seen, g_tls_ranges_added);
+}
+}  // namespace
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+bool __cqmsan_is_static_range(__sanitizer::uptr addr) {
+  for (int i = 0; i < g_num_static_ranges; i++)
+    if (addr >= g_static_ranges[i].start && addr < g_static_ranges[i].end)
+      return true;
+  return false;
+}
+#endif  // CQMSAN_FLIP_CONVENTION
+
 
 // [DONE] 13/05
 // entry point for the CQMSan runtime.
@@ -764,6 +865,12 @@ void __cqmsan_init() {
     DumpProcessMap();
     Die();
   }
+
+#ifdef CQMSAN_FLIP_CONVENTION
+  // Runs once, in the forkserver parent, before its fork() point — every
+  // child inherits the list via COW, no rebuild per-exec.
+  InitStaticRangeList();
+#endif
 
   Symbolizer::GetOrInit()->AddHooks(EnterSymbolizerOrUnwider,
                                        ExitSymbolizerOrUnwider);

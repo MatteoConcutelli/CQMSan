@@ -1749,25 +1749,39 @@ INTERCEPTOR(wchar_t *, wcsncpy, wchar_t *dest, const wchar_t *src, SIZE_T n) {
   return res;
 }
 
+// [FLIP experiment] Under CQMSAN_FLIP_CONVENTION (0=uninit, mirroring QMSan),
+// clean/poison shadow byte values are the bit-complement of the default
+// (poison=0x00 instead of 0xff, clean=0xff instead of 0x00) — every one of
+// the ~70 unpoison call sites + ~521 common-interceptor WRITE_RANGE macro
+// route through __cqmsan_unpoison/__cqmsan_poison, so flipping just these
+// three functions' literal byte is sufficient; no other call site changes.
+#ifdef CQMSAN_FLIP_CONVENTION
+static const __sanitizer::u8 kCleanByte  = (u8)-1;
+static const __sanitizer::u8 kPoisonByte = (u8)0;
+#else
+static const __sanitizer::u8 kCleanByte  = (u8)0;
+static const __sanitizer::u8 kPoisonByte = (u8)-1;
+#endif
+
 // [DONE]
 // These interface functions reside here so that they can use
 // REAL(memset), etc.
 void __cqmsan_unpoison(const void *a, __sanitizer::uptr size) {
   if (!MEM_IS_APP(a)) return;
-  SetShadow(a, size, (u8)0);
+  SetShadow(a, size, kCleanByte);
 }
 
 // [DONE]
 void __cqmsan_poison(const void *a, __sanitizer::uptr size) {
   if (!MEM_IS_APP(a)) return;
-  SetShadow(a, size, (u8)-1);
+  SetShadow(a, size, kPoisonByte);
 }
 
 // [DONE]
 void __cqmsan_poison_stack(void *a, __sanitizer::uptr size) {
   if (!MEM_IS_APP(a)) return;
   // TODO - handle the flag -> SetShadow(a, size, __cqmsan::flags()->poison_stack_with_zeroes ? (u8)-1 : 0);
-  SetShadow(a, size, (u8)-1);
+  SetShadow(a, size, kPoisonByte);
 }
 
 // [DONE]
@@ -1775,8 +1789,8 @@ void __cqmsan_unpoison_param(__sanitizer::uptr n) { UnpoisonParam(n); }
 
 // [DONE]
 void __cqmsan_clear_and_unpoison(void *a, __sanitizer::uptr size) {
-  REAL(memset)(a, 0, size);
-  SetShadow(a, size, (u8)0);
+  REAL(memset)(a, 0, size);  // real DATA zeroing (calloc semantics) — never flips
+  SetShadow(a, size, kCleanByte);
 }
 
 void *__cqmsan_memcpy(void *dest, const void *src, SIZE_T n) {
