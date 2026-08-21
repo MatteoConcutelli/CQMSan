@@ -139,7 +139,6 @@ static cl::opt<bool> ClColdWarning(
     // It may be hot if the program is small and the warning is triggered often.
 
 // [PARAMETRIZATION]
-// TODO - understand if this is correct for CQMSan
 static cl::opt<bool> ClTrustReturn(
     "cqmsan-trust-return",
     cl::desc("Trust return values from functions"),
@@ -546,9 +545,9 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
       getOrInsertGlobal(M, "__cqmsan_retval_tls",
                         ArrayType::get(IRB.getInt64Ty(), kRetvalTLSSize / 8));
 
-    ParamTLS =
-      getOrInsertGlobal(M, "__cqmsan_param_tls",
-                            ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
+    //ParamTLS =
+    //  getOrInsertGlobal(M, "__cqmsan_param_tls",
+    //                        ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
 
     VAArgTLS =
       getOrInsertGlobal(M, "__cqmsan_va_arg_tls",
@@ -1277,16 +1276,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     Value* getShadowPtr(Value *Addr, IRBuilder<> &IRB,
         Type *ShadowTy, MaybeAlign Alignment, [[maybe_unused]] bool isStore) {
         return getShadowPtrUserspace(Addr, IRB, ShadowTy, Alignment);
-    }
-
-    /// Compute the shadow address for a given function argument.
-    ///
-    /// Shadow = ParamTLS+ArgOffset.
-    Value *getShadowPtrForArgument(IRBuilder<> &IRB, int ArgOffset) {
-        Value *Base = IRB.CreatePointerCast(CQMS.ParamTLS, CQMS.IntptrTy);
-        if (ArgOffset)
-            Base = IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
-        return IRB.CreateIntToPtr(Base, IRB.getPtrTy(0), "_cqmsarg");
     }
 
     /// Compute the shadow address for a retval.

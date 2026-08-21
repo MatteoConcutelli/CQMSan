@@ -247,7 +247,7 @@ extern "C" void __libc_free(void *ptr);
 // via plain __libc_malloc/__libc_calloc and rounding the returned pointer up.
 
 static const __sanitizer::uptr kHeaderWords = 3; // [delta-to-base][requested_size]
-static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(__sanitizer::uptr), 16); // 16 on x86_64
+static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(__sanitizer::uptr), 16); // alignment 16 on x86_64
 // If the user requested alignment > kMinHeaderSlot, we will over-allocate
 
 // magic value to detect glibc-path allocations in AllocationBegin/AllocationSize
@@ -394,6 +394,20 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
   __sanitizer::uptr header_slot = reinterpret_cast<__sanitizer::uptr *>(p)[-2];
   void *raw = reinterpret_cast<char *>(p) - header_slot;
 
+  // Size-gated proactive shadow release (mirrors CQMsanMapUnmapCallback::OnUnmap
+  // for the ORIGINAL allocator's secondary/large allocations).
+  // MUST run BEFORE poisoning below: ReleaseMemoryPagesToOS is
+  // madvise(MADV_DONTNEED) on the shadow pages, which lazily zero-fills them;
+  // under the 0=clean convention that silently erases poison written earlier.
+  // Poisoning last makes it the final, surviving shadow state.
+  // [BUG FIX 2026-08-21 -- see 02_modifiche_audit/allocator_glibc_passthrough_test/README.md §11.6:
+  //  previously poison-then-release, which silently lost UAF detection on every
+  //  freed block >=128KB, unconditionally with respect to poison_in_malloc/poison_in_free]
+  if (size >= kShadowReleaseThreshold) {
+    __sanitizer::uptr shadow_p = MEM_TO_SHADOW(reinterpret_cast<__sanitizer::uptr>(p));
+    ReleaseMemoryPagesToOS(shadow_p, shadow_p + size);
+  }
+
   if (flags()->poison_in_free) {
     __cqmsan_poison(p, size);
     if (__cqmsan_get_track_origins()) {
@@ -404,12 +418,6 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
   }
 
   __libc_free(raw);
-  // Size-gated proactive shadow release (mirrors CQMsanMapUnmapCallback::OnUnmap
-  // for the ORIGINAL allocator's secondary/large allocations)
-  if (size >= kShadowReleaseThreshold) {
-    __sanitizer::uptr shadow_p = MEM_TO_SHADOW(reinterpret_cast<__sanitizer::uptr>(p));
-    ReleaseMemoryPagesToOS(shadow_p, shadow_p + size);
-  }
 }
 
 static void *CQMsanReallocateGlibc(__sanitizer::BufferedStackTrace *stack, void *old_p,
@@ -591,11 +599,16 @@ static void *CQMsanCalloc(__sanitizer::BufferedStackTrace *stack, __sanitizer::u
 // or invalid free error. This is a known limitation of the glibc-path allocator.
 static const void *AllocationBegin(const void *p) {
   if (!p) return nullptr;
-  
+
+  // Ownership-query contract: __sanitizer_get_ownership/malloc_usable_size are
+  // explicitly meant to be called on pointers that might NOT belong to this
+  // allocator, and must answer gracefully ("not mine"), not abort the process.
+  // free()/realloc() misuse (CQMsanDeallocate/CQMsanReallocateGlibc above) is a
+  // different contract and correctly keeps aborting on a bad pointer -- only
+  // this ownership-query path was wrong.
+  // [BUG FIX 2026-08-21 -- see 02_modifiche_audit/allocator_glibc_passthrough_test/README.md §11.6]
   if (((const __sanitizer::uptr *)p)[-3] != kHeaderMagic) {
-    Report("CQMSAN: malloc_usable_size/AllocationSize on a pointer that is not "
-           "the start of an allocation (possible internal pointer to hanlde): %p\n", p);
-    Die();   // abort
+    return nullptr;
   }
 
   __sanitizer::uptr size = reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
