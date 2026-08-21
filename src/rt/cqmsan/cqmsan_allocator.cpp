@@ -246,7 +246,7 @@ extern "C" void __libc_free(void *ptr);
 // this same pass). Alignment is instead implemented by over-allocating
 // via plain __libc_malloc/__libc_calloc and rounding the returned pointer up.
 
-static const __sanitizer::uptr kHeaderWords = 3; // [delta-to-base][requested_size]
+static const __sanitizer::uptr kHeaderWords = 3; // [delta-to-base][requested_size][canary]
 static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(__sanitizer::uptr), 16); // alignment 16 on x86_64
 // If the user requested alignment > kMinHeaderSlot, we will over-allocate
 
