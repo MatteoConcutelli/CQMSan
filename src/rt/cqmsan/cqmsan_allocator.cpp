@@ -198,17 +198,21 @@ void CQMsanThreadLocalMallocStorage::CommitBack() {
 // using __libc_malloc/__libc_calloc/__libc_memalign/__libc_free, while
 // preserving poison_in_malloc/poison_in_free semantics manually.
 //
-//   - Headers: [delta-to-base][size] right
-//     before the user pointer. `delta-to-base` lets us support alignment
-//     requests (memalign/posix_memalign/aligned_alloc/valloc/pvalloc) with
-//     the SAME free()/realloc() code path as plain malloc — for those,
-//     delta-to-base = header_slot = Max(alignment, 2*sizeof(uptr)), and the
-//     block is obtained via __libc_memalign(alignment, header_slot+size) so
-//     the user pointer (raw+header_slot) is still `alignment`-aligned (valid
-//     because header_slot is itself a multiple of `alignment` whenever
-//     alignment > 2*sizeof(uptr), and constant 2*sizeof(uptr)=16 otherwise —
-//     already exceeding glibc's own natural malloc alignment guarantee, so
-//     plain malloc/calloc is used instead of memalign for that common case).
+//   - Headers: [canary][delta-to-base][size] immediately before the user
+//     pointer (read back as user[-3], user[-2], user[-1]). `delta-to-base`
+//     (header_slot) is what lets aligned requests (memalign/posix_memalign/
+//     aligned_alloc/valloc/pvalloc) share the SAME free()/realloc() code path
+//     as plain malloc. Two cases:
+//       * alignment <= glibc's MALLOC_ALIGNMENT (2*sizeof(void*) = 16B on
+//         x86_64): header_slot = kMinHeaderSlot (32B, a multiple of 16), the
+//         block comes from __libc_malloc/__libc_calloc, and raw+32 preserves
+//         the 16B alignment glibc already guarantees — no over-allocation;
+//       * larger alignment: over-allocate (kMinHeaderSlot + size + alignment-1),
+//         still via __libc_malloc/__libc_calloc, and round the user pointer up:
+//         header_slot = RoundUpTo(raw+kMinHeaderSlot, alignment) - raw, hence
+//         variable and always >= kMinHeaderSlot (the header always fits).
+//     __libc_memalign is deliberately NOT used: it is intercepted by this same
+//     runtime (see NOTE below) and would recurse infinitely.
 //
 //   - Origin tracking restored (gated on __cqmsan_get_track_origins(), which
 //     is already a cheap flag read — this project keeps it OFF by default,
@@ -246,7 +250,7 @@ extern "C" void __libc_free(void *ptr);
 // this same pass). Alignment is instead implemented by over-allocating
 // via plain __libc_malloc/__libc_calloc and rounding the returned pointer up.
 
-static const __sanitizer::uptr kHeaderWords = 3; // [delta-to-base][requested_size][canary]
+static const __sanitizer::uptr kHeaderWords = 3; // [canary][delta-to-base][requested_size]
 static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(__sanitizer::uptr), 16); // alignment 16 on x86_64
 // If the user requested alignment > kMinHeaderSlot, we will over-allocate
 
