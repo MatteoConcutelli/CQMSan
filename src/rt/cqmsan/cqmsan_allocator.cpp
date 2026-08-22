@@ -312,8 +312,15 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
     ReportRssLimitExceeded(stack);
   }
 
-  bool needs_align = alignment > kMinHeaderSlot; 
-  // true for function that return non-default alignment (memalign, posix_memalign, malloc...) 
+  // `>=`, not `>`: at alignment == kMinHeaderSlot (32), the fast path below
+  // (header_slot = kMinHeaderSlot, user = raw + 32) only guarantees 16-byte
+  // alignment for `user` -- glibc guarantees `raw` is a multiple of 16, not
+  // of 32, and adding a fixed 32 preserves whatever residue mod 32 `raw`
+  // already had. Since every alignment value here is a power of two, 32 is
+  // the only value for which this off-by-one-bucket error is reachable
+  // (16 and below are fine: 32 is itself a multiple of every one of them).
+  bool needs_align = alignment >= kMinHeaderSlot;
+  // true for function that return non-default alignment (memalign, posix_memalign, malloc...)
   // Worst case, the next `alignment` boundary is up to (alignment-1) bytes
   // past where the header would naturally end — over-allocate that much
   // slack so a valid [header][aligned user data] layout always fits.
@@ -338,10 +345,15 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
   // allocator's fixed, hand-picked arena address, this is a fact about how
   // glibc+kernel currently behave, not a guarantee this code enforces by
   // itself — so check it explicitly instead of assuming it silently holds.
-  if (UNLIKELY(!MEM_IS_APP(reinterpret_cast<__sanitizer::uptr>(raw)))) {
+  // Check BOTH ends of the block, not just `raw`: a large enough allocation
+  // could start inside the APP range and end outside it, in which case
+  // MEM_TO_SHADOW of the tail would land outside the mapped SHADOW region --
+  // checking only the first byte would miss exactly that case.
+  __sanitizer::uptr raw_u = reinterpret_cast<__sanitizer::uptr>(raw);
+  if (UNLIKELY(!MEM_IS_APP(raw_u) || !MEM_IS_APP(raw_u + real_size - 1))) {
     Report("CQMSAN: glibc returned a heap pointer outside the expected APP "
-           "memory range (%p) — shadow mapping would be invalid; refusing "
-           "to poison unmapped/foreign memory.\n", raw);
+           "memory range (%p, size 0x%zx) — shadow mapping would be invalid; "
+           "refusing to poison unmapped/foreign memory.\n", raw, real_size);
     Die();
   }
 
