@@ -255,7 +255,26 @@ static const __sanitizer::uptr kMinHeaderSlot = RoundUpTo(kHeaderWords * sizeof(
 // If the user requested alignment > kMinHeaderSlot, we will over-allocate
 
 // magic value to detect glibc-path allocations in AllocationBegin/AllocationSize
-static const __sanitizer::uptr kHeaderMagic = 0x43514D53414E00ULL; // random not probable value // TODO
+static const __sanitizer::uptr kHeaderMagic = 0x43514D53414E00ULL; // "CQMSAN\0"
+
+// Sentinel written into the canary slot once a block has been freed, distinct
+// from kHeaderMagic so a subsequent free()/realloc() on the same pointer is
+// reported as a double-free specifically, rather than a generic corrupted
+// header.
+static const __sanitizer::uptr kFreedMagic = 0x46524545440000ULL; // "FREED\0\0"
+
+// Both magics are combined with the header's own address via XOR rather than
+// stored as flat constants: a header (live or freed) that ends up copied to
+// a different address no longer matches when re-checked from its new
+// location, and a data buffer that happens to contain the literal magic
+// bytes can no longer be mistaken for a real header regardless of where it
+// lives.
+static inline __sanitizer::uptr CQMsanCanaryFor(const void *user) {
+  return kHeaderMagic ^ reinterpret_cast<__sanitizer::uptr>(user);
+}
+static inline __sanitizer::uptr CQMsanFreedCanaryFor(const void *user) {
+  return kFreedMagic ^ reinterpret_cast<__sanitizer::uptr>(user);
+}
 
 // Mirrors glibc's own M_MMAP_THRESHOLD default: allocations at/above this are
 // likely individually mmap'd by glibc itself, making a real page-release
@@ -269,7 +288,7 @@ static inline void *CQMsanGlibcHeaderToUser(void *raw, __sanitizer::uptr header_
   // Headers
   reinterpret_cast<__sanitizer::uptr *>(user)[-1] = size;
   reinterpret_cast<__sanitizer::uptr *>(user)[-2] = header_slot;
-  reinterpret_cast<__sanitizer::uptr *>(user)[-3] = kHeaderMagic; // canary
+  reinterpret_cast<__sanitizer::uptr *>(user)[-3] = CQMsanCanaryFor(user); // canary, bound to this address
 
   return user;
 }
@@ -386,15 +405,26 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
 
 void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p) {
   DCHECK(p);  //debug check
-  if (reinterpret_cast<__sanitizer::uptr *>(p)[-3] != kHeaderMagic) {
+  // [-1] normally holds `size`; once a block is freed it holds the
+  // freed-marker instead (see the write site below for why it lives at [-1]
+  // rather than alongside the canary at [-3]). Checked first so a
+  // double-free is reported specifically, before the generic corruption check.
+  __sanitizer::uptr slot1 = reinterpret_cast<__sanitizer::uptr *>(p)[-1];
+  if (slot1 == CQMsanFreedCanaryFor(p)) {
+    Report("CQMSAN: double free() detected: %p\n", p);
+    Die();
+  }
+
+  __sanitizer::uptr canary = reinterpret_cast<__sanitizer::uptr *>(p)[-3];
+  if (canary != CQMsanCanaryFor(p)) {
     Report("CQMSAN: free() on a pointer that is not the start of an allocation "
-            "(interior pointer, double-free, or corrupted header): %p\n", p);
+            "(interior pointer or corrupted header): %p\n", p);
     Die();
   }
   UnpoisonParam(1);
   RunFreeHooks(p);
 
-  __sanitizer::uptr size = reinterpret_cast<__sanitizer::uptr *>(p)[-1];
+  __sanitizer::uptr size = slot1;
   __sanitizer::uptr header_slot = reinterpret_cast<__sanitizer::uptr *>(p)[-2];
   void *raw = reinterpret_cast<char *>(p) - header_slot;
 
@@ -404,9 +434,6 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
   // madvise(MADV_DONTNEED) on the shadow pages, which lazily zero-fills them;
   // under the 0=clean convention that silently erases poison written earlier.
   // Poisoning last makes it the final, surviving shadow state.
-  // [BUG FIX 2026-08-21 -- see 02_modifiche_audit/allocator_glibc_passthrough_test/README.md §11.6:
-  //  previously poison-then-release, which silently lost UAF detection on every
-  //  freed block >=128KB, unconditionally with respect to poison_in_malloc/poison_in_free]
   if (size >= kShadowReleaseThreshold) {
     __sanitizer::uptr shadow_p = MEM_TO_SHADOW(reinterpret_cast<__sanitizer::uptr>(p));
     ReleaseMemoryPagesToOS(shadow_p, shadow_p + size);
@@ -421,19 +448,34 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
     }
   }
 
+  // Mark the header as freed before handing `raw` back to glibc. This must
+  // live at [-1] rather than [-3]: for the common header_slot==kMinHeaderSlot
+  // case, [-3] sits at raw+8, which is exactly where glibc's own tcache
+  // writes its `key` field on free -- a marker stored there would be
+  // overwritten by glibc itself before any subsequent free() could observe
+  // it. [-1] sits at raw+header_slot-8 (>=raw+24), outside both tcache's
+  // 16-byte bookkeeping footprint and fastbin's (`fd` at raw+0 only).
+  reinterpret_cast<__sanitizer::uptr *>(p)[-1] = CQMsanFreedCanaryFor(p);
+
   __libc_free(raw);
 }
 
 static void *CQMsanReallocateGlibc(__sanitizer::BufferedStackTrace *stack, void *old_p,
                             __sanitizer::uptr new_size, __sanitizer::uptr alignment) {
 
-  if (reinterpret_cast<__sanitizer::uptr *>(old_p)[-3] != kHeaderMagic) {
+  __sanitizer::uptr slot1 = reinterpret_cast<__sanitizer::uptr *>(old_p)[-1];
+  if (slot1 == CQMsanFreedCanaryFor(old_p)) {
+    Report("CQMSAN: realloc() on an already-freed pointer (double free): %p\n", old_p);
+    Die();
+  }
+  __sanitizer::uptr canary = reinterpret_cast<__sanitizer::uptr *>(old_p)[-3];
+  if (canary != CQMsanCanaryFor(old_p)) {
     Report("CQMSAN: realloc() on a pointer that is not the start of an allocation "
-            "(interior pointer, double-free, or corrupted header): %p\n", old_p);
+            "(interior pointer or corrupted header): %p\n", old_p);
     Die();
   }
 
-  __sanitizer::uptr old_size = reinterpret_cast<__sanitizer::uptr *>(old_p)[-1];
+  __sanitizer::uptr old_size = slot1;
   __sanitizer::uptr copy_size = Min(new_size, old_size);
   void *new_p = CQMsanAllocate(stack, new_size, alignment, false);
   if (new_p) {
@@ -610,12 +652,32 @@ static const void *AllocationBegin(const void *p) {
   // free()/realloc() misuse (CQMsanDeallocate/CQMsanReallocateGlibc above) is a
   // different contract and correctly keeps aborting on a bad pointer -- only
   // this ownership-query path was wrong.
-  // [BUG FIX 2026-08-21 -- see 02_modifiche_audit/allocator_glibc_passthrough_test/README.md §11.6]
-  if (((const __sanitizer::uptr *)p)[-3] != kHeaderMagic) {
+  //
+  // Callers of this function routinely
+  // pass addresses whose backing memory may not be mapped at all, treating
+  // arbitrary stack/register words as candidate pointers -- a direct
+  // dereference of p[-3] would fault before ever reaching the comparison
+  // below. Use sanitizer_common's TryMemCpy (the same pipe-write-based safe
+  // probe ASan/LSan already rely on for scanning arbitrary memory) instead
+  // of reading the header directly. This is intentionally scoped to
+  // AllocationBegin only: CQMsanDeallocate/CQMsanReallocateGlibc are reached
+  // solely from the target's own free()/realloc() calls, where a syscall on
+  // every invocation would cost real throughput for a failure mode that,
+  // even unguarded, degrades no worse than plain glibc free() on a wild
+  // pointer would.
+  __sanitizer::uptr header[3];  // [-3] canary, [-2] header_slot (unused here), [-1] size/freed-marker
+  if (!__sanitizer::TryMemCpy(header, reinterpret_cast<const __sanitizer::uptr *>(p) - 3,
+                              sizeof(header))) {
+    return nullptr;
+  }
+  if (header[2] == CQMsanFreedCanaryFor(p)) {
+    return nullptr;  // already freed
+  }
+  if (header[0] != CQMsanCanaryFor(p)) {
     return nullptr;
   }
 
-  __sanitizer::uptr size = reinterpret_cast<const __sanitizer::uptr *>(p)[-1];
+  __sanitizer::uptr size = header[2];
   if (size == 0)
     return nullptr;
   return p;
