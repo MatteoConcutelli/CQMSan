@@ -79,7 +79,7 @@ THREADLOCAL __sanitizer::uptr __cqmsan_va_arg_overflow_size_tls;
 SANITIZER_INTERFACE_ATTRIBUTE
 THREADLOCAL __sanitizer::u32 __cqmsan_origin_tls;
 
-// [DONE] 13/05 - load_addr not used
+// load_addr not used
 // AFL bitmap feedback enrichment: XOR-fold of stack frames captured at UMR.
 __sanitizer::uptr __cqmsan_callstack_hash;
 __sanitizer::uptr load_addr;
@@ -88,7 +88,7 @@ extern "C" SANITIZER_WEAK_ATTRIBUTE const int __cqmsan_track_origins;
 // This is a compile-time constant, so we can use it in the linker script.
 
 #undef __cqmsan_get_track_origins
-// [DONE] 13/05 - track_origins is not enabled for the opportunistic mode
+// track_origins is not enabled for the opportunistic mode
 int __cqmsan_get_track_origins() {
   return 0;
 }
@@ -183,7 +183,7 @@ static void RegisterCQMsanFlags(FlagParser *parser, Flags *f) {
                           "deprecated, use halt_on_error");
 }
 
-// [DONE] 13/05
+
 static void InitializeFlags() {
   SetCommonFlagsDefaults();
   { // temporary scope for CommonFlags.
@@ -278,7 +278,7 @@ static void InitializeFlags() {
   if (f->store_context_size < 1) f->store_context_size = 1;
 }
 
-// [DONE] 13/05
+
 void PrintWarningWithOrigin(__sanitizer::uptr pc, __sanitizer::uptr bp, __sanitizer::u32 origin) {
   if (cqmsan_expect_umr) {
     __cqmsan_origin_tls = origin;
@@ -309,12 +309,12 @@ void PrintWarningWithOrigin(__sanitizer::uptr pc, __sanitizer::uptr bp, __saniti
   
 }
 
-// [DONE] 13/05
+
 void UnpoisonParam(__sanitizer::uptr n) {
   internal_memset(__cqmsan_param_tls, 0, n * sizeof(*__cqmsan_param_tls));
 }
 
-// [DONE] 13/05
+
 // Backup CQMSan runtime TLS state.
 // Implementation must be async-signal-safe.
 // Instances of this class may live on the signal handler stack, and data size
@@ -323,7 +323,7 @@ void ScopedThreadLocalStateBackup::Backup() {
   va_arg_overflow_size_tls = __cqmsan_va_arg_overflow_size_tls;
 }
 
-// [DONE] 13/05
+
 void ScopedThreadLocalStateBackup::Restore() {
   // A lame implementation that only keeps essential state and resets the rest.
   __cqmsan_va_arg_overflow_size_tls = va_arg_overflow_size_tls;
@@ -536,10 +536,9 @@ void cqmsan_update_map_pc (__sanitizer::uptr pc){
 
 }  // namespace __cqmsan
 
-// [DONE] 13/05
-// fast when -fno-omit-frame-pointer, otherwise it is a fallback to slow unwinder.
 void __sanitizer::BufferedStackTrace::UnwindImpl(
     __sanitizer::uptr pc, __sanitizer::uptr bp, void *context, bool request_fast, __sanitizer::u32 max_depth) {
+  
   using namespace __cqmsan;
   CQMsanThread *t = GetCurrentThread();
   if (!t || !__sanitizer::StackTrace::WillUseFastUnwind(request_fast)) {
@@ -559,7 +558,7 @@ void __sanitizer::BufferedStackTrace::UnwindImpl(
 
 using namespace __cqmsan;
 
-// [DONE] 13/05
+
 #ifdef CQMSAN_FLIP_CONVENTION
 // [FLIP experiment] 0=uninit: mirrors convertToBool/normalizeShadow, which
 // warn iff the (possibly multi-bit) shadow is EXACTLY zero, not "any bit
@@ -622,7 +621,7 @@ CQMSAN_MAYBE_WARNING_FAST_PCONLY(u64, 8)
 
 } // extern "C"
 
-// [DONE] 13/05 - cutted directly the API for storing origin
+// cutted directly the API for storing origin
 //#define CQMSAN_MAYBE_STORE_ORIGIN(type, size)                       \
   void __cqmsan_maybe_store_origin_##size(type s, void *p, __sanitizer::u32 o) { \
     if (UNLIKELY(s)) {                                            \
@@ -667,7 +666,7 @@ void __cqmsan_warning_fast() {
   }
 }
 
-// [DONE] 13/05
+
 void __cqmsan_warning() {
   GET_CALLER_PC_BP;  
   PrintWarningWithOrigin(pc, bp, 0);
@@ -679,7 +678,7 @@ void __cqmsan_warning() {
   }
 }
 
-// [DONE] 13/05
+
 void __cqmsan_warning_noreturn() {
   GET_CALLER_PC_BP;
   PrintWarningWithOrigin(pc, bp, 0);
@@ -689,7 +688,7 @@ void __cqmsan_warning_noreturn() {
   Die();
 }
 
-// [DONE] 13/05 - removed since no origin tracking
+// removed since no origin tracking
 //void __cqmsan_warning_with_origin(__sanitizer::u32 origin) {
 //  GET_CALLER_PC_BP;
 //  PrintWarningWithOrigin(pc, bp, origin);
@@ -701,7 +700,7 @@ void __cqmsan_warning_noreturn() {
 //  }
 //}
 
-// [DONE] 13/05 - removed since no origin tracking
+// removed since no origin tracking
 //void __cqmsan_warning_with_origin_noreturn(__sanitizer::u32 origin) {
 //  GET_CALLER_PC_BP;
 //  PrintWarningWithOrigin(pc, bp, origin);
@@ -711,19 +710,16 @@ void __cqmsan_warning_noreturn() {
 //  Die();
 //}
 
-//[DONE] 13/05
 static void OnStackUnwind(const SignalContext &sig, const void *,
                           __sanitizer::BufferedStackTrace *stack) {
   stack->Unwind(__sanitizer::StackTrace::GetNextInstructionPc(sig.pc), sig.bp, sig.context,
                 __sanitizer::common_flags()->fast_unwind_on_fatal);
 }
 
-//[DONE] 13/05
 static void CQMsanOnDeadlySignal(int signo, void *siginfo, void *context) {
   HandleDeadlySignal(siginfo, context, GetTid(), &OnStackUnwind, nullptr);
 }
 
-//[DONE] 13/05
 static void CheckUnwind() {
   GET_FATAL_STACK_TRACE_PC_BP(__sanitizer::StackTrace::GetCurrentPc(), GET_CURRENT_FRAME());
   stack.Print();
@@ -818,9 +814,6 @@ bool __cqmsan_is_static_range(__sanitizer::uptr addr) {
 }
 #endif  // CQMSAN_FLIP_CONVENTION
 
-
-// [DONE] 13/05
-// entry point for the CQMSan runtime.
 void __cqmsan_init() {
   CHECK(!cqmsan_init_is_running);
   if (cqmsan_inited) return;
@@ -898,12 +891,10 @@ void __cqmsan_init() {
 
 }
 
-// [DONE] 13/05
 void __cqmsan_set_keep_going(int keep_going) {
   flags()->halt_on_error = !keep_going;
 }
 
-// [DONE] 13/05
 void __cqmsan_set_expect_umr(int expect_umr) {
   if (expect_umr) {
     cqmsan_expected_umr_found = 0;
@@ -916,7 +907,6 @@ void __cqmsan_set_expect_umr(int expect_umr) {
   cqmsan_expect_umr = expect_umr;
 }
 
-// [DONE] 13/05
 void __cqmsan_print_shadow(const void *x, __sanitizer::uptr size) {
   if (!MEM_IS_APP(x)) {
     Printf("Not a valid application address: %p\n", x);
@@ -926,7 +916,6 @@ void __cqmsan_print_shadow(const void *x, __sanitizer::uptr size) {
   DescribeMemoryRange(x, size);
 }
 
-// [DONE] 13/05
 void __cqmsan_dump_shadow(const void *x, __sanitizer::uptr size) {
   if (!MEM_IS_APP(x)) {
     Printf("Not a valid application address: %p\n", x);
@@ -940,7 +929,6 @@ void __cqmsan_dump_shadow(const void *x, __sanitizer::uptr size) {
   Printf("\n");
 }
 
-// [DONE] 13/05
 sptr __cqmsan_test_shadow(const void *x, uptr size) {
   if (!MEM_IS_APP(x)) return -1;
   unsigned char *s = (unsigned char *)MEM_TO_SHADOW((uptr)x);
@@ -953,7 +941,6 @@ sptr __cqmsan_test_shadow(const void *x, uptr size) {
   return -1;
 }
 
-// [DONE] 13/05
 void __cqmsan_check_mem_is_initialized(const void *x, __sanitizer::uptr size) {
   if (!__cqmsan::flags()->report_umrs) return;
   sptr offset = __cqmsan_test_shadow(x, size);
@@ -973,45 +960,39 @@ void __cqmsan_check_mem_is_initialized(const void *x, __sanitizer::uptr size) {
   }
 }
 
-// [DONE] 13/05
 int __cqmsan_set_poison_in_malloc(int do_poison) {
   int old = flags()->poison_in_malloc;
   flags()->poison_in_malloc = do_poison;
   return old;
 }
 
-// [DONE] 13/05
 int __cqmsan_has_dynamic_component() { return false; }
 
-// [DONE] 13/05
 NOINLINE
 void __cqmsan_clear_on_return() {
   __cqmsan_param_tls[0] = 0;
 }
 
-// [DONE] 13/05
 void __cqmsan_partial_poison(const void* data, void* shadow, __sanitizer::uptr size) {
   internal_memcpy((void*)MEM_TO_SHADOW((__sanitizer::uptr)data), shadow, size);
 }
 
-// [DONE] 13/05
 void __cqmsan_load_unpoisoned(const void *src, __sanitizer::uptr size, void *dst) {
   internal_memcpy(dst, src, size);
   __cqmsan_unpoison(dst, size);
 }
 
-// [DONE] 13/05
 void __cqmsan_set_origin(const void *a, __sanitizer::uptr size, __sanitizer::u32 origin) {
   if (__cqmsan_get_track_origins()) SetOrigin(a, size, origin);
 }
 
-// [DONE] 13/05
+
 void __cqmsan_set_alloca_origin(void *a, __sanitizer::uptr size, char *descr) {
   SetAllocaOrigin(a, size, reinterpret_cast<__sanitizer::u32 *>(descr), descr + 4,
                   GET_CALLER_PC());
 }
 
-// [DONE] 13/05
+
 void __cqmsan_set_alloca_origin4(void *a, __sanitizer::uptr size, char *descr, __sanitizer::uptr pc) {
   // Intentionally ignore pc and use return address. This function is here for
   // compatibility, in case program is linked with library instrumented by
@@ -1020,25 +1001,25 @@ void __cqmsan_set_alloca_origin4(void *a, __sanitizer::uptr size, char *descr, _
                   GET_CALLER_PC());
 }
 
-// [DONE] 13/05
+
 void __cqmsan_set_alloca_origin_with_descr(void *a, __sanitizer::uptr size, __sanitizer::u32 *id_ptr,
                                          char *descr) {
   SetAllocaOrigin(a, size, id_ptr, descr, GET_CALLER_PC());
 }
 
-// [DONE] 13/05
+
 void __cqmsan_set_alloca_origin_no_descr(void *a, __sanitizer::uptr size, __sanitizer::u32 *id_ptr) {
   SetAllocaOrigin(a, size, id_ptr, nullptr, GET_CALLER_PC());
 }
 
-// [DONE] 13/05
+
 __sanitizer::u32 __cqmsan_chain_origin(__sanitizer::u32 id) {
   GET_CALLER_PC_BP;
   GET_STORE_STACK_TRACE_PC_BP(pc, bp);
   return ChainOrigin(id, static_cast<__sanitizer::StackTrace*>(&stack));
 }
 
-// [DONE] 13/05
+
 __sanitizer::u32 __cqmsan_get_origin(const void *a) {
   if (!__cqmsan_get_track_origins()) return 0;
   __sanitizer::uptr x = (__sanitizer::uptr)a;
@@ -1047,7 +1028,7 @@ __sanitizer::u32 __cqmsan_get_origin(const void *a) {
   return *(__sanitizer::u32*)origin_ptr;
 }
 
-// [DONE] 13/05
+
 int __cqmsan_origin_is_descendant_or_same(__sanitizer::u32 this_id, __sanitizer::u32 prev_id) {
   Origin o = Origin::FromRawId(this_id);
   while (o.raw_id() != prev_id && o.isChainedOrigin())
@@ -1055,7 +1036,7 @@ int __cqmsan_origin_is_descendant_or_same(__sanitizer::u32 this_id, __sanitizer:
   return o.raw_id() == prev_id;
 }
 
-// [DONE] 13/05
+
 __sanitizer::u32 __cqmsan_get_umr_origin() {
   return __cqmsan_origin_tls;
 }
@@ -1076,7 +1057,7 @@ __sanitizer::u32 __sanitizer_unaligned_load32(const uu32 *p) {
   return *p;
 }
 
-// [DONE] 13/05
+
 u64 __sanitizer_unaligned_load64(const uu64 *p) {
   internal_memcpy(&__cqmsan_retval_tls[0], (void *)MEM_TO_SHADOW((__sanitizer::uptr)p),
                   sizeof(uu64));
@@ -1109,7 +1090,7 @@ void __sanitizer_unaligned_store32(uu32 *p, __sanitizer::u32 x) {
   *p = x;
 }
 
-// [DONE] 13/05
+
 void __sanitizer_unaligned_store64(uu64 *p, u64 x) {
   u64 s = __cqmsan_param_tls[1];
   *(uu64 *)MEM_TO_SHADOW((__sanitizer::uptr)p) = s;
@@ -1120,12 +1101,12 @@ void __sanitizer_unaligned_store64(uu64 *p, u64 x) {
     *p = x;
 }
 
-// [DONE] 13/05
+
 void __cqmsan_set_death_callback(void (*callback)(void)) {
   SetUserDieCallback(callback);
 }
 
-// [DONE] 13/05
+
 void __cqmsan_start_switch_fiber(const void *bottom, __sanitizer::uptr size) {
   CQMsanThread *t = GetCurrentThread();
   if (!t) {
@@ -1135,7 +1116,7 @@ void __cqmsan_start_switch_fiber(const void *bottom, __sanitizer::uptr size) {
   t->StartSwitchFiber((__sanitizer::uptr)bottom, size);
 }
 
-// [DONE] 13/05
+
 void __cqmsan_finish_switch_fiber(const void **bottom_old, __sanitizer::uptr *size_old) {
   CQMsanThread *t = GetCurrentThread();
   if (!t) {
@@ -1158,12 +1139,12 @@ void __cqmsan_finish_switch_fiber(const void **bottom_old, __sanitizer::uptr *si
   }
 }
 
-// [DONE] 13/05
+
 SANITIZER_INTERFACE_WEAK_DEF(const char *, __cqmsan_default_options, void) {
   return "";
 }
 
-// [DONE] 13/05
+
 // API implementation
 extern "C" {
     SANITIZER_INTERFACE_ATTRIBUTE
