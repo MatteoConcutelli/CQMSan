@@ -111,7 +111,6 @@ static const size_t kNumberOfAccessSizes = 4;
 
 
 // ------------- FLAGS --------------- //
-
 static cl::opt<bool> ClSkipProvableCleanLoads("cqmsan-skip-provable-clean-loads",
     cl::desc("Skip loads that can be proven to be clean (no UMR)"),
     cl::Hidden, cl::init(false));
@@ -151,6 +150,41 @@ static cl::opt<bool> ClBBCoalescedChecks(
     cl::Hidden, cl::init(false)); 
     // TODO - adjust and validate the soundess of isImmediateEssentialSink()
 
+
+/// ------------------------------ABLATION--------------------------------------------- ///
+
+// Default true ⇒ default behavior UNCHANGED. 
+// ONLY used to measure the load-skipping throughput 
+// ceiling (they are NOT real detectors: setting false loses detection).
+//
+// ClInstrumentLoads=false : visitLoadInst does not instrument loads at all (no
+// shadow-loads, no checks; the load shadow is treated as clean). This is the ceiling:
+// no load-skipping optimization can go faster than this.
+// Per-target selection: -mllvm -cqmsan-instrument-loads=0
+static cl::opt<bool> ClInstrumentLoads(
+    "cqmsan-instrument-loads",
+    cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
+    cl::Hidden, cl::init(true));
+
+// ClCheckLoads=false : the shadow load is loaded but the UMR check is NOT
+// issued. Without propagation, the shadow load becomes dead and the DCE removes it ⇒ in
+// practice, it collapses on instrument-loads=0 (useful for confirming that the cost is the
+// shadow load, not just the check branch).
+// Per-target selection: -mllvm -cqmsan-check-loads=0
+static cl::opt<bool> ClCheckLoads(
+    "cqmsan-check-loads",
+    cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentStores(
+    "cqmsan-instrument-stores",
+    cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
+    cl::Hidden, cl::init(true));
+
+/// ------------------------------------------------------------------------------------ ///
+
+/// Originals
+
 static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
     cl::desc("keep going after reporting a UMR"),
     cl::Hidden, cl::init(true));
@@ -188,7 +222,7 @@ static cl::opt<bool> ClHandleLifetimeIntrinsics("cqmsan-handle-lifetime-intrinsi
 // the first sizeof(type) bytes for each type* pointer.
 static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
     cl::desc("conservative handling of inline assembly"), cl::Hidden,
-    cl::init(false));
+    cl::init(true));
     // when true it reduces the false positives, but it may cause false negatives 
     // (e.g. if the inline assembly does not initialize the entire array)
     // So in opportunistic mode we leave it to false, to avoid false negatives and 
@@ -203,9 +237,7 @@ static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
 static cl::opt<bool> ClCheckAccessAddress(
     "cqmsan-check-access-address",
     cl::desc("report accesses through a pointer which has poisoned shadow"),
-    cl::Hidden, cl::init(false));  // MSan upstream uses false.
-                                   // Removes the shadow check on the ADDRESS at every
-                                   // load/store
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
@@ -254,39 +286,6 @@ static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
 static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
     cl::desc("Print name of local stack variable"),
     cl::Hidden, cl::init(false));
-
-/// ------------------------------ABLATION--------------------------------------------- ///
-
-// Default true ⇒ default behavior UNCHANGED. 
-// ONLY used to measure the load-skipping throughput 
-// ceiling (they are NOT real detectors: setting false loses detection).
-//
-// ClInstrumentLoads=false : visitLoadInst does not instrument loads at all (no
-// shadow-loads, no checks; the load shadow is treated as clean). This is the ceiling:
-// no load-skipping optimization can go faster than this.
-// Per-target selection: -mllvm -cqmsan-instrument-loads=0
-static cl::opt<bool> ClInstrumentLoads(
-    "cqmsan-instrument-loads",
-    cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
-    cl::Hidden, cl::init(true));
-
-// ClCheckLoads=false : the shadow load is loaded but the UMR check is NOT
-// issued. Without propagation, the shadow load becomes dead and the DCE removes it ⇒ in
-// practice, it collapses on instrument-loads=0 (useful for confirming that the cost is the
-// shadow load, not just the check branch).
-// Per-target selection: -mllvm -cqmsan-check-loads=0
-static cl::opt<bool> ClCheckLoads(
-    "cqmsan-check-loads",
-    cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
-    cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClInstrumentStores(
-    "cqmsan-instrument-stores",
-    cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
-    cl::Hidden, cl::init(true));
-
-/// ------------------------------------------------------------------------------------ ///
-
 
 // Define the constructor name and the init function name of the runtime library
 const char kCQMSanModuleCtorName[] = "cqmsan.module_ctor";
@@ -466,11 +465,10 @@ CompilerQEMUMemorySanitizerOptions::CompilerQEMUMemorySanitizerOptions(bool R,
 PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysisManager &AM) {
 
     insertModuleCtor(M); // ensure the __cqmsan_init is called before main()
+    bool Modified = true;
 
     // get the function analysis manager from the module analysis manager
     auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-    bool Modified = false;
-
     // Foreach function in the module, apply the CompilerQEMUMemorySanitizer instrumentation
     for (Function &F : M) {
         if (F.empty())
@@ -494,14 +492,15 @@ PreservedAnalyses CompilerQEMUMemorySanitizerPass::run(Module &M, ModuleAnalysis
 
 void CompilerQEMUMemorySanitizerPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
-  static_cast<PassInfoMixin<CompilerQEMUMemorySanitizerPass> *>(this)->printPipeline(
-      OS, MapClassName2PassName);
-  OS << '<';
-  if (Options.Recover)
-    OS << "recover;";
-  if (Options.EagerChecks)
-    OS << "eager-checks;";
-  OS << '>';
+        
+    static_cast<PassInfoMixin<CompilerQEMUMemorySanitizerPass> *>(this)->printPipeline(
+        OS, MapClassName2PassName);
+    OS << '<';
+    if (Options.Recover)
+        OS << "recover;";
+    if (Options.EagerChecks)
+        OS << "eager-checks;";
+    OS << '>';
 }
 
 // Used for declaring globals as "__cqmsan_retval_tls"...
@@ -1589,7 +1588,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     bool canProveLoadIsClean(LoadInst *LI) {
-        // [TODO] if this work, implement this flag then
+        // [TODO] if this work, activate this flag then
         if (!ClSkipProvableCleanLoads) return false;
 
         // R1
