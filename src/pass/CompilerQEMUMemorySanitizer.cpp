@@ -376,8 +376,6 @@ private:
     PointerType *PtrTy;     // ptr type
 
     /// TLS shadow channels ///
-    /// Thread-local shadow storage for function parameters.
-    Value *ParamTLS;
     /// Thread-local shadow storage for function return value.
     Value *RetvalTLS;
     /// Thread-local shadow storage for in-register va_arg function.
@@ -543,10 +541,6 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     RetvalTLS =
       getOrInsertGlobal(M, "__cqmsan_retval_tls",
                         ArrayType::get(IRB.getInt64Ty(), kRetvalTLSSize / 8));
-
-    //ParamTLS =
-    //  getOrInsertGlobal(M, "__cqmsan_param_tls",
-    //                        ArrayType::get(IRB.getInt64Ty(), kParamTLSSize / 8));
 
     VAArgTLS =
       getOrInsertGlobal(M, "__cqmsan_va_arg_tls",
@@ -1364,7 +1358,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Get the shadow value for a given Value.
     ///
     /// This function either returns the value set earlier with setShadow,
-    /// or extracts if from ParamTLS (for function arguments).
+    /// or a clean shadow (arguments/undef/unstored are trusted clean).
     Value *getShadow(Value *V) {
 
         if (Instruction *I = dyn_cast<Instruction>(V)) {
@@ -1375,14 +1369,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // For instructions the shadow is already stored in the map.
             Value *Shadow = ShadowMap[V];
             if (!Shadow) {
-                // OLD
-                //  LLVM_DEBUG(dbgs() << "No shadow: " << *V << "\n" << *(I->getParent()));
-                //  assert(Shadow && "No shadow for a value");ù
-                // NEW
-                // Se l'istruzione non è stata strumentata (es. prologo, o saltata),
-                // assumiamo che il suo valore sia pulito/inizializzato.
-                LLVM_DEBUG(dbgs() << "No shadow found for: " << *V << " -> Returning Clean Shadow\n");
-                return getCleanShadow(V);
+                LLVM_DEBUG(dbgs() << "No shadow for: " << *V << " in " << I->getFunction()->getName() << "\n");
+                assert(Shadow && "CQMSan: missing shadow (a handler forgot setShadow)");
+                return getCleanShadow(V); // opportunistic clean fallback (release)
             }
             return Shadow;
         }  
@@ -1957,6 +1946,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             ShadowTy, ShadowPtr, Mask, getShadow(PassThru), "_cqmsmaskedexpload");
 
         setShadow(&I, Shadow);
+
+        // check-at-load: solo lane attive (le inattive portano lo shadow del PassThru)
+        if (ClCheckLoads) {
+#ifdef CQMSAN_FLIP_CONVENTION
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getAllOnesShadow(ShadowTy), "_cqmsmaskedchk");
+#else
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
+#endif
+            pushShadowCheck(ActiveShadow, &I);
+        }
     }
 
     void handleMaskedCompressStore(IntrinsicInst &I) {
@@ -2012,6 +2011,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             IRB.CreateMaskedGather(ShadowTy, ShadowPtrs, Alignment, Mask,
                                 getShadow(PassThru), "_cqmsmaskedgather");
         setShadow(&I, Shadow);
+
+        // check-at-load: solo lane attive (le inattive portano lo shadow del PassThru)
+        if (ClCheckLoads) {
+#ifdef CQMSAN_FLIP_CONVENTION
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getAllOnesShadow(ShadowTy), "_cqmsmaskedchk");
+#else
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
+#endif
+            pushShadowCheck(ActiveShadow, &I);
+        }
     }
 
     void handleMaskedScatter(IntrinsicInst &I) {
@@ -2086,8 +2095,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         Type *ShadowTy = getShadowTy(&I);
         Value *ShadowPtr =
             getShadowPtr(Ptr, IRB, ShadowTy, Alignment, /*isStore*/ false);
-        setShadow(&I, IRB.CreateMaskedLoad(ShadowTy, ShadowPtr, Alignment, Mask,
-                                        getShadow(PassThru), "_cqmsmaskedld"));
+        Value *Shadow = IRB.CreateMaskedLoad(ShadowTy, ShadowPtr, Alignment, Mask,
+                                        getShadow(PassThru), "_cqmsmaskedld");
+        setShadow(&I, Shadow);
+
+        // check-at-load: solo lane attive (le inattive portano lo shadow del PassThru)
+        if (ClCheckLoads) {
+#ifdef CQMSAN_FLIP_CONVENTION
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getAllOnesShadow(ShadowTy), "_cqmsmaskedchk");
+#else
+            Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
+#endif
+            pushShadowCheck(ActiveShadow, &I);
+        }
 
         return;
     }
@@ -2238,6 +2258,17 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // __sanitizer_unaligned_{load,store} functions may be called by users
             // and always expects shadows in the TLS. So don't check them.
             MayCheckCall &= !Func->getName().starts_with("__sanitizer_unaligned_");
+        }
+
+        // 4b. Eager argument check: noundef, non-byval args (no ParamTLS channel).
+        if (MayCheckCall) {
+            for (unsigned i = 0, n = CB.arg_size(); i < n; ++i) {
+                Value *A = CB.getArgOperand(i);
+                if (!A->getType()->isSized()) continue;
+                if (CB.paramHasAttr(i, Attribute::ByVal)) continue;
+                if (!CB.paramHasAttr(i, Attribute::NoUndef)) continue;
+                insertShadowCheck(A, &CB);
+            }
         }
 
         // 5. VarArgs handling — SIZE-ONLY (opportunistic).
@@ -2560,40 +2591,6 @@ struct VarArgHelperBase : public VarArgHelper {
                     CompilerQEMUMemorySanitizerVisitor &CQMSV, unsigned VAListTagSize)
         : F(F), CQMS(CQMS), CQMSV(CQMSV), VAListTagSize(VAListTagSize) {}
 
-    Value *getShadowAddrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset) {
-        Value *Base = IRB.CreatePointerCast(CQMS.VAArgTLS, CQMS.IntptrTy);
-        return IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
-    }
-
-    /// Compute the shadow address for a given va_arg.
-    Value *getShadowPtrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset) {
-        Value *Base = IRB.CreatePointerCast(CQMS.VAArgTLS, CQMS.IntptrTy);
-        Base = IRB.CreateAdd(Base, ConstantInt::get(CQMS.IntptrTy, ArgOffset));
-        return IRB.CreateIntToPtr(Base, CQMS.PtrTy, "_cqmsarg_va_s");
-    }
-
-    /// Compute the shadow address for a given va_arg.
-    Value *getShadowPtrForVAArgument(IRBuilder<> &IRB, unsigned ArgOffset,
-                                    unsigned ArgSize) {
-        // Make sure we don't overflow __cqmsan_va_arg_tls.
-        if (ArgOffset + ArgSize > kParamTLSSize)
-            return nullptr;
-        return getShadowPtrForVAArgument(IRB, ArgOffset);
-    }
-
-    void CleanUnusedTLS(IRBuilder<> &IRB, Value *ShadowBase,
-                      unsigned BaseOffset) {
-        // The tails of __cqmsan_va_arg_tls is not large enough to fit full
-        // value shadow, but it will be copied to backup anyway. Make it
-        // clean.
-        if (BaseOffset >= kParamTLSSize)
-            return;
-        Value *TailSize =
-            ConstantInt::getSigned(IRB.getInt32Ty(), kParamTLSSize - BaseOffset);
-        IRB.CreateMemSet(ShadowBase, ConstantInt::getNullValue(IRB.getInt8Ty()),
-                        TailSize, Align(8));
-    }
-
     void unpoisonVAListTagForInst(IntrinsicInst &I) {
         IRBuilder<> IRB(&I);
         Value *VAListTag = I.getArgOperand(0);
@@ -2631,8 +2628,6 @@ struct VarArgAMD64Helper : public VarArgHelperBase {
   static const unsigned AMD64FpEndOffsetNoSSE = AMD64GpEndOffset;
 
   unsigned AMD64FpEndOffset;
-  AllocaInst *VAArgTLSCopy = nullptr;
-  AllocaInst *VAArgTLSOriginCopy = nullptr;
   Value *VAArgOverflowSize = nullptr;
 
   enum ArgKind { AK_GeneralPurpose, AK_FloatingPoint, AK_Memory };
@@ -2731,73 +2726,44 @@ struct VarArgAMD64Helper : public VarArgHelperBase {
     }
 
     void finalizeInstrumentation() override {
-        assert(!VAArgOverflowSize && !VAArgTLSCopy &&
-            "finalizeInstrumentation called twice");
-        
+        assert(!VAArgOverflowSize && "finalizeInstrumentation called twice");
+
         if (!VAStartInstrumentationList.empty()) {
-            // If there is a va_start in this function, make a backup copy of
-            // va_arg_tls somewhere in the function entry block.
             IRBuilder<> IRB(CQMSV.FnPrologueEnd);
-            
             VAArgOverflowSize =
                 IRB.CreateLoad(IRB.getInt64Ty(), CQMS.VAArgOverflowSizeTLS);
-            
-            Value *CopySize = IRB.CreateAdd(
-                ConstantInt::get(CQMS.IntptrTy, AMD64FpEndOffset), VAArgOverflowSize);
-            
-            VAArgTLSCopy = IRB.CreateAlloca(Type::getInt8Ty(*CQMS.C), CopySize);
-            VAArgTLSCopy->setAlignment(kShadowTLSAlignment);
-
-            IRB.CreateMemSet(VAArgTLSCopy, Constant::getNullValue(IRB.getInt8Ty()),
-                            CopySize, kShadowTLSAlignment, false);
-
-            Value *SrcSize = IRB.CreateBinaryIntrinsic(
-                Intrinsic::umin, CopySize,
-                ConstantInt::get(CQMS.IntptrTy, kParamTLSSize));
-            IRB.CreateMemCpy(VAArgTLSCopy, kShadowTLSAlignment, CQMS.VAArgTLS,
-                            kShadowTLSAlignment, SrcSize);
-            
         }
 
-        // Instrument va_start.
-        // Copy va_list shadow from the backup copy of the TLS contents.
+        // VAArgTLS is never written (size-only design): va_start shadow = clean.
         for (CallInst *OrigInst : VAStartInstrumentationList) {
             NextNodeIRBuilder IRB(OrigInst);
             Value *VAListTag = OrigInst->getArgOperand(0);
+            const Align Alignment = Align(16);
 
             Value *RegSaveAreaPtrPtr = IRB.CreateIntToPtr(
                 IRB.CreateAdd(IRB.CreatePtrToInt(VAListTag, CQMS.IntptrTy),
                                 ConstantInt::get(CQMS.IntptrTy, 16)),
                 CQMS.PtrTy);
-            
             Value *RegSaveAreaPtr = IRB.CreateLoad(CQMS.PtrTy, RegSaveAreaPtrPtr);
-
-            Value *RegSaveAreaShadowPtr;
-            const Align Alignment = Align(16);
-            RegSaveAreaShadowPtr =
+            Value *RegSaveAreaShadowPtr =
                     CQMSV.getShadowPtr(RegSaveAreaPtr, IRB, IRB.getInt8Ty(),
                                         Alignment, /*isStore*/ true);
+            IRB.CreateMemSet(RegSaveAreaShadowPtr,
+                            Constant::getNullValue(IRB.getInt8Ty()),
+                            AMD64FpEndOffset, Alignment, false);
 
-            IRB.CreateMemCpy(RegSaveAreaShadowPtr, Alignment, VAArgTLSCopy, Alignment,
-                            AMD64FpEndOffset);
-            
             Value *OverflowArgAreaPtrPtr = IRB.CreateIntToPtr(
                 IRB.CreateAdd(IRB.CreatePtrToInt(VAListTag, CQMS.IntptrTy),
                                 ConstantInt::get(CQMS.IntptrTy, 8)),
                 CQMS.PtrTy);
-
             Value *OverflowArgAreaPtr =
                 IRB.CreateLoad(CQMS.PtrTy, OverflowArgAreaPtrPtr);
-
             Value *OverflowArgAreaShadowPtr =
                 CQMSV.getShadowPtr(OverflowArgAreaPtr, IRB, IRB.getInt8Ty(),
                                         Alignment, /*isStore*/ true);
-
-            Value *SrcPtr = IRB.CreateConstGEP1_32(IRB.getInt8Ty(), VAArgTLSCopy,
-                                                    AMD64FpEndOffset);
-            IRB.CreateMemCpy(OverflowArgAreaShadowPtr, Alignment, SrcPtr, Alignment,
-                            VAArgOverflowSize);
-            
+            IRB.CreateMemSet(OverflowArgAreaShadowPtr,
+                            Constant::getNullValue(IRB.getInt8Ty()),
+                            VAArgOverflowSize, Alignment, false);
         }
     }
 };
