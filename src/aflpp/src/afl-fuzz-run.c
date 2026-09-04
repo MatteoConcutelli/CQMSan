@@ -102,7 +102,14 @@ int logged = 0;
 int valgrind_mode = 0;
 
 int check_msan_trace(afl_state_t *afl, u8* trace){
-  // if (memcmp(trace, afl->msan_traces, MAP_SIZE) == 0) return 0;
+  // [OPT] Whole-map early-out: if no non-sentinel byte changed since the last fold,
+  // there is nothing new to detect, so skip the per-byte loop entirely. msan_traces'
+  // bits are always a subset of trace's (we only ever OR trace's bits into it), so
+  // byte-equality => no novelty. Compare MAP_SIZE-1 bytes: the last byte is the dirty
+  // sentinel (0xff in trace, 0 in msan_traces) that the loop below never processes.
+  // On re-fire-of-known-edges execs (e.g. re2) this replaces the 65535-iter scalar
+  // scan with one vectorized 64KB compare.
+  if (memcmp(trace, afl->msan_traces, MAP_SIZE - 1) == 0) return 0;
 
   int i = MAP_SIZE -1, heavyweight_needed = 0;
 #ifdef QMSAN_FLAGGING
@@ -112,8 +119,10 @@ int check_msan_trace(afl_state_t *afl, u8* trace){
     u8 new = trace[i];
     u8 old = afl->msan_traces[i];
 
-    // OTPIMIZATION - 07/26
-    // if (new == old) continue;
+    // [OPT] Skip unchanged bytes: every block below tests a transition (old->new),
+    // which is impossible when old==new. Handles the case where memcmp found SOME
+    // change but most bytes are still unchanged.
+    if (new == old) continue;
 
   //in this mode, we just check for the byte to contain something
   //useful if we just want to consider one property (e.g. edges)
@@ -377,6 +386,12 @@ int qmsan_check_bugs(afl_state_t *afl){
       QMSAN_LOG("msan stats: [%llu/%llu]\n",
             afl->qmsan_crashes, afl->heavyweight_runs);
     }
+    // [OPT] Clear the sentinel on EVERY handled exec, not only on novelty. The
+    // sentinel lives in shared msan_bits, which is never reset in EDGES mode, so
+    // otherwise it stays set forever after the first firing and forces the scan on
+    // ~every subsequent exec. Clearing it here makes the scan run only on execs that
+    // actually fired this run -- big win for low-firing targets (e.g. openssl).
+    afl->fsrv.msan_bits[MAP_SIZE - 1] = 0;
   }
 #if defined QMSAN_FLAGGING || defined QMSAN_NAIVE
   //in this modes we need QEMU to have fresh bits in its map
