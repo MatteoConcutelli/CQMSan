@@ -35,6 +35,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -742,9 +743,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // [PROTOTIPO sink-based] Cerca un SINK (sink MSan-fedeli) raggiunto dal valore di Load, su cui
     // deferire il check in modo SOUND (single-placement). Condizione di soundness: il sink deve essere
     // GARANTITO raggiunto quando il load esegue -> stesso BB dopo il load, oppure BB che POST-DOMINA
-    // il BB del load (ogni path dal load ci passa -> nessun uso resta non-checkato). La dominanza
-    // shadow->sink e' garantita da SSA (il sink usa un valore derivato dal load). NON propaga: porta
-    // lo shadow ORIGINALE. Ritorna il sink o nullptr (fallback: check al load).
+    // il BB del load, E senza barriere (call unwind/noreturn) sul percorso (guaranteedPathHasBarrier):
+    // la sola post-dominanza CFG non basta perche' una call unwinding non e' modellata come exit. La
+    // dominanza shadow->sink e' garantita da SSA (il sink usa un valore derivato dal load). NON propaga:
+    // porta lo shadow ORIGINALE. Ritorna il sink o nullptr (fallback: check al load).
     Instruction *findSinkFor(LoadInst *Load, PostDominatorTree &PDT) {
 
         BasicBlock *LBB = Load->getParent();    // get the basic block of the load instruction
@@ -801,14 +803,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                     if (seen.insert(UI).second) wl.push_back(UI); continue;
                 }
 
-                // accetta il sink se e' garantito raggiunto: stesso BB dopo il load, oppure BB che
-                // post-domina il BB del load (single-placement sound cross-block). NB: terminatori
-                // ESCLUSI di proposito: br/switch di loop sono blocchi caldi -> deferire li' rilocca il
-                // check su codice piu' caldo e PEGGIORA le perf.
+                // accetta il sink se e' garantito raggiunto quando il load esegue: stesso BB dopo il load,
+                // oppure BB che post-domina il BB del load; E nessuna barriera (call unwind/noreturn) sul
+                // percorso load->sink -- altrimenti il sink potrebbe non essere raggiunto a runtime e il
+                // check deferito non scatterebbe (falso negativo). NB: terminatori ESCLUSI di proposito
+                // (br/switch di loop sono blocchi caldi -> deferire li' PEGGIORA le perf).
                 if (cand && !isa<PHINode>(cand) && !cand->isTerminator()) {
                     BasicBlock *CBB = cand->getParent();
                     bool guaranteed = (CBB == LBB) ? Load->comesBefore(cand) : PDT.dominates(CBB, LBB);
-                    if (guaranteed) return cand;
+                    if (guaranteed && !guaranteedPathHasBarrier(Load, cand)) return cand;
                 }
 
             }
@@ -1054,6 +1057,32 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return !isGuaranteedToTransferExecutionToSuccessor(I);
     }
 
+    // true se sul percorso GARANTITO Load->Sink esiste una barriera (call che puo' unwind/non-ritornare).
+    // In tal caso il sink potrebbe non essere raggiunto a runtime -> deferral UNSOUND (fallback al load).
+    // (audit: la sola post-dominanza CFG non basta, una call unwinding non e' modellata come exit).
+    bool guaranteedPathHasBarrier(const Instruction *Load, const Instruction *Sink) const {
+        const BasicBlock *LBB = Load->getParent(), *SBB = Sink->getParent();
+        if (LBB == SBB) {
+            for (const Instruction *I = Load->getNextNode(); I && I != Sink; I = I->getNextNode())
+                if (isBBBarrier(I)) return true;
+            return false;
+        }
+        // cross-block (SBB post-domina LBB): coda di LBB + blocchi intermedi (raggiungibili da LBB
+        // prima di SBB) + testa di SBB fino al sink. Over-approx conservativa = sound.
+        for (const Instruction *I = Load->getNextNode(); I; I = I->getNextNode())
+            if (isBBBarrier(I)) return true;
+        SmallPtrSet<const BasicBlock *, 16> seen;
+        SmallVector<const BasicBlock *, 16> wl;
+        for (const BasicBlock *S : successors(LBB)) if (S != SBB && seen.insert(S).second) wl.push_back(S);
+        while (!wl.empty()) {
+            const BasicBlock *B = wl.pop_back_val();
+            for (const Instruction &I : *B) if (isBBBarrier(&I)) return true;
+            for (const BasicBlock *S : successors(B)) if (S != SBB && seen.insert(S).second) wl.push_back(S);
+        }
+        for (const Instruction &I : *SBB) { if (&I == Sink) break; if (isBBBarrier(&I)) return true; }
+        return false;
+    }
+
     // terminatori davanti ai quali non possiamo splittare/inserire in sicurezza
     static bool isUnsplittableTerminator(const Instruction *T) {
         return isa<CatchSwitchInst>(T) || isa<CleanupReturnInst>(T) ||
@@ -1105,6 +1134,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             else
                 Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true));
         }
+
+        // Rende consecutive le entry con lo stesso OrigIns: un check-valore ricaduto in Essential (anchor
+        // assente) puo' condividere OrigIns col check-indirizzo del load -> senza sort verrebbe processato
+        // due volte (2 check invece di 1 fuso). Il grouping sotto (find_if su run consecutivi) lo esige.
+        std::stable_sort(Essential.begin(), Essential.end(),
+            [](const ShadowAndInsertPoint &A, const ShadowAndInsertPoint &B){ return A.OrigIns < B.OrigIns; });
 
         // FASE 2a: essenziali come legacy (1 check OR-ed per OrigIns, al sito)
         for (auto I = Essential.begin(); I != Essential.end();) {
