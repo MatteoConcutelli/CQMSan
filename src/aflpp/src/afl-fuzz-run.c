@@ -329,6 +329,18 @@ int qmsan_check_bugs(afl_state_t *afl){
     init_cmdline(afl);
   }
 
+#ifdef QMSAN_NOOP_FPCHECK
+  // [ABLATION — extends QMSAN_NOOP_ACCURATE] Disable the false-positive check
+  // entirely: treat EVERY flagged execution as a false positive WITHOUT ever
+  // running check_msan_trace (the per-exec 65535-iteration fold of the UMR map
+  // into afl->msan_traces). This isolates the throughput cost of that scan.
+  // We clear the sentinel so the child's next firing is still observable.
+  // NOTE: this removes the UMR->AFL novelty feedback, so it is a THROUGHPUT-ONLY
+  // ceiling (measured re2 ~+21% vs the scan), NOT a valid detection build.
+  if(afl->fsrv.msan_bits) afl->fsrv.msan_bits[MAP_SIZE - 1] = 0;
+  return 0;
+#endif
+
   if(afl->fsrv.msan_bits && afl->fsrv.msan_bits[MAP_SIZE - 1]){
     if(check_msan_trace(afl, afl->fsrv.msan_bits)){
       afl->fsrv.msan_bits[MAP_SIZE - 1] = 0;
