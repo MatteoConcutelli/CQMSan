@@ -16,6 +16,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -33,6 +34,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
@@ -147,8 +149,8 @@ static cl::opt<bool> ClTrustReturn(
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
     cl::desc("Group shadow checks per basic block."),
-    cl::Hidden, cl::init(false)); 
-    // TODO - adjust and validate the soundess of isImmediateEssentialSink()
+    cl::Hidden, cl::init(false));
+    // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
 
 
 /// ------------------------------ABLATION--------------------------------------------- ///
@@ -175,6 +177,13 @@ static cl::opt<bool> ClCheckLoads(
     "cqmsan-check-loads",
     cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
     cl::Hidden, cl::init(true));
+
+// [PROTOTIPO sink-based] deferisce il check del valore caricato al primo sink che il load domina,
+// e la fusione avviene per OrigIns (materialize). Riduce il n. di check-branch. init(false).
+static cl::opt<bool> ClSinkChecks(
+    "cqmsan-sink-checks",
+    cl::desc("Defer the loaded-value check to the first dominated sink (fused). Prototype."),
+    cl::Hidden, cl::init(false));
 
 static cl::opt<bool> ClInstrumentStores(
     "cqmsan-instrument-stores",
@@ -728,7 +737,84 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     const TargetLibraryInfo *TLI;   // for recognizing libc functions
     Instruction *FnPrologueEnd;
     // List of instructions to instrument in a second time (see runOnFunction)
-    SmallVector<Instruction *, 16> Instructions;    
+    SmallVector<Instruction *, 16> Instructions;
+
+    // [PROTOTIPO sink-based] Cerca un SINK (sink MSan-fedeli) raggiunto dal valore di Load, su cui
+    // deferire il check in modo SOUND (single-placement). Condizione di soundness: il sink deve essere
+    // GARANTITO raggiunto quando il load esegue -> stesso BB dopo il load, oppure BB che POST-DOMINA
+    // il BB del load (ogni path dal load ci passa -> nessun uso resta non-checkato). La dominanza
+    // shadow->sink e' garantita da SSA (il sink usa un valore derivato dal load). NON propaga: porta
+    // lo shadow ORIGINALE. Ritorna il sink o nullptr (fallback: check al load).
+    Instruction *findSinkFor(LoadInst *Load, PostDominatorTree &PDT) {
+
+        BasicBlock *LBB = Load->getParent();    // get the basic block of the load instruction
+        SmallPtrSet<Value *, 32> seen;          
+        SmallVector<Value *, 64> wl;
+        
+        wl.push_back(Load); seen.insert(Load);
+        while (!wl.empty()) {
+
+            Value *V = wl.pop_back_val();
+            for (User *U : V->users()) {                // for each user of the value V
+                auto *UI = dyn_cast<Instruction>(U);    // cast the user to an instruction
+                if (!UI) continue;
+
+                Instruction *cand = nullptr;            // candidate sink instruction (if any) that uses the value V
+                
+                if      (auto *LD = dyn_cast<LoadInst>(UI))     { if (LD->getPointerOperand() == V) cand = UI; }
+                else if (auto *ST = dyn_cast<StoreInst>(UI))    { if (ST->getPointerOperand() == V) cand=UI; 
+                                                             else if (ST->getValueOperand() == V) continue; }
+                else if (auto *RI = dyn_cast<ReturnInst>(UI))   { if (RI->getReturnValue() == V) cand=UI; }
+                else if (auto *BR = dyn_cast<BranchInst>(UI))   { if (BR->isConditional() && BR->getCondition() == V) cand = UI; }
+                else if (auto *SW = dyn_cast<SwitchInst>(UI))   { if (SW->getCondition() == V) cand=UI; }
+                else if (auto *BO = dyn_cast<BinaryOperator>(UI)) {
+                    auto op=BO->getOpcode();
+                    if ((op==Instruction::SDiv||op==Instruction::UDiv||op==Instruction::SRem||op==Instruction::URem)&&BO->getOperand(1)==V) cand=UI;
+                    else { if (seen.insert(BO).second) wl.push_back(BO); continue; }    // div/rem: sink (div-by-zero) -> check-valore deferible at sink; 
+                                                                                        // other binop are not sinks
+                }
+                else if (auto *CB = dyn_cast<CallBase>(UI)) {
+                    // sink CALL: valore usato come argomento. IR stabile (remap post-visit) -> niente dangling.
+                    // Escludi memintrinsics e le call al runtime cqmsan (non sono veri sink d'uso).
+                    // (gli InvokeInst sono terminatori -> gia' esclusi dal filtro finale.)
+                    if (isa<MemIntrinsic>(CB)) continue;
+
+                    Function *Callee = CB->getCalledFunction();
+                    if (Callee && Callee->getName().starts_with("__cqmsan")) continue;
+
+                    bool isArg=false; 
+                    for (unsigned a = 0; a < CB->arg_size(); ++a) 
+                        if (CB->getArgOperand(a) == V){
+                            isArg=true;
+                            break;
+                        }
+
+                    if (isArg) cand=UI; else continue;
+
+                }
+                // NB: NO PHINode/SelectInst nella propagazione: sono merge control-dipendenti -> su un path
+                // che non passa dal load lo shadow di L non domina (PHI) o il valore non viene da L (select
+                // -> falso positivo). Fermarsi qui e' il fallback sound (check al load).
+                else if (isa<CastInst>(UI)||isa<GetElementPtrInst>(UI)||isa<CmpInst>(UI)||
+                         isa<ExtractValueInst>(UI)||isa<InsertValueInst>(UI)||isa<ExtractElementInst>(UI)||
+                         isa<InsertElementInst>(UI)||isa<ShuffleVectorInst>(UI)||isa<UnaryOperator>(UI)||isa<FreezeInst>(UI)) {
+                    if (seen.insert(UI).second) wl.push_back(UI); continue;
+                }
+
+                // accetta il sink se e' garantito raggiunto: stesso BB dopo il load, oppure BB che
+                // post-domina il BB del load (single-placement sound cross-block). NB: terminatori
+                // ESCLUSI di proposito: br/switch di loop sono blocchi caldi -> deferire li' rilocca il
+                // check su codice piu' caldo e PEGGIORA le perf.
+                if (cand && !isa<PHINode>(cand) && !cand->isTerminator()) {
+                    BasicBlock *CBB = cand->getParent();
+                    bool guaranteed = (CBB == LBB) ? Load->comesBefore(cand) : PDT.dominates(CBB, LBB);
+                    if (guaranteed) return cand;
+                }
+
+            }
+        }
+        return nullptr;
+    }
 
     bool InsertChecks;
     bool PoisonStack;
@@ -739,9 +825,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     struct ShadowAndInsertPoint {
         Value *Shadow;
         Instruction *OrigIns;
+        bool Essential;   // true (default): materializza al sito = legacy sound; false: check-valore differibile/coalescabile
 
-        ShadowAndInsertPoint(Value *S, Instruction *I)
-            : Shadow(S), OrigIns(I) {}
+        ShadowAndInsertPoint(Value *S, Instruction *I, bool E = true)
+            : Shadow(S), OrigIns(I), Essential(E) {}
     };
 
     SmallVector<ShadowAndInsertPoint, 16> InstrumentationList;
@@ -868,7 +955,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     void materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint> InstructionChecks) {
         const DataLayout &DL = F.getDataLayout();
-        
+
         Instruction *OrigIns = InstructionChecks.front().OrigIns;
         Value *Shadow = nullptr;
         
@@ -932,7 +1019,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         //LLVM_DEBUG(dbgs() << "DONE:\n" << F);
     }
 
-    // TODO - controllare la correttezza di questa funzione, non è chiaro se sia sufficiente per tutti i casi
+    // rete ridondante (non piu' il classificatore primario): forza essenziali certi sink anche senza bit
     bool isImmediateEssentialSink(Instruction *OrigIns) const {
         // Indirect call: ptr deve essere checked PRIMA della call execution
         if (auto *CB = dyn_cast<CallBase>(OrigIns))
@@ -962,48 +1049,75 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 #endif
     }
 
-    void materializeChecks() {
+    // true se dopo I l'esecuzione potrebbe non raggiungere il successore in linea (call noreturn/throw, ecc.)
+    static bool isBBBarrier(const Instruction *I) {
+        return !isGuaranteedToTransferExecutionToSuccessor(I);
+    }
 
+    // terminatori davanti ai quali non possiamo splittare/inserire in sicurezza
+    static bool isUnsplittableTerminator(const Instruction *T) {
+        return isa<CatchSwitchInst>(T) || isa<CleanupReturnInst>(T) ||
+               isa<CatchReturnInst>(T) || isa<CallBrInst>(T) || T->isEHPad();
+    }
+
+    // flush di un check differibile: prima barriera dopo OrigIns nel BB, altrimenti il terminatore (nullptr se non splittabile)
+    Instruction *anchorFor(Instruction *OrigIns) const {
+        BasicBlock *BB = OrigIns->getParent();
+        Instruction *Term = BB->getTerminator();
+        for (Instruction *I = OrigIns->getNextNode(); I && I != Term; I = I->getNextNode())
+            if (isBBBarrier(I))
+                return I;
+        return isUnsplittableTerminator(Term) ? nullptr : Term;
+    }
+
+    // OR aggregate-safe di piu' shadow in un solo check prima di At (convertToBool, non normalizeShadow che crasha sugli aggregati)
+    void emitCoalescedCheck(ArrayRef<Value *> Shadows, Instruction *At) {
+        if (Shadows.empty()) return;
+        IRBuilder<> IRB(At);
+        Value *Acc = convertToBool(Shadows[0], IRB, "_cqmscoal");
+        for (size_t i = 1; i < Shadows.size(); ++i)
+            Acc = IRB.CreateOr(Acc, convertToBool(Shadows[i], IRB, "_cqmscoal"), "_cqmsor");
+        materializeOneCheck(IRB, Acc);
+    }
+
+    void materializeChecks() {
         if (!ClBBCoalescedChecks) {
-            materializeChecksLegacy();   // original path
+            materializeChecksLegacy();   // path originale: baseline sound, invariato
             return;
         }
 
-        // TODO - risolvere la soundness di isImmediateEssentialSink() per arrivare in questo punto
-        // rende grossolano il feedback ad AFL
-        // Optimization: coalesce all checks in a BB into a single check at the terminator.
-        DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;
-
-        for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
-            if (isImmediateEssentialSink(It->OrigIns)) {
-                // Materialize subito al sink originale
-                IRBuilder<> IRB(It->OrigIns);
-                materializeOneCheck(IRB, It->Shadow);
-            } else {
-                // Accumula per BB
-                BasicBlock *BB = It->OrigIns->getParent();
-                BBShadows[BB].push_back(It->Shadow);
-            }
+        // Partiziona: essenziale se il bit lo dice o se OrigIns e' comunque un sink immediato (rete ridondante)
+        SmallVector<ShadowAndInsertPoint, 16> Essential;
+        struct Deferred { Value *Shadow; Instruction *OrigIns; };
+        SmallVector<Deferred, 16> Deferrable;
+        for (const auto &C : InstrumentationList) {
+            if (C.Essential || isImmediateEssentialSink(C.OrigIns))
+                Essential.push_back(C);
+            else
+                Deferrable.push_back({C.Shadow, C.OrigIns});
         }
 
-        // Per ogni BB, emette UN check al terminator
-        for (auto &Entry : BBShadows) {
-            BasicBlock *BB = Entry.first;
-            auto &Shadows = Entry.second;
-            if (Shadows.empty()) continue;
-
-            Instruction *Term = BB->getTerminator();
-            IRBuilder<> IRB(Term);
-
-            // OR di tutti shadow → i1 normalizzato
-            Value *Accumulated = normalizeShadow(IRB, Shadows[0]);
-            for (size_t i = 1; i < Shadows.size(); ++i) {
-                Value *S = normalizeShadow(IRB, Shadows[i]);
-                Accumulated = IRB.CreateOr(Accumulated, S);
-            }
-
-            materializeOneCheck(IRB, Accumulated);
+        // FASE 1 (read-only, prima di ogni mutazione IR): calcola gli anchor e raggruppa (MapVector = ordine deterministico)
+        MapVector<Instruction *, SmallVector<Value *, 8>> ByAnchor;
+        for (const auto &D : Deferrable) {
+            if (Instruction *A = anchorFor(D.OrigIns))
+                ByAnchor[A].push_back(D.Shadow);
+            else
+                Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true));
         }
+
+        // FASE 2a: essenziali come legacy (1 check OR-ed per OrigIns, al sito)
+        for (auto I = Essential.begin(); I != Essential.end();) {
+            Instruction *O = I->OrigIns;
+            auto J = std::find_if(I + 1, Essential.end(),
+                         [O](const ShadowAndInsertPoint &R){ return R.OrigIns != O; });
+            materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint>(I, J));
+            I = J;
+        }
+
+        // FASE 2b: un check coalescato per segmento straight-line (per anchor)
+        for (auto &KV : ByAnchor)
+            emitCoalescedCheck(KV.second, KV.first);
     }
 
     bool runOnFunction() {
@@ -1043,6 +1157,26 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         for (AllocaInst *AI : AllocaSet)
             instrumentAlloca(*AI);
         
+        // [PROTOTIPO ClSinkChecks] Rimappa il check-valore dal load al primo sink dominato. 
+        // La fusione avviene per OrigIns in materialize.
+        if (ClSinkChecks) {
+            PostDominatorTree PDT(F);
+
+            for (auto &C : InstrumentationList) {
+                if (C.Essential) continue;
+                if (auto *L = dyn_cast<LoadInst>(C.OrigIns))
+                    if (Instruction *S = findSinkFor(L, PDT)) C.OrigIns = S;
+            }
+
+            // Rende consecutive le entry con lo stesso OrigIns (richiesto dal grouping di
+            // materializeChecksLegacy: assert Done + find_if su run consecutivi).
+            std::stable_sort(InstrumentationList.begin(), InstrumentationList.end(),
+                [](const ShadowAndInsertPoint &A, const ShadowAndInsertPoint &B) {
+                    return A.OrigIns < B.OrigIns;
+                });
+        
+        }
+
         // Insert shadow value checks (deferred from visit phase).
         materializeChecks();
 
@@ -1402,7 +1536,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     ///
     /// This location will be later instrumented with a check that will print a
     /// UMR warning in runtime if the shadow value is not 0.
-    void pushShadowCheck(Value *Shadow, Instruction *OrigIns) {
+    void pushShadowCheck(Value *Shadow, Instruction *OrigIns, bool Essential = true) {
         assert(Shadow);
         if (!InsertChecks)
             return;
@@ -1414,14 +1548,14 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             "Can only insert checks for integer, vector, and aggregate shadow types");
 #endif
         
-        InstrumentationList.push_back(ShadowAndInsertPoint(Shadow, OrigIns));
+        InstrumentationList.push_back(ShadowAndInsertPoint(Shadow, OrigIns, Essential));
     }
 
     /// Remember the place where a shadow check should be inserted.
     ///
     /// This location will be later instrumented with a check that will print a
     /// UMR warning in runtime if the value is not fully defined.
-    void insertShadowCheck(Value *Val, Instruction *OrigIns) {
+    void insertShadowCheck(Value *Val, Instruction *OrigIns, bool Essential = true) {
         assert(Val);
         Value *Shadow;
         if (ClCheckConstantShadow) {
@@ -1430,7 +1564,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             Shadow = dyn_cast_or_null<Instruction>(getShadow(Val));
         }
         if (!Shadow) return;
-        pushShadowCheck(Shadow, OrigIns);
+        pushShadowCheck(Shadow, OrigIns, Essential);
     }
 
     AtomicOrdering addReleaseOrdering(AtomicOrdering a) {
@@ -1674,10 +1808,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             insertedShadowLoad = true;
 
             if (ClCheckLoads) {
+                // [PROTOTIPO ClSinkChecks] il deferral al sink e' fatto DOPO il visit (IR stabile),
+                // in runOnFunction, rimappando OrigIns. Qui si pusha sempre al load.
 #ifdef CQMSAN_FLIP_CONVENTION
-                pushShadowCheck(EffectivePoisoned, &I);
+                pushShadowCheck(EffectivePoisoned, &I, /*Essential=*/false);
 #else
-                pushShadowCheck(EffectiveShadow, &I);
+                pushShadowCheck(EffectiveShadow, &I, /*Essential=*/false);
 #endif
             }
 
@@ -1842,7 +1978,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         setShadow(&I, LoadedShadow);
         
         // same push logic as visitLoadInst
-        pushShadowCheck(LoadedShadow, &I);
+        pushShadowCheck(LoadedShadow, &I, /*Essential=*/false);
         
         if (ClCheckAccessAddress)
             insertShadowCheck(Addr, &I);
@@ -1922,7 +2058,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             insertShadowCheck(Addr, &I);
 
         Value *Shadow = IRB.CreateAlignedLoad(Ty, ShadowPtr, Alignment, "_ldmxcsr");
-        pushShadowCheck(Shadow, &I);
+        pushShadowCheck(Shadow, &I, /*Essential=*/false);
 
     }
     
@@ -1954,7 +2090,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 #else
             Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
 #endif
-            pushShadowCheck(ActiveShadow, &I);
+            pushShadowCheck(ActiveShadow, &I, /*Essential=*/false);
         }
     }
 
@@ -2019,7 +2155,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 #else
             Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
 #endif
-            pushShadowCheck(ActiveShadow, &I);
+            pushShadowCheck(ActiveShadow, &I, /*Essential=*/false);
         }
     }
 
@@ -2106,7 +2242,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 #else
             Value *ActiveShadow = IRB.CreateSelect(Mask, Shadow, getCleanShadow(ShadowTy), "_cqmsmaskedchk");
 #endif
-            pushShadowCheck(ActiveShadow, &I);
+            pushShadowCheck(ActiveShadow, &I, /*Essential=*/false);
         }
 
         return;
