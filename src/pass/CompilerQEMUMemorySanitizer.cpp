@@ -191,6 +191,21 @@ static cl::opt<bool> ClInstrumentStores(
     cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
     cl::Hidden, cl::init(true));
 
+// [OPPORTUNISTIC / QMSan-style stores] Instead of propagating the stored value's
+// shadow (shadow[addr] = getShadow(val), the MSan model), mark the destination
+// shadow CLEAN/initialized unconditionally (shadow[addr] = 0). This is QMSan's
+// fast-tier model: a store means "this location now holds a written value" -> init.
+//  + cheaper: the store operand's shadow is never materialized, so shadow-loads
+//    that only fed store-propagation become dead and are DCE'd.
+//  + still detects read-of-NEVER-WRITTEN memory (stack/malloc poison stays until stored).
+//  - loses detection of store-of-an-UNINITIALIZED-value then read (false negative),
+//    exactly the precision QMSan's fast tier trades away. Ablation flag, default OFF.
+static cl::opt<bool> ClUnpoisonStores(
+    "cqmsan-unpoison-stores",
+    cl::desc("Opportunistic (QMSan-style) stores: mark the destination shadow clean "
+             "unconditionally instead of propagating the stored value's shadow."),
+    cl::Hidden, cl::init(false));
+
 /// ------------------------------------------------------------------------------------ ///
 
 /// Originals
@@ -908,7 +923,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             Value *Val = SI->getValueOperand();
             Value *Addr = SI->getPointerOperand();
 
-            Value *Shadow = SI->isAtomic() ? getCleanShadow(Val) : getShadow(Val);
+            // [ClUnpoisonStores] opportunistic QMSan-style store: write clean shadow
+            // unconditionally (mark init) instead of propagating getShadow(Val).
+            Value *Shadow = (ClUnpoisonStores || SI->isAtomic()) ? getCleanShadow(Val) : getShadow(Val);
             
             Type *ShadowTy = Shadow->getType();
             const Align Alignment = SI->getAlign();
