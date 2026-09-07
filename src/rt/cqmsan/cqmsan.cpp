@@ -522,7 +522,7 @@ void cqmsan_update_map(__sanitizer::BufferedStackTrace* stack){
 // callstack context), which required the expensive full unwind per firing and
 // was a low-quality (order-insensitive, self-cancelling) signal anyway.
 // Selected at compile time by the pass flag ClPCOnly (picks the _pconly symbols).
-void cqmsan_update_map_pc (__sanitizer::uptr pc){
+void cqmsan_update_map_pc(__sanitizer::uptr pc){
 
     cqmsan_area_ptr[ pc % MAP_SIZE] |= CQMSAN_AFL_ERROR;
     //edges between instructions

@@ -116,7 +116,7 @@ static const size_t kNumberOfAccessSizes = 4;
 // ------------- FLAGS --------------- //
 static cl::opt<bool> ClSkipProvableCleanLoads("cqmsan-skip-provable-clean-loads",
     cl::desc("Skip loads that can be proven to be clean (no UMR)"),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClPCOnly(
     "cqmsan_pc-only",
@@ -137,7 +137,7 @@ static cl::opt<bool> ClFastWarning(
 static cl::opt<bool> ClColdWarning(
     "cqmsan-cold-warning",
     cl::desc("Mark warning handler as cold (keep out of I-cache hot path)."),
-    cl::Hidden, cl::init(true)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
+    cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
     // It may be hot if the program is small and the warning is triggered often.
 
 // [PARAMETRIZATION]
@@ -150,7 +150,7 @@ static cl::opt<bool> ClTrustReturn(
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
     cl::desc("Group shadow checks per basic block."),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
     // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
 
 
@@ -184,7 +184,7 @@ static cl::opt<bool> ClCheckLoads(
 static cl::opt<bool> ClSinkChecks(
     "cqmsan-sink-checks",
     cl::desc("Defer the loaded-value check to the first dominated sink (fused). Prototype."),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClInstrumentStores(
     "cqmsan-instrument-stores",
