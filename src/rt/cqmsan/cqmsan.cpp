@@ -458,20 +458,21 @@ __sanitizer::uptr last_cs_edge = 0;
 
 
 //#ifdef CQMSAN_AFL
-void cqmsan_update_map(__sanitizer::BufferedStackTrace* stack){
-    //Printf("CQMSAN: updating map for pc=%p, bp=%p\n", (void *)pc, (void *)bp);
-    //TODO: (pc - load_addr) assumes that we are using no_lib mode
-    //i.e. we only find candidates in the binary and not in the libraries
-    uptr pc = stack->trace_buffer[0];
-    //Printf("CQMSAN: updating map for pc=%p\n", (void *)pc);
+void cqmsan_update_map(__sanitizer::StackTrace* stack){
+    
+    
+    uptr pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[0]);
+    uptr __cqmsan_callstack_hash = pc;
 
-    // on-demand hashing using BufferedStackTrace for calculate cqmsan_callstack_hash
-    __cqmsan_callstack_hash = 0;
-    for (u32 i = 0; i < stack->size; ++i) {
-      uptr pc_i = stack->trace_buffer[i];
-      //Printf("  frame %02u: pc %p\n", i, (void *)pc_i);
-      __cqmsan_callstack_hash ^= pc_i;
+    for (uptr i = 1; i < stack->size; ++i) {
+      __cqmsan_callstack_hash ^= __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[i]);
     }
+
+    // fallback
+    if (stack->size){
+      __cqmsan_callstack_hash ^= StackTrace::GetPreviousInstructionPc(stack->trace[0]);
+    }
+
     // ------------------------------------------------------------------------------
     
     //edges between instructions
