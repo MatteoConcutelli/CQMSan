@@ -124,6 +124,17 @@ static cl::opt<bool> ClPCOnly(
              "Requires -cqmsan-fast-warning. "),
     cl::Hidden, cl::init(false));
 
+// [ClUpdateUMRMap] Su un UMR scattato, aggiorna la mappa AFL (e lo stack). false =
+// stub fast-warning che conta soltanto (niente cqmsan_update_map, niente unwind) —
+// ablazione per MISURARE il costo delle operazioni UMR (mappa/stack). Ha effetto solo
+// quando un check SCATTA (a firing=0 e' un no-op). Richiede -cqmsan-fast-warning.
+// NB: false = nessun feedback al two-tier/AFL -> solo misura di perf, non sound.
+static cl::opt<bool> ClUpdateUMRMap(
+    "cqmsan-update-umr-map",
+    cl::desc("Update the AFL feedback map/stack on a fired UMR. false = count-only stub "
+             "(ablation of the UMR-map/stack cost). Requires -cqmsan-fast-warning."),
+    cl::Hidden, cl::init(true));
+
 // [OPTIMIZATION]
 static cl::opt<bool> ClFastWarning(
     "cqmsan-fast-warning",
@@ -541,7 +552,9 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
     // [OPTIMIZATION]
     // TODO - future work: add a noreturn variant of the fast warning handler, to avoid the stack unwind and keep going after the warning.
     StringRef WarningFnName = Recover ? "__cqmsan_warning" : "__cqmsan_warning_noreturn";
-    if (ClFastWarning && ClPCOnly)
+    if (ClFastWarning && !ClUpdateUMRMap)
+        WarningFnName = "__cqmsan_warning_fast_noupdate";
+    else if (ClFastWarning && ClPCOnly)
         WarningFnName = "__cqmsan_warning_fast_pconly";
     else if (ClFastWarning)
         WarningFnName = "__cqmsan_warning_fast";

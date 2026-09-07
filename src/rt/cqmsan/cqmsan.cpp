@@ -666,6 +666,16 @@ void __cqmsan_warning_fast() {
   }
 }
 
+// [ClUpdateUMRMap=false] Stub di ablazione: UMR scattato ma NESSUN update mappa /
+// NESSUN unwind dello stack. Conta soltanto -> misura il costo di map+unwind come
+// delta vs __cqmsan_warning_fast(_pconly). NB: niente feedback AFL/two-tier (solo perf).
+extern "C" void __cqmsan_warning_fast_noupdate() {
+  ++cqmsan_report_count;
+  if (__cqmsan::flags()->halt_on_error) {
+    Die();
+  }
+}
+
 
 void __cqmsan_warning() {
   GET_CALLER_PC_BP;  
