@@ -266,7 +266,7 @@ static cl::opt<bool> ClCheckAccessAddress(
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
-    cl::Hidden, cl::init(true)); // avoid using TLS for noundef arguments
+    cl::Hidden, cl::init(false)); // avoid using TLS for noundef arguments
     // upstream default false
 
 // When there will be too much instrumentation, use callbacks instead of inline checks.
