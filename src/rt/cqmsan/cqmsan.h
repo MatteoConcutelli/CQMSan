@@ -338,6 +338,19 @@ const int STACK_TRACE_TAG_VPTR = STACK_TRACE_TAG_FIELDS + 1;
 #define GET_FATAL_STACK_TRACE \
   GET_FATAL_STACK_TRACE_PC_BP(__sanitizer::StackTrace::GetCurrentPc(), GET_CURRENT_FRAME())
 
+// Stack trace for the UMR feedback map (keep-going fast handlers). Unlike the fatal-report
+// macro above, this runs on EVERY fired check, so it uses the frame-pointer unwinder and a
+// bounded depth (runtime flags umr_fast_unwind / umr_unwind_depth) instead of the DWARF
+// unwinder over the whole stack. depth 0 = full (kStackTraceMax), 1 = site pc only.
+#define GET_UMR_MAP_STACK_TRACE_PC_BP(pc, bp)                                          \
+  UNINITIALIZED __sanitizer::BufferedStackTrace stack;                                 \
+  if (cqmsan_inited) {                                                                 \
+    int _umr_depth = __cqmsan::flags()->umr_unwind_depth;                              \
+    stack.Unwind(pc, bp, nullptr, __cqmsan::flags()->umr_fast_unwind,                  \
+                 (_umr_depth > 0) ? (__sanitizer::u32)_umr_depth                       \
+                                  : __sanitizer::kStackTraceMax);                      \
+  }
+
 // Unwind the stack for fatal error, as the parameter `stack` is
 // empty without origins.
 #define GET_FATAL_STACK_TRACE_IF_EMPTY(STACK)                                 \

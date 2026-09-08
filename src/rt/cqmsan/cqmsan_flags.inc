@@ -47,3 +47,22 @@ CQMSAN_FLAG(int, store_context_size, 20,
 // noreturn, _noupdate) are not filtered.
 CQMSAN_FLAG(bool, skip_known_sites, true,
           "Skip unwind+map update for UMR sites whose ERROR bit is already set in the AFL map.")
+
+// [umr_unwind_depth / umr_fast_unwind] Stack unwind used ONLY to build the callstack hash
+// of the AFL feedback map (fast keep-going handlers: __cqmsan_warning_fast and the
+// __cqmsan_maybe_warning_fast_N family). Historically this path reused the fatal-report
+// macro: DWARF (libunwind) unwinder, whole stack (kStackTraceMax = 255 frames), ~2.5 us per
+// firing on libxml2. The hash only needs the site plus a few callers, so:
+//  - umr_unwind_depth: max frames (trace[0] = site pc). 0 = full stack (old behaviour),
+//    1 = site pc only, N = site + N-1 callers. Measured (1 site, recursion depth 100,
+//    unwind on every firing): DWARF full 7.2 us/fire, DWARF depth 4 0.6 us, frame-pointer
+//    full 0.25 us, frame-pointer depth 4 <= 50 ns. Small depths also bound how much of the
+//    (input-dependent) call chain enters the CS/CS_EDGE hash.
+//  - umr_fast_unwind: frame-pointer unwinder (campaign targets are built with
+//    -fno-omit-frame-pointer) instead of the DWARF one. false = old behaviour
+//    (common_flags()->fast_unwind_on_fatal, default false = slow).
+// Diagnostic paths (__cqmsan_warning report, noreturn) keep the full fatal-report unwind.
+CQMSAN_FLAG(int, umr_unwind_depth, 4,
+          "Max frames unwound for the UMR-map callstack hash (0 = full stack, 1 = pc only).")
+CQMSAN_FLAG(bool, umr_fast_unwind, true,
+          "Use the frame-pointer unwinder for the UMR-map callstack hash (false = DWARF unwinder).")

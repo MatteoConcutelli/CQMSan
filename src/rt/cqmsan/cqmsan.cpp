@@ -607,7 +607,7 @@ CQMSAN_MAYBE_WARNING(u64, 8)
       ++cqmsan_report_count; \
       /* [skip_known_sites] known site: no unwind, no map write, no sentinel */ \
       if (!__cqmsan::cqmsan_site_known(__sanitizer::StackTrace::GetPreviousInstructionPc(pc))) { \
-        GET_FATAL_STACK_TRACE_PC_BP(pc, bp); \
+        GET_UMR_MAP_STACK_TRACE_PC_BP(pc, bp); \
         __cqmsan::cqmsan_update_map(&stack); \
       } \
       if (__cqmsan::flags()->halt_on_error) Die(); \
@@ -704,7 +704,7 @@ CQMSAN_WARNING_CC void __cqmsan_warning_fast() {
   // map): skip the ~2.5us unwind and the map/sentinel writes. Same index as
   // cqmsan_update_map (GetPreviousInstructionPc of the caller pc).
   if (!__cqmsan::cqmsan_site_known(__sanitizer::StackTrace::GetPreviousInstructionPc(pc))) {
-    GET_FATAL_STACK_TRACE_PC_BP(pc, bp);
+    GET_UMR_MAP_STACK_TRACE_PC_BP(pc, bp);   // bounded, frame-pointer unwind (umr_unwind_depth / umr_fast_unwind)
     __cqmsan::cqmsan_update_map(&stack);
   }
 
