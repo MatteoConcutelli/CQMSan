@@ -533,6 +533,19 @@ void cqmsan_update_map_pc(__sanitizer::uptr pc){
 
 }
 
+// [skip_known_sites] Probe of the AFL shared map BEFORE any per-firing work.
+// `site_pc` must be the SAME value the map update indexes the ERROR bit with:
+//   - cqmsan_update_map():    GetPreviousInstructionPc(trace[0]) == GetPreviousInstructionPc(caller pc)
+//   - cqmsan_update_map_pc(): the raw caller pc
+// so the caller passes the already-adjusted pc. One L1-resident load + branch; the
+// shared map persists across execs of the forkserver session, so a site is unwound/
+// recorded once per session (once per process in standalone mode, where the map is
+// the local `dummy` buffer). See cqmsan_flags.inc for the policy discussion.
+ALWAYS_INLINE bool cqmsan_site_known(uptr site_pc) {
+  return flags()->skip_known_sites &&
+         (cqmsan_area_ptr[site_pc % MAP_SIZE] & CQMSAN_AFL_ERROR);
+}
+
 }  // namespace __cqmsan
 
 void __sanitizer::BufferedStackTrace::UnwindImpl(
@@ -591,9 +604,12 @@ CQMSAN_MAYBE_WARNING(u64, 8)
     void __cqmsan_maybe_warning_fast_##size(type s, __sanitizer::u32 o) { \
       if (LIKELY(!CQMSAN_MAYBE_WARNING_TRIGGERED(s))) return; \
       GET_CALLER_PC_BP; \
-      GET_FATAL_STACK_TRACE_PC_BP(pc, bp); \
-      __cqmsan::cqmsan_update_map(&stack); \
       ++cqmsan_report_count; \
+      /* [skip_known_sites] known site: no unwind, no map write, no sentinel */ \
+      if (!__cqmsan::cqmsan_site_known(__sanitizer::StackTrace::GetPreviousInstructionPc(pc))) { \
+        GET_FATAL_STACK_TRACE_PC_BP(pc, bp); \
+        __cqmsan::cqmsan_update_map(&stack); \
+      } \
       if (__cqmsan::flags()->halt_on_error) Die(); \
     }
 
@@ -608,8 +624,10 @@ extern "C" {
   void __cqmsan_maybe_warning_fast_pconly_##size(type s, __sanitizer::u32 o) { \
     if (LIKELY(!CQMSAN_MAYBE_WARNING_TRIGGERED(s))) return; \
     GET_CALLER_PC_BP; \
-    __cqmsan::cqmsan_update_map_pc(pc); \
     ++cqmsan_report_count; \
+    /* [skip_known_sites] pc-only index == raw caller pc (see cqmsan_update_map_pc) */ \
+    if (!__cqmsan::cqmsan_site_known(pc)) \
+      __cqmsan::cqmsan_update_map_pc(pc); \
     if (__cqmsan::flags()->halt_on_error) Die(); \
   }
 
@@ -680,10 +698,15 @@ void __cqmsan_warning_noreturn() {
 // the cold edge of every check with preserve_allcc; the callee saves/restores all registers.
 CQMSAN_WARNING_CC void __cqmsan_warning_fast() {
   GET_CALLER_PC_BP;
-  GET_FATAL_STACK_TRACE_PC_BP(pc, bp);
-
-  __cqmsan::cqmsan_update_map(&stack);
   ++cqmsan_report_count;
+
+  // [skip_known_sites] Site already reported in this session (ERROR bit set in the AFL
+  // map): skip the ~2.5us unwind and the map/sentinel writes. Same index as
+  // cqmsan_update_map (GetPreviousInstructionPc of the caller pc).
+  if (!__cqmsan::cqmsan_site_known(__sanitizer::StackTrace::GetPreviousInstructionPc(pc))) {
+    GET_FATAL_STACK_TRACE_PC_BP(pc, bp);
+    __cqmsan::cqmsan_update_map(&stack);
+  }
 
   if (__cqmsan::flags()->halt_on_error) {
     Die();
@@ -692,8 +715,10 @@ CQMSAN_WARNING_CC void __cqmsan_warning_fast() {
 
 CQMSAN_WARNING_CC void __cqmsan_warning_fast_pconly() {
   GET_CALLER_PC_BP;
-  __cqmsan::cqmsan_update_map_pc(pc);
   ++cqmsan_report_count;
+  // [skip_known_sites] pc-only index == raw caller pc (see cqmsan_update_map_pc)
+  if (!__cqmsan::cqmsan_site_known(pc))
+    __cqmsan::cqmsan_update_map_pc(pc);
 
   if (__cqmsan::flags()->halt_on_error) {
     Die();
