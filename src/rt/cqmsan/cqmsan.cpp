@@ -460,17 +460,15 @@ __sanitizer::uptr last_cs_edge = 0;
 //#ifdef CQMSAN_AFL
 void cqmsan_update_map(__sanitizer::StackTrace* stack){
     
-    
+    if (stack->size == 0)
+      return;
+
     uptr pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[0]);
-    uptr __cqmsan_callstack_hash = pc;
-
-    for (uptr i = 1; i < stack->size; ++i) {
-      __cqmsan_callstack_hash ^= __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[i]);
-    }
-
-    // fallback
-    if (stack->size){
-      __cqmsan_callstack_hash ^= StackTrace::GetPreviousInstructionPc(stack->trace[0]);
+    
+    uptr __cqmsan_callstack_hash = 0;
+    for (uptr i = 0; i < stack->size; ++i) {
+      uptr frame_pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[i]);
+      __cqmsan_callstack_hash ^= __cqmsan_callstack_hash * 31 + frame_pc; // moltiplicativo: ordine preservato
     }
 
     // ------------------------------------------------------------------------------
@@ -486,7 +484,7 @@ void cqmsan_update_map(__sanitizer::StackTrace* stack){
     //if we are only looking for edges, we don't need to use bitfields
     if(!cqmsan_area_ptr[idx]){
         cqmsan_area_ptr[idx] = CQMSAN_AFL_CS_EDGE;
-        last_cs_edge = cqmsan_callstack;
+        last_cs_edge = __cqmsan_callstack_hash;
         cqmsan_area_ptr[MAP_SIZE - 1] = 0xff;
     }
     return;
@@ -509,7 +507,7 @@ void cqmsan_update_map(__sanitizer::StackTrace* stack){
 
     //edges between whole callstacks
     cqmsan_area_ptr[idx] |= CQMSAN_AFL_CS_EDGE;
-    //last_cs_edge = cqmsan_callstack^(pc-load_addr);
+    //last_cs_edge = __cqmsan_callstack_hash^(pc-load_addr);
 
     //lastly, set this to 0xff so that AFL knows we found something
     cqmsan_area_ptr[MAP_SIZE - 1] = 0xff;
