@@ -16,6 +16,24 @@
 
 #include "../sanitizer_common/sanitizer_internal_defs.h"
 
+// Calling convention of the RETURNING (keep-going) warning entry points.
+// The pass calls them from a cold block right after every load check; with the plain C
+// convention every value live in the instrumented function would have to be pinned in a
+// callee-saved register or spilled/reloaded around that call (audit 2026-09-08: spills x2,
+// reloads x2.4 vs a noreturn callee). preserve_all makes the callee save every register
+// (all GPRs except the R11 scratch, all XMM/YMM), so the instrumented hot path stays
+// unconstrained. MUST match the pass (-cqmsan-warning-preserve-all, default on): the pass
+// emits preserve_allcc call sites and references __cqmsan_warning_preserve_all_abi from every
+// module ctor, so a preserve_all pass cannot be linked against a C-CC runtime by mistake.
+// NB: the callee saves the vector registers of ITS OWN target features (XMM without -mavx*):
+// build the runtime with the same vector ISA flags as the instrumented targets.
+#if defined(__x86_64__) && defined(__clang__)
+#  define CQMSAN_WARNING_CC __attribute__((preserve_all))
+#  define CQMSAN_HAVE_PRESERVE_ALL 1
+#else
+#  define CQMSAN_WARNING_CC
+#endif
+
 extern "C" {
 // FIXME: document all interface functions.
 
@@ -28,14 +46,24 @@ void __cqmsan_init();
 
 // Print a warning and maybe return.
 // This function can die based on __sanitizer::common_flags()->exitcode.
-SANITIZER_INTERFACE_ATTRIBUTE
+SANITIZER_INTERFACE_ATTRIBUTE CQMSAN_WARNING_CC
 void __cqmsan_warning();
 
-SANITIZER_INTERFACE_ATTRIBUTE
+SANITIZER_INTERFACE_ATTRIBUTE CQMSAN_WARNING_CC
 void __cqmsan_warning_fast();
 
-SANITIZER_INTERFACE_ATTRIBUTE
+SANITIZER_INTERFACE_ATTRIBUTE CQMSAN_WARNING_CC
 void __cqmsan_warning_fast_pconly();
+
+// Ablation stub (ClUpdateUMRMap=false): counts only, no map update / unwind.
+SANITIZER_INTERFACE_ATTRIBUTE CQMSAN_WARNING_CC
+void __cqmsan_warning_fast_noupdate();
+
+#ifdef CQMSAN_HAVE_PRESERVE_ALL
+// ABI marker referenced by the pass' module ctor (see CQMSAN_WARNING_CC above). Empty.
+SANITIZER_INTERFACE_ATTRIBUTE
+void __cqmsan_warning_preserve_all_abi();
+#endif
 
 // Print a warning and die.
 // Instrumentation inserts calls to this function when building in "fast" mode

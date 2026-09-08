@@ -620,6 +620,19 @@ CQMSAN_MAYBE_WARNING_FAST_PCONLY(u16, 2)
 CQMSAN_MAYBE_WARNING_FAST_PCONLY(u32, 4)
 CQMSAN_MAYBE_WARNING_FAST_PCONLY(u64, 8)
 
+// [ClUpdateUMRMap=false] variante outlined: fire ma NESSUN update mappa / NESSUN unwind.
+#define CQMSAN_MAYBE_WARNING_FAST_NOUPDATE(type, size) \
+  void __cqmsan_maybe_warning_fast_noupdate_##size(type s, __sanitizer::u32 o) { \
+    if (LIKELY(!CQMSAN_MAYBE_WARNING_TRIGGERED(s))) return; \
+    ++cqmsan_report_count; \
+    if (__cqmsan::flags()->halt_on_error) Die(); \
+  }
+
+CQMSAN_MAYBE_WARNING_FAST_NOUPDATE(u8, 1)
+CQMSAN_MAYBE_WARNING_FAST_NOUPDATE(u16, 2)
+CQMSAN_MAYBE_WARNING_FAST_NOUPDATE(u32, 4)
+CQMSAN_MAYBE_WARNING_FAST_NOUPDATE(u64, 8)
+
 } // extern "C"
 
 // cutted directly the API for storing origin
@@ -644,18 +657,30 @@ CQMSAN_MAYBE_WARNING_FAST_PCONLY(u64, 8)
 #include "sanitizer_symbolizer.h"
 #include "cqmsan_origin.h"  // where is defined Origin::FromRawId, used in PrintWarningWithOrigin
 
-void __cqmsan_warning_fast_pconly() {
-  GET_CALLER_PC_BP;
-  __cqmsan::cqmsan_update_map_pc(pc);
-  ++cqmsan_report_count;
-
+CQMSAN_WARNING_CC void __cqmsan_warning() {
+  GET_CALLER_PC_BP;  
+  PrintWarningWithOrigin(pc, bp, 0);
   if (__cqmsan::flags()->halt_on_error) {
+    if (__cqmsan::flags()->print_stats)
+      ReportStats();
+    //Printf("Exiting\n");
     Die();
   }
 }
 
+void __cqmsan_warning_noreturn() {
+  GET_CALLER_PC_BP;
+  PrintWarningWithOrigin(pc, bp, 0);
+  if (__cqmsan::flags()->print_stats)
+    ReportStats();
+  //Printf("Exiting\n");
+  Die();
+}
+
 // [OPTIMIZATION] 22/05
-void __cqmsan_warning_fast() {
+// CQMSAN_WARNING_CC (preserve_all): see cqmsan_interface_internal.h — the pass calls this from
+// the cold edge of every check with preserve_allcc; the callee saves/restores all registers.
+CQMSAN_WARNING_CC void __cqmsan_warning_fast() {
   GET_CALLER_PC_BP;
   GET_FATAL_STACK_TRACE_PC_BP(pc, bp);
 
@@ -667,37 +692,32 @@ void __cqmsan_warning_fast() {
   }
 }
 
+CQMSAN_WARNING_CC void __cqmsan_warning_fast_pconly() {
+  GET_CALLER_PC_BP;
+  __cqmsan::cqmsan_update_map_pc(pc);
+  ++cqmsan_report_count;
+
+  if (__cqmsan::flags()->halt_on_error) {
+    Die();
+  }
+}
+
 // [ClUpdateUMRMap=false] Stub di ablazione: UMR scattato ma NESSUN update mappa /
 // NESSUN unwind dello stack. Conta soltanto -> misura il costo di map+unwind come
 // delta vs __cqmsan_warning_fast(_pconly). NB: niente feedback AFL/two-tier (solo perf).
-extern "C" void __cqmsan_warning_fast_noupdate() {
+extern "C" CQMSAN_WARNING_CC void __cqmsan_warning_fast_noupdate() {
   ++cqmsan_report_count;
   if (__cqmsan::flags()->halt_on_error) {
     Die();
   }
 }
 
-
-void __cqmsan_warning() {
-  GET_CALLER_PC_BP;  
-  PrintWarningWithOrigin(pc, bp, 0);
-  if (__cqmsan::flags()->halt_on_error) {
-    if (__cqmsan::flags()->print_stats)
-      ReportStats();
-    //Printf("Exiting\n");
-    Die();
-  }
-}
-
-
-void __cqmsan_warning_noreturn() {
-  GET_CALLER_PC_BP;
-  PrintWarningWithOrigin(pc, bp, 0);
-  if (__cqmsan::flags()->print_stats)
-    ReportStats();
-  //Printf("Exiting\n");
-  Die();
-}
+#ifdef CQMSAN_HAVE_PRESERVE_ALL
+// [ClWarningPreserveAll] ABI marker: its presence certifies that the warning entry points
+// above are compiled with preserve_all. The pass' module ctor calls it (once per TU, at
+// startup); it does nothing. Linking a preserve_all pass against a runtime without it fails.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __cqmsan_warning_preserve_all_abi() {}
+#endif
 
 // removed since no origin tracking
 //void __cqmsan_warning_with_origin(__sanitizer::u32 origin) {

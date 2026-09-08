@@ -280,7 +280,7 @@ void *cqmsan_aligned_alloc(__sanitizer::uptr alignment, __sanitizer::uptr size, 
 void *cqmsan_memalign(__sanitizer::uptr alignment, __sanitizer::uptr size, __sanitizer::BufferedStackTrace *stack);
 int cqmsan_posix_memalign(void **memptr, __sanitizer::uptr alignment, __sanitizer::uptr size, __sanitizer::BufferedStackTrace *stack);
 
-void cqmsan_update_map(__sanitizer::BufferedStackTrace* stack);
+void cqmsan_update_map(__sanitizer::StackTrace* stack);  // [2517c8f] StackTrace* (BufferedStackTrace derives from it)
 
 void InstallTrapHandler();
 void InstallAtExitHandler();

@@ -28,7 +28,7 @@
 using namespace __sanitizer;
 
 namespace __cqmsan {
-  void cqmsan_update_map(__sanitizer::BufferedStackTrace* stack);
+  void cqmsan_update_map(__sanitizer::StackTrace* stack);  // [2517c8f] aligned to the definition in cqmsan.cpp
 }
 
 namespace __cqmsan {

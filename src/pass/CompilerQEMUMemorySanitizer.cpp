@@ -151,6 +151,25 @@ static cl::opt<bool> ClColdWarning(
     cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
     // It may be hot if the program is small and the warning is triggered often.
 
+// [OPTIMIZATION] keep-going codegen (audit 2026-09-08).
+// In keep-going mode the warning callee RETURNS, so every check is a diamond with a real call on
+// the cold edge: every value live across the check is call-clobbered and the register allocator
+// has to pin it in a callee-saved register or spill/reload it around EVERY check. Measured on
+// libxml2 vs the same instrumentation with a noreturn callee: spills x2.06, reloads x2.44, shadow-
+// mask rematerialisations x3.7, .text +28% (MSan-halt does not pay this: noreturn + unreachable).
+// preserve_all makes the CALLEE save/restore every register (all GPRs except the R11 scratch, all
+// XMM/YMM), so the caller's hot path is left unconstrained while keep-going is preserved.
+// REQUIRES a runtime whose warning entry points are compiled with __attribute__((preserve_all))
+// (see CQMSAN_WARNING_CC in cqmsan_interface_internal.h); the module ctor references
+// __cqmsan_warning_preserve_all_abi so that linking against an old (C-CC) runtime fails loudly
+// instead of corrupting registers on the first fired check. No effect on the noreturn variant.
+static cl::opt<bool> ClWarningPreserveAll(
+    "cqmsan-warning-preserve-all",
+    cl::desc("Give the returning (keep-going) warning callee the preserve_all calling "
+             "convention so the cold check call does not clobber caller registers. "
+             "The runtime entry points must be built with the same convention."),
+    cl::Hidden, cl::init(true));
+
 // [PARAMETRIZATION]
 static cl::opt<bool> ClTrustReturn(
     "cqmsan-trust-return",
@@ -190,6 +209,18 @@ static cl::opt<bool> ClCheckLoads(
     cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
     cl::Hidden, cl::init(true));
 
+// [ClEmitChecks] MASTER switch di TUTTI i check UMR. false = nessun check emesso da
+// NESSUN sito (load-value, indirizzo/ClCheckAccessAddress, return, eager-arg, atomic):
+// gata l'unico imbuto InsertChecks -> push/insertShadowCheck diventano no-op ->
+// __cqmsan_warning_fast NON puo' mai partire. Per ablazioni PULITE del solo costo
+// shadow-load/store (senza contaminazione del path UMR/warning). Ortogonale a
+// ClInstrumentLoads/Stores (quelli tolgono anche le shadow-load/store).
+static cl::opt<bool> ClEmitChecks(
+    "cqmsan-emit-checks",
+    cl::desc("Master switch: emit ANY UMR check. false = zero checks anywhere "
+             "(load/address/return/eager/atomic) -> warning_fast never fires."),
+    cl::Hidden, cl::init(true));
+
 // [PROTOTIPO sink-based] deferisce il check del valore caricato al primo sink che il load domina,
 // e la fusione avviene per OrigIns (materialize). Riduce il n. di check-branch. init(false).
 static cl::opt<bool> ClSinkChecks(
@@ -224,6 +255,10 @@ static cl::opt<bool> ClUnpoisonStores(
 static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
     cl::desc("keep going after reporting a UMR"),
     cl::Hidden, cl::init(true));
+
+// [ClWarningPreserveAll] true when the selected warning callee returns to the instrumented code
+// (keep-going or fast handler); false only for the noreturn variant (!keep-going && !fast-warning).
+static bool warningCalleeReturns() { return ClKeepGoing || ClFastWarning; }
 
 // disable only for debug
 static cl::opt<bool> ClPoisonStack("cqmsan-poison-stack",
@@ -472,6 +507,16 @@ void insertModuleCtor(Module &M) {
         // This callback is invoked when the functions are created the first
         // time. Hook them into the global ctors list in that case:
         [&](Function *Ctor, FunctionCallee) {
+            // [ClWarningPreserveAll] ABI guard: the runtime that provides preserve_all warning
+            // entry points also defines this (empty) symbol. A pass emitting preserve_allcc
+            // call sites must never be linked against a plain C-CC runtime, so make the link
+            // fail (undefined reference) instead of silently corrupting registers on firing.
+            if (ClWarningPreserveAll && warningCalleeReturns()) {
+                IRBuilder<> IRB(Ctor->getEntryBlock().getTerminator());
+                FunctionCallee Abi = M.getOrInsertFunction(
+                    "__cqmsan_warning_preserve_all_abi", IRB.getVoidTy());
+                IRB.CreateCall(Abi);
+            }
             if (!ClWithComdat) {
                 appendToGlobalCtors(M, Ctor, 0);
                 return;
@@ -575,6 +620,14 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
 
     WarningFn = M.getOrInsertFunction(WarningFnName, Attrs, IRB.getVoidTy());
 
+    // [ClWarningPreserveAll] Returning warning callee: preserve_all calling convention, so the
+    // cold call after every check does not constrain register allocation in the hot path.
+    // (Call sites copy the callee CC in insertWarningFn.) Not applied to the noreturn variant.
+    if (ClWarningPreserveAll && warningCalleeReturns()) {
+        if (auto *WF = dyn_cast<Function>(WarningFn.getCallee()))
+            WF->setCallingConv(CallingConv::PreserveAll);
+    }
+
     // Create the global TLS variables.    
     RetvalTLS =
       getOrInsertGlobal(M, "__cqmsan_retval_tls",
@@ -597,7 +650,9 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
 
         std::string FunctionName = ClFastWarning ? "__cqmsan_maybe_warning_fast_" : "__cqmsan_maybe_warning_";
 
-        if (ClFastWarning && ClPCOnly) {
+        if (ClFastWarning && !ClUpdateUMRMap) {
+            FunctionName = "__cqmsan_maybe_warning_fast_noupdate_";
+        } else if (ClFastWarning && ClPCOnly) {
             FunctionName = "__cqmsan_maybe_warning_fast_pconly_";
         }
         FunctionName += itostr(AccessSize);
@@ -879,7 +934,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // Attribute::SanitizeMemory to functions (it only does so with -fsanitize=memory).
         F.addFnAttr(Attribute::SanitizeMemory);
         bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeMemory);
-        InsertChecks = SanitizeFunction;
+        InsertChecks = SanitizeFunction && ClEmitChecks; // [ClEmitChecks] master gate di tutti i check
         PoisonStack = SanitizeFunction && ClPoisonStack;
         PoisonUndef = SanitizeFunction && ClPoisonUndef;
         // [Disallignment with 19.x version]
@@ -958,7 +1013,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// CQMSan does not implement origin tracking (vedi docs/flags/ClTrackOrigins.md),
     /// so the warning call takes no arguments.
     void insertWarningFn(IRBuilder<> &IRB) {
-        IRB.CreateCall(CQMS.WarningFn)->setCannotMerge();
+        CallInst *WarnCall = IRB.CreateCall(CQMS.WarningFn);
+        WarnCall->setCannotMerge();
+        // The call-site calling convention must match the callee's
+        // (PreserveAll under ClWarningPreserveAll, C otherwise).
+        if (auto *WF = dyn_cast<Function>(CQMS.WarningFn.getCallee()))
+            WarnCall->setCallingConv(WF->getCallingConv());
     }
 
     void materializeOneCheck(IRBuilder<> &IRB, Value *ConvertedShadow) {
