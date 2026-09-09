@@ -262,7 +262,7 @@ int check_msan_trace(afl_state_t *afl, u8* trace){
 }
 
 //TODO: this should be moved in afl-fuzz.c and made a one-time thing.
-//      Also, in general, we should not rely on .cur_inpuut, instead
+//      Also, in general, we should not rely on .cur_input, instead
 //      we should make a generic cmdline with some fmt stuff and call it.
 void init_cmdline(afl_state_t *afl){
 

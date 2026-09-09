@@ -217,9 +217,9 @@ bool InitShadowWithReExec(bool init_origins) {
 
 static void CQMsanAtExit(void) {
   if (flags()->print_stats && (flags()->atexit || cqmsan_report_count > 0))
-    ReportStats();
+    // ReportStats();
   if (cqmsan_report_count > 0) {
-    ReportAtExitStatistics();
+    // ReportAtExitStatistics();
     if (__sanitizer::common_flags()->exitcode)
       internal__exit(__sanitizer::common_flags()->exitcode);
   }

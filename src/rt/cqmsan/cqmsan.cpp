@@ -457,7 +457,7 @@ __sanitizer::uptr last_cs_edge = 0;
 
 
 
-//#ifdef CQMSAN_AFL
+//#ifdef CQMSAN_AFL - todo
 void cqmsan_update_map(__sanitizer::StackTrace* stack){
     
     if (stack->size == 0)
