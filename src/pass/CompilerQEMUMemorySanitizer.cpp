@@ -196,7 +196,9 @@ static cl::opt<bool> ClBBCoalescedChecks(
 static cl::opt<bool> ClLoopCoalescedChecks(
     "cqmsan-loop-coalesced-checks",
     cl::desc("EXP#2: accumulate shadow per-loop (memory acc + mem2reg) and check at loop exits. "
-             "Slower than check-at-load; experiment only."),
+             "Measured SLOWER than check-at-load (+7.4% wall-time on libxml2 memory-bound); it also "
+             "loses per-PC AFL feedback granularity. EXPERIMENT ONLY, init(false). Verified to build "
+             "cleanly (opt -verify + full builds) on libxml2/c-ares/pcre2/re2/json/openssl (2026-09-09)."),
     cl::Hidden, cl::init(false));
     // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
 
@@ -1231,12 +1233,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
         DenseMap<Loop *, AllocaInst *> Acc;          // 1 accumulatore i8 per loop
         DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
+        // [FIX 2026-09-09] Defer essential-sink checks: materializeOneCheck SPLITS the CFG,
+        // which invalidates LoopInfo/Loop* used below. Collect now, materialize AFTER all
+        // LoopInfo use (getLoopFor + getExitBlocks). Fixes a nondeterministic codegen crash
+        // (dangling Loop* -> stale exit blocks) seen on libxml2 with the flag on.
+        SmallVector<std::pair<Value *, Instruction *>, 16> Essential;
 
         // FASE 1: accumula (nessun cambio di CFG: solo load/or/store + alloca/store-init)
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
             if (isImmediateEssentialSink(It->OrigIns)) {
-                IRBuilder<> IRB(It->OrigIns);
-                materializeOneCheck(IRB, It->Shadow);
+                Essential.push_back({It->Shadow, It->OrigIns});   // [FIX] defer (splits CFG)
                 continue;
             }
             Loop *L = LI.getLoopFor(It->OrigIns->getParent());
@@ -1290,7 +1296,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             CB->addParamAttr(1, Attribute::ZExt);
         }
 
-        // fallback: 1 check al terminatore di BB (come ClBBCoalescedChecks)
+        // [FIX 2026-09-09] BB-fallback FIRST, essential-sink checks LAST. Rationale: an essential
+        // check (e.g. an indirect call) SPLITS its block; if that runs before the BB-fallback, the
+        // fallback would OR shadows that the split moved into a new tail block and emit the check at
+        // the old block's terminator -> "instruction does not dominate all uses". Building the
+        // fallback OR while the block is still whole (all shadows present and dominated) is safe: a
+        // later split moves the OR and the later shadows together into the tail (the head still
+        // dominates). All LoopInfo use (getLoopFor + getExitBlocks) is already done above, so both
+        // loops may split freely now.
+        //
+        // fallback: 1 check al terminatore di BB (come ClBBCoalescedChecks) -- PRIMA degli essenziali
         for (auto &Entry : BBShadows) {
             auto &Shadows = Entry.second;
             if (Shadows.empty()) continue;
@@ -1299,6 +1314,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             for (size_t i = 1; i < Shadows.size(); ++i)
                 Accd = IRB.CreateOr(Accd, normalizeShadow(IRB, Shadows[i]));
             materializeOneCheck(IRB, Accd);
+        }
+
+        // essential-sink checks LAST (splittano il CFG; nessuno legge piu' gli shadow dopo di qui)
+        for (auto &E : Essential) {
+            IRBuilder<> IRB(E.second);
+            materializeOneCheck(IRB, E.first);
         }
     }
 
