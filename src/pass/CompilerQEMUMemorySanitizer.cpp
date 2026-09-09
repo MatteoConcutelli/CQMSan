@@ -35,6 +35,9 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/LoopInfo.h"          // [ClLoopCoalescedChecks] LoopInfo for per-loop shadow accumulation
+#include "llvm/IR/Dominators.h"               // [ClLoopCoalescedChecks] DominatorTree for LoopInfo
+#include "llvm/Transforms/Utils/Mem2Reg.h"    // [ClLoopCoalescedChecks] PromotePass: alloca accumulators -> SSA PHI
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -181,6 +184,20 @@ static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
     cl::desc("Group shadow checks per basic block."),
     cl::Hidden, cl::init(true));
+
+// [EXP#2 / ClLoopCoalescedChecks] Loop-carried coalescing: accumulate each loop load's shadow
+// (branchless, in a per-loop i8 memory accumulator: acc |= shadow!=0) and emit ONE check at each
+// loop-exit block, instead of one check per iteration. The memory accumulator + PromotePass(mem2reg)
+// in the post-pass pipeline becomes a loop-carried SSA PHI, handling MULTI-BLOCK loops without
+// hand-resolving conditional-shadow dominance. Essential sinks and non-loop shadows fall back to the
+// per-BB coalesced check. init(false): DEV default unchanged; measured slower than check-at-load even
+// on memory-bound (audit 2026-09-09) -> experiment flag, not a default. Requires the runtime's
+// __cqmsan_maybe_warning* (MaybeWarningFn) which DEV already provides in the _fast variant.
+static cl::opt<bool> ClLoopCoalescedChecks(
+    "cqmsan-loop-coalesced-checks",
+    cl::desc("EXP#2: accumulate shadow per-loop (memory acc + mem2reg) and check at loop exits. "
+             "Slower than check-at-load; experiment only."),
+    cl::Hidden, cl::init(false));
     // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
 
 
@@ -246,7 +263,7 @@ static cl::opt<bool> ClUnpoisonStores(
     "cqmsan-unpoison-stores",
     cl::desc("Opportunistic (QMSan-style) stores: mark the destination shadow clean "
              "unconditionally instead of propagating the stored value's shadow."),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
 
 /// ------------------------------------------------------------------------------------ ///
 
@@ -308,7 +325,7 @@ static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
 static cl::opt<bool> ClCheckAccessAddress(
     "cqmsan-check-access-address",
     cl::desc("report accesses through a pointer which has poisoned shadow"),
-    cl::Hidden, cl::init(true));
+    cl::Hidden, cl::init(false)); // maybe redountant with the opportunistic model
 
 static cl::opt<bool> ClEagerChecks("cqmsan-eager-checks",
     cl::desc("check arguments and return values at function call boundaries"),
@@ -1204,7 +1221,92 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         materializeOneCheck(IRB, Acc);
     }
 
+    // [EXP #2 multi-blocco] accumulatore-memoria per-loop (i8) + check ai loop-exit; mem2reg lo promuove a PHI.
+    // Robusto sui loop multi-blocco: l'OR in memoria evita i problemi di dominanza degli shadow condizionali.
+    void materializeChecksLoopCoalesced() {
+        DominatorTree DT(F);
+        LoopInfo LI(DT);
+        IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
+        Type *I8 = EntryB.getInt8Ty();
+
+        DenseMap<Loop *, AllocaInst *> Acc;          // 1 accumulatore i8 per loop
+        DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
+
+        // FASE 1: accumula (nessun cambio di CFG: solo load/or/store + alloca/store-init)
+        for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
+            if (isImmediateEssentialSink(It->OrigIns)) {
+                IRBuilder<> IRB(It->OrigIns);
+                materializeOneCheck(IRB, It->Shadow);
+                continue;
+            }
+            Loop *L = LI.getLoopFor(It->OrigIns->getParent());
+            Instruction *ShadowI = dyn_cast<Instruction>(It->Shadow);
+            // idoneo solo se: loop con preheader, shadow e' un'istruzione DENTRO il loop (cosi' l'accumulo
+            // inserito subito dopo lo shadow e' dominato, e il reset in preheader domina il body).
+            if (!L || !L->getLoopPreheader() || !ShadowI || !L->contains(ShadowI->getParent())) {
+                BBShadows[It->OrigIns->getParent()].push_back(It->Shadow);
+                continue;
+            }
+            AllocaInst *A = Acc.lookup(L);
+            if (!A) {
+                A = EntryB.CreateAlloca(I8, nullptr, "cq_loopacc");
+                EntryB.CreateStore(ConstantInt::get(I8, 0), A);  // init in ENTRY: domina TUTTO ->
+                                                                 // niente undef sui percorsi che bypassano
+                                                                 // il loop (era la causa dei falsi positivi)
+                Acc[L] = A;
+                IRBuilder<> PH(L->getLoopPreheader()->getTerminator());
+                PH.CreateStore(ConstantInt::get(I8, 0), A);   // reset a ogni ingresso nel loop (freschezza)
+            }
+            // acc |= (shadow != 0)  -- branchless, SUBITO DOPO lo shadow (dominanza garantita)
+            BasicBlock::iterator IP = isa<PHINode>(ShadowI)
+                ? ShadowI->getParent()->getFirstInsertionPt()
+                : std::next(ShadowI->getIterator());
+            IRBuilder<> IRB(ShadowI->getParent(), IP);
+            Value *B = normalizeShadow(IRB, It->Shadow);      // i1
+            Value *Z = IRB.CreateZExt(B, I8);
+            Value *Old = IRB.CreateLoad(I8, A, "cq_acc_ld");
+            IRB.CreateStore(IRB.CreateOr(Old, Z, "cq_acc_or"), A);
+        }
+
+        // raccogli TUTTI i blocchi di uscita PRIMA di mutare il CFG (LI valido qui)
+        SmallVector<std::pair<AllocaInst *, BasicBlock *>, 32> ExitChecks;
+        for (auto &KV : Acc) {
+            SmallVector<BasicBlock *, 4> Exits;
+            KV.first->getExitBlocks(Exits);
+            SmallPtrSet<BasicBlock *, 4> Seen;
+            for (BasicBlock *E : Exits)
+                if (Seen.insert(E).second && !E->isEHPad() &&
+                    E->getFirstInsertionPt() != E->end())
+                    ExitChecks.push_back({KV.second, E});
+        }
+
+        // FASE 2: check ai loop-exit come CHIAMATA out-of-line (NON splitta il blocco -> nessuna
+        // interazione col BB-fallback che inserisce nello stesso blocco).
+        for (auto &EC : ExitChecks) {
+            IRBuilder<> EB(&*EC.second->getFirstInsertionPt());
+            Value *F2 = EB.CreateLoad(I8, EC.first, "cq_acc_exit");
+            CallBase *CB = EB.CreateCall(CQMS.MaybeWarningFn[0], {F2, EB.getInt32(0)});
+            CB->addParamAttr(0, Attribute::ZExt);
+            CB->addParamAttr(1, Attribute::ZExt);
+        }
+
+        // fallback: 1 check al terminatore di BB (come ClBBCoalescedChecks)
+        for (auto &Entry : BBShadows) {
+            auto &Shadows = Entry.second;
+            if (Shadows.empty()) continue;
+            IRBuilder<> IRB(Entry.first->getTerminator());
+            Value *Accd = normalizeShadow(IRB, Shadows[0]);
+            for (size_t i = 1; i < Shadows.size(); ++i)
+                Accd = IRB.CreateOr(Accd, normalizeShadow(IRB, Shadows[i]));
+            materializeOneCheck(IRB, Accd);
+        }
+    }
+
     void materializeChecks() {
+        if (ClLoopCoalescedChecks) {   // [EXP#2] loop-carried accumulation + check at loop exits
+            materializeChecksLoopCoalesced();
+            return;
+        }
         if (!ClBBCoalescedChecks) {
             materializeChecksLegacy();   // path originale: baseline sound, invariato
             return;
@@ -3128,6 +3230,10 @@ llvmGetPassPluginInfo() {
                     if (Level != OptimizationLevel::O0) {
                         MPM.addPass(RequireAnalysisPass<GlobalsAA, Module>());
                         FunctionPassManager FPM;
+                        // [ClLoopCoalescedChecks] promote the per-loop memory accumulators to SSA
+                        // loop-carried PHIs before the rest of the cleanup runs.
+                        if (ClLoopCoalescedChecks)
+                            FPM.addPass(PromotePass());
                         FPM.addPass(EarlyCSEPass(true /* mem-ssa */));
                         FPM.addPass(InstCombinePass());
                         FPM.addPass(JumpThreadingPass());
