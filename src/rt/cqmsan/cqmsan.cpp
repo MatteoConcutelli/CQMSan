@@ -541,7 +541,8 @@ void cqmsan_update_map_pc(__sanitizer::uptr pc){
 // shared map persists across execs of the forkserver session, so a site is unwound/
 // recorded once per session (once per process in standalone mode, where the map is
 // the local `dummy` buffer). See cqmsan_flags.inc for the policy discussion.
-ALWAYS_INLINE bool cqmsan_site_known(uptr site_pc) {
+// External linkage (declared in cqmsan.h): also called from the interceptor UMR-check path.
+bool cqmsan_site_known(uptr site_pc) {
   return flags()->skip_known_sites &&
          (cqmsan_area_ptr[site_pc % MAP_SIZE] & CQMSAN_AFL_ERROR);
 }

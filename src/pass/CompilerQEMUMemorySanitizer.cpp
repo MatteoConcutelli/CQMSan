@@ -1112,12 +1112,13 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         //LLVM_DEBUG(dbgs() << "DONE:\n" << F);
     }
 
-    // rete ridondante (non piu' il classificatore primario): forza essenziali certi sink anche senza bit
+    // rete ridondante (non piu' il classificatore primario): forza essenziali certi sink anche senza bit essential
     bool isImmediateEssentialSink(Instruction *OrigIns) const {
         // Indirect call: ptr deve essere checked PRIMA della call execution
         if (auto *CB = dyn_cast<CallBase>(OrigIns))
             if (CB->isIndirectCall())
                 return true;
+
         // Memory intrinsics: OOB execution prima del check sarebbe catastrofica
         if (isa<MemIntrinsic>(OrigIns)) return true;
         // Atomic: race effects materializzati prima del check
@@ -1161,15 +1162,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // prima di SBB) + testa di SBB fino al sink. Over-approx conservativa = sound.
         for (const Instruction *I = Load->getNextNode(); I; I = I->getNextNode())
             if (isBBBarrier(I)) return true;
+        
         SmallPtrSet<const BasicBlock *, 16> seen;
         SmallVector<const BasicBlock *, 16> wl;
         for (const BasicBlock *S : successors(LBB)) if (S != SBB && seen.insert(S).second) wl.push_back(S);
+        
         while (!wl.empty()) {
             const BasicBlock *B = wl.pop_back_val();
             for (const Instruction &I : *B) if (isBBBarrier(&I)) return true;
             for (const BasicBlock *S : successors(B)) if (S != SBB && seen.insert(S).second) wl.push_back(S);
         }
+        
         for (const Instruction &I : *SBB) { if (&I == Sink) break; if (isBBBarrier(&I)) return true; }
+        
         return false;
     }
 
@@ -1209,6 +1214,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         SmallVector<ShadowAndInsertPoint, 16> Essential;
         struct Deferred { Value *Shadow; Instruction *OrigIns; };
         SmallVector<Deferred, 16> Deferrable;
+
         for (const auto &C : InstrumentationList) {
             if (C.Essential || isImmediateEssentialSink(C.OrigIns))
                 Essential.push_back(C);
@@ -1222,7 +1228,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             if (Instruction *A = anchorFor(D.OrigIns))
                 ByAnchor[A].push_back(D.Shadow);
             else
-                Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true));
+                Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true)); // not deferreable
         }
 
         // Rende consecutive le entry con lo stesso OrigIns: un check-valore ricaduto in Essential (anchor

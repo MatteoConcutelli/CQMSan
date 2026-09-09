@@ -124,9 +124,16 @@ struct DlsymAlloc : public DlSymAllocator<DlsymAlloc> {
     sptr __offset = __cqmsan_test_shadow(x, n);                    \
     if (__offset >= 0 && __cqmsan::flags()->report_umrs) {         \
       GET_CALLER_PC_BP;                                           \
-      GET_FATAL_STACK_TRACE_PC_BP(pc, bp);                        \
-      __cqmsan::cqmsan_update_map(&stack);                        \
       ++cqmsan_report_count;                                      \
+      /* Same fast path as __cqmsan_warning_fast: if this site already fired    */ \
+      /* this session skip the unwind + map update (skip_known_sites); otherwise */ \
+      /* use the bounded frame-pointer unwind (umr_unwind_depth / umr_fast_unwind) */ \
+      /* instead of the full DWARF fatal unwind over the whole stack.            */ \
+      if (!__cqmsan::cqmsan_site_known(                             \
+              __sanitizer::StackTrace::GetPreviousInstructionPc(pc))) { \
+        GET_UMR_MAP_STACK_TRACE_PC_BP(pc, bp);                    \
+        __cqmsan::cqmsan_update_map(&stack);                      \
+      }                                                          \
       if (__cqmsan::flags()->halt_on_error) {                       \
         Die();                                                    \
       }                                                           \

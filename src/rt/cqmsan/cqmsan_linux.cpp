@@ -216,10 +216,18 @@ bool InitShadowWithReExec(bool init_origins) {
 }
 
 static void CQMsanAtExit(void) {
+  // [perf] The at-exit reports run on EVERY exec that fired >= 1 UMR in keep-going mode;
+  // under AFL their output goes to /dev/null. ReportAtExitStatistics builds a Decorator
+  // (color=auto -> isatty ioctl) and writes 3 lines to stderr under the report lock.
+  // Gate both reports behind print_stats / raised verbosity so the hot fuzzing exit path
+  // pays nothing, while standalone/debug runs still print. MSan never reaches here (it
+  // dies at the first UMR). The FUNCTIONAL part -- exiting with the common exitcode when a
+  // UMR fired -- is preserved unconditionally (needed for standalone crash exit codes).
   if (flags()->print_stats && (flags()->atexit || cqmsan_report_count > 0))
-    // ReportStats();
+    ReportStats();
   if (cqmsan_report_count > 0) {
-    // ReportAtExitStatistics();
+    if (flags()->print_stats || __sanitizer::common_flags()->verbosity > 0)
+      ReportAtExitStatistics();
     if (__sanitizer::common_flags()->exitcode)
       internal__exit(__sanitizer::common_flags()->exitcode);
   }

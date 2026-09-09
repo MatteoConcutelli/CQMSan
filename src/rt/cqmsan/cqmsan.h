@@ -282,6 +282,12 @@ int cqmsan_posix_memalign(void **memptr, __sanitizer::uptr alignment, __sanitize
 
 void cqmsan_update_map(__sanitizer::StackTrace* stack);  // [2517c8f] StackTrace* (BufferedStackTrace derives from it)
 
+// [skip_known_sites] true if this warning site already fired this session (its ERROR bit is
+// set in the AFL map). Declared here so both the fast handlers (cqmsan.cpp) and the interceptor
+// UMR-check path (cqmsan_interceptors.cpp) can skip the unwind+map update. Cold path -> a plain
+// (non-inlined) call is fine.
+bool cqmsan_site_known(__sanitizer::uptr site_pc);
+
 void InstallTrapHandler();
 void InstallAtExitHandler();
 
