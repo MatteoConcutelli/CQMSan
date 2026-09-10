@@ -50,6 +50,8 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"            // [ClSkipAFLRuntimeAccesses] strip inttoptr/add/ptrtoint constexprs
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAArch64.h"
 #include "llvm/IR/IntrinsicsX86.h"
@@ -119,6 +121,32 @@ static const size_t kNumberOfAccessSizes = 4;
 // ------------- FLAGS --------------- //
 static cl::opt<bool> ClSkipProvableCleanLoads("cqmsan-skip-provable-clean-loads",
     cl::desc("Skip loads that can be proven to be clean (no UMR)"),
+    cl::Hidden, cl::init(true));
+
+// [OPPORTUNISTIC 2026-09-10] MSan-equivalent "dead shadow" skip.
+// Under propagate-to-sink (MSan) the shadow of a load whose value only ever flows into
+// !nosanitize instructions is never consumed, so DCE deletes the shadow load and no check
+// exists. Check-at-load keeps that shadow alive (the check IS the consumer). Make the
+// equivalence explicit: when every transitive use of the loaded value (followed through
+// pure value ops: gep/cast/arith/phi/select/icmp/min-max intrinsics) ends in a nosanitize
+// instruction or in nothing, emit neither shadow load nor check. Zero detection loss w.r.t.
+// MSan by construction. Measured on OpenSSL 1.0.1f built with afl-clang-fast (PCGUARD):
+// 12.5k shadow-loads+checks of @__afl_area_ptr avoided (03_risultati/ir_diff_openssl_2026-09-10).
+static cl::opt<bool> ClSkipNoSanitizeOnlyLoads("cqmsan-skip-nosanitize-only-loads",
+    cl::desc("Do not load/check shadow for loads whose value only feeds !nosanitize "
+             "instructions (MSan-equivalent dead shadow)"),
+    cl::Hidden, cl::init(true));
+
+// AFL++ PCGUARD (LLVM >= 16) registers at OptimizerEarlyEP, so the whole -O3 pipeline runs
+// AFTER coverage instrumentation: PRE/LICM/unrolling hoist and duplicate its loads/stores of
+// @__afl_area_ptr, @__sancov_gen_* and the map counters, and the new copies lose the
+// !nosanitize metadata (37% of the __afl_area_ptr loads on OpenSSL). Recognise accesses whose
+// underlying object is AFL runtime state and treat them as nosanitize, restoring the
+// instrumentation's intent. MSan reaches the same result by folding (identity propagation),
+// so this is parity, not a detection loss.
+static cl::opt<bool> ClSkipAFLRuntimeAccesses("cqmsan-skip-afl-runtime-accesses",
+    cl::desc("Treat loads/stores whose underlying object is AFL runtime state "
+             "(@__afl_*, @__sancov_gen_*, map counters) as nosanitize"),
     cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClPCOnly(
@@ -199,6 +227,13 @@ static cl::opt<bool> ClLoopCoalescedChecks(
              "Measured SLOWER than check-at-load (+7.4% wall-time on libxml2 memory-bound); it also "
              "loses per-PC AFL feedback granularity. EXPERIMENT ONLY, init(false). Verified to build "
              "cleanly (opt -verify + full builds) on libxml2/c-ares/pcre2/re2/json/openssl (2026-09-09)."),
+    cl::Hidden, cl::init(false));
+
+// [2026-09-10] Declared only so that this tree compiles (it was referenced but never declared).
+// The inline-exit emission of the loop-coalesced experiment is NOT ported to this tree:
+// enabling the flag aborts compilation instead of silently dropping the loop-exit checks.
+static cl::opt<bool> ClLoopCoalescedInlineExit("cqmsan-loop-coalesced-inline-exit",
+    cl::desc("EXPERIMENT ONLY / NOT IMPLEMENTED IN THIS TREE: keep false"),
     cl::Hidden, cl::init(false));
     // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
 
@@ -1231,7 +1266,13 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
         Type *I8 = EntryB.getInt8Ty();
 
-        DenseMap<Loop *, AllocaInst *> Acc;          // 1 accumulatore i8 per loop
+        // [FIX 2026-09-10] Accumulo dello shadow GREZZO per (loop, tipo-shadow), 1 OR nativo per load
+        // (come MSan: niente icmp/zext-di-bool per iterazione dentro il loop caldo; l'OR raw same-width
+        // e' vettorizzabile). Il vecchio schema faceva `or(acc, zext(icmp ne shadow,0))` per load -> un
+        // icmp + una zext + un or i8 per iterazione = piu' pesante di check-at-load (di qui il +7.4%).
+        // Ora la riduzione + l'UNICO icmp sono al loop-exit. mem2reg promuove gli accumulatori a PHI SSA.
+        DenseMap<std::pair<Loop *, Type *>, AllocaInst *> Acc;    // 1 accumulatore per (loop, tipo)
+        MapVector<Loop *, SmallVector<AllocaInst *, 4>> AccsByLoop;
         DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
         // [FIX 2026-09-09] Defer essential-sink checks: materializeOneCheck SPLITS the CFG,
         // which invalidates LoopInfo/Loop* used below. Collect now, materialize AFTER all
@@ -1239,7 +1280,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // (dangling Loop* -> stale exit blocks) seen on libxml2 with the flag on.
         SmallVector<std::pair<Value *, Instruction *>, 16> Essential;
 
-        // FASE 1: accumula (nessun cambio di CFG: solo load/or/store + alloca/store-init)
+        // FASE 1: accumula lo shadow GREZZO per (loop,tipo) -- nessun cambio di CFG
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
             if (isImmediateEssentialSink(It->OrigIns)) {
                 Essential.push_back({It->Shadow, It->OrigIns});   // [FIX] defer (splits CFG)
@@ -1247,51 +1288,62 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             }
             Loop *L = LI.getLoopFor(It->OrigIns->getParent());
             Instruction *ShadowI = dyn_cast<Instruction>(It->Shadow);
-            // idoneo solo se: loop con preheader, shadow e' un'istruzione DENTRO il loop (cosi' l'accumulo
-            // inserito subito dopo lo shadow e' dominato, e il reset in preheader domina il body).
-            if (!L || !L->getLoopPreheader() || !ShadowI || !L->contains(ShadowI->getParent())) {
+            Type *T = It->Shadow->getType();
+            // idoneo: loop+preheader, shadow-istruzione DENTRO il loop (l'accumulo inserito subito
+            // dopo lo shadow e' dominato, il reset in preheader domina il body), tipo OR-abile.
+            if (!L || !L->getLoopPreheader() || !ShadowI || !L->contains(ShadowI->getParent()) ||
+                !T->isIntOrIntVectorTy()) {
                 BBShadows[It->OrigIns->getParent()].push_back(It->Shadow);
                 continue;
             }
-            AllocaInst *A = Acc.lookup(L);
+            std::pair<Loop *, Type *> Key(L, T);
+            AllocaInst *A = Acc.lookup(Key);
             if (!A) {
-                A = EntryB.CreateAlloca(I8, nullptr, "cq_loopacc");
-                EntryB.CreateStore(ConstantInt::get(I8, 0), A);  // init in ENTRY: domina TUTTO ->
-                                                                 // niente undef sui percorsi che bypassano
-                                                                 // il loop (era la causa dei falsi positivi)
-                Acc[L] = A;
+                A = EntryB.CreateAlloca(T, nullptr, "cq_loopacc");
+                EntryB.CreateStore(getCleanShadow(T), A);   // init in ENTRY: domina TUTTO -> niente
+                                                            // undef sui percorsi che bypassano il loop
+                Acc[Key] = A;
+                AccsByLoop[L].push_back(A);
                 IRBuilder<> PH(L->getLoopPreheader()->getTerminator());
-                PH.CreateStore(ConstantInt::get(I8, 0), A);   // reset a ogni ingresso nel loop (freschezza)
+                PH.CreateStore(getCleanShadow(T), A);       // reset a ogni ingresso nel loop (freschezza)
             }
-            // acc |= (shadow != 0)  -- branchless, SUBITO DOPO lo shadow (dominanza garantita)
+            // acc |= shadow GREZZO -- 1 sola op (OR nativo same-width), SUBITO DOPO lo shadow.
             BasicBlock::iterator IP = isa<PHINode>(ShadowI)
                 ? ShadowI->getParent()->getFirstInsertionPt()
                 : std::next(ShadowI->getIterator());
             IRBuilder<> IRB(ShadowI->getParent(), IP);
-            Value *B = normalizeShadow(IRB, It->Shadow);      // i1
-            Value *Z = IRB.CreateZExt(B, I8);
-            Value *Old = IRB.CreateLoad(I8, A, "cq_acc_ld");
-            IRB.CreateStore(IRB.CreateOr(Old, Z, "cq_acc_or"), A);
+            Value *Old = IRB.CreateLoad(T, A, "cq_acc_ld");
+            IRB.CreateStore(IRB.CreateOr(Old, It->Shadow, "cq_acc_or"), A);
         }
 
-        // raccogli TUTTI i blocchi di uscita PRIMA di mutare il CFG (LI valido qui)
-        SmallVector<std::pair<AllocaInst *, BasicBlock *>, 32> ExitChecks;
-        for (auto &KV : Acc) {
+        // raccogli (loop, exit-block) PRIMA di mutare il CFG (LI valido qui)
+        SmallVector<std::pair<Loop *, BasicBlock *>, 32> ExitChecks;
+        for (auto &KV : AccsByLoop) {
             SmallVector<BasicBlock *, 4> Exits;
             KV.first->getExitBlocks(Exits);
             SmallPtrSet<BasicBlock *, 4> Seen;
             for (BasicBlock *E : Exits)
                 if (Seen.insert(E).second && !E->isEHPad() &&
                     E->getFirstInsertionPt() != E->end())
-                    ExitChecks.push_back({KV.second, E});
+                    ExitChecks.push_back({KV.first, E});
         }
 
-        // FASE 2: check ai loop-exit come CHIAMATA out-of-line (NON splitta il blocco -> nessuna
-        // interazione col BB-fallback che inserisce nello stesso blocco).
+        // FASE 2 (default): al loop-exit reduce UNA volta ogni accumulatore-tipo, combina, 1 chiamata
+        // out-of-line (NON splitta il blocco -> nessuna interazione col BB-fallback). UNICO icmp qui.
+        // Con ClLoopCoalescedInlineExit la FASE 2 e' rimandata a DOPO gli essenziali (variante inline).
+        if (ClLoopCoalescedInlineExit)
+            report_fatal_error("cqmsan-loop-coalesced-inline-exit: inline-exit variant is not "
+                               "present in this tree (loop-exit checks would be dropped)");
         for (auto &EC : ExitChecks) {
             IRBuilder<> EB(&*EC.second->getFirstInsertionPt());
-            Value *F2 = EB.CreateLoad(I8, EC.first, "cq_acc_exit");
-            CallBase *CB = EB.CreateCall(CQMS.MaybeWarningFn[0], {F2, EB.getInt32(0)});
+            Value *Comb = nullptr;
+            for (AllocaInst *A : AccsByLoop[EC.first]) {
+                Value *V = EB.CreateLoad(A->getAllocatedType(), A, "cq_acc_exit");
+                Value *B = normalizeShadow(EB, V);          // reduce (se vettore) + icmp -> i1, UNA volta
+                Comb = Comb ? EB.CreateOr(Comb, B) : B;
+            }
+            Value *C8 = EB.CreateZExt(Comb, I8);
+            CallBase *CB = EB.CreateCall(CQMS.MaybeWarningFn[0], {C8, EB.getInt32(0)});
             CB->addParamAttr(0, Attribute::ZExt);
             CB->addParamAttr(1, Attribute::ZExt);
         }
@@ -1750,8 +1802,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     Value *getShadow(Value *V) {
 
         if (Instruction *I = dyn_cast<Instruction>(V)) {
-            // Functions with no_sanitize attribute - clean
-            if (I->getMetadata(LLVMContext::MD_nosanitize))
+            // Functions with no_sanitize attribute - clean (also AFL runtime accesses that
+            // were skipped by visit(), see ClSkipAFLRuntimeAccesses)
+            if (I->getMetadata(LLVMContext::MD_nosanitize) || isAFLRuntimeAccess(*I))
                 return getCleanShadow(V);
             
             // For instructions the shadow is already stored in the map.
@@ -1911,6 +1964,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         if (I.getMetadata(LLVMContext::MD_nosanitize))
             return;
 
+        // [ClSkipAFLRuntimeAccesses] AFL coverage accesses whose !nosanitize got lost in the
+        // pipeline: skip them exactly as if the metadata were still there.
+        if (isAFLRuntimeAccess(I))
+            return;
+
         // Don't want to visit if we're in the prologue
         if (isInPrologue(I))
             return;
@@ -1923,6 +1981,120 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         Instructions.push_back(&I);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // [ClSkipAFLRuntimeAccesses] / [ClSkipNoSanitizeOnlyLoads] helpers
+    // ------------------------------------------------------------------------------------
+
+    /// Strip inttoptr / ptrtoint / add-constant wrappers (instructions or constant
+    /// expressions) that AFL PCGUARD uses to address its guard array:
+    ///   inttoptr (add (ptrtoint @__sancov_gen_ to i64), 8) to ptr
+    static const Value *stripIntPtrArithmetic(const Value *V) {
+        for (unsigned Depth = 0; Depth < 8; ++Depth) {
+            const auto *Op = dyn_cast<Operator>(V);
+            if (!Op) return V;
+            switch (Op->getOpcode()) {
+            case Instruction::IntToPtr:
+            case Instruction::PtrToInt:
+            case Instruction::BitCast:
+            case Instruction::AddrSpaceCast:
+                V = Op->getOperand(0);
+                continue;
+            case Instruction::Add:
+                if (isa<ConstantInt>(Op->getOperand(1))) { V = Op->getOperand(0); continue; }
+                if (isa<ConstantInt>(Op->getOperand(0))) { V = Op->getOperand(1); continue; }
+                return V;
+            default:
+                return V;
+            }
+        }
+        return V;
+    }
+
+    /// True if the memory addressed by Ptr is AFL runtime state: a global named
+    /// __afl_* / __sancov_gen_* (directly, through GEPs or through PCGUARD's
+    /// inttoptr/add/ptrtoint constant expressions), or the coverage map reached through
+    /// the pointer loaded from @__afl_area_ptr (map counters: gep (load @__afl_area_ptr), idx).
+    /// PHIs/selects of such pointers are accepted only if ALL incoming objects qualify.
+    static bool isAFLRuntimePointer(const Value *Ptr) {
+        SmallVector<const Value *, 4> Objs;
+        getUnderlyingObjects(Ptr, Objs, /*LI=*/nullptr, /*MaxLookup=*/6);
+        if (Objs.empty()) return false;
+        for (const Value *O : Objs) {
+            const Value *Base = getUnderlyingObject(stripIntPtrArithmetic(O));
+            if (const auto *GV = dyn_cast<GlobalVariable>(Base)) {
+                if (GV->getName().starts_with("__afl_") || GV->getName().starts_with("__sancov_gen_"))
+                    continue;
+                return false;
+            }
+            if (const auto *LI = dyn_cast<LoadInst>(Base)) {
+                // the map pointer itself: only @__afl_area_ptr (never the fuzz input buffer)
+                const Value *B2 = getUnderlyingObject(stripIntPtrArithmetic(LI->getPointerOperand()));
+                if (const auto *GV = dyn_cast<GlobalVariable>(B2))
+                    if (GV->getName() == "__afl_area_ptr") continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /// Load/store/atomicrmw whose address is AFL runtime state (see ClSkipAFLRuntimeAccesses).
+    static bool isAFLRuntimeAccess(const Instruction &I) {
+        if (!ClSkipAFLRuntimeAccesses) return false;
+        if (const auto *LI = dyn_cast<LoadInst>(&I))   return isAFLRuntimePointer(LI->getPointerOperand());
+        if (const auto *SI = dyn_cast<StoreInst>(&I))  return isAFLRuntimePointer(SI->getPointerOperand());
+        if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I)) return isAFLRuntimePointer(RMW->getPointerOperand());
+        return false;
+    }
+
+    /// nosanitize, either explicitly (metadata) or by AFL-runtime recognition.
+    static bool isNoSanitizeEquivalent(const Instruction &I) {
+        return I.getMetadata(LLVMContext::MD_nosanitize) || isAFLRuntimeAccess(I);
+    }
+
+    /// [ClSkipNoSanitizeOnlyLoads] True if every transitive use of V, followed only through
+    /// pure value-producing instructions, ends in a nosanitize(-equivalent) instruction or in
+    /// nothing. Any other consumer (store of the value, call, ret, br/switch, a memory op that
+    /// uses it as address, ...) could observe the shadow under MSan too -> false. Bounded
+    /// worklist; anything unusual answers false (conservative = keep the check).
+    static bool onlyFeedsNoSanitize(const Value *V) {
+        SmallVector<const Instruction *, 32> Work;
+        SmallPtrSet<const Instruction *, 32> Seen;
+        auto PushUsers = [&](const Value *X) -> bool {
+            for (const User *U : X->users()) {
+                const auto *UI = dyn_cast<Instruction>(U);
+                if (!UI) return false;                       // constant-expression user: give up
+                if (Seen.insert(UI).second) Work.push_back(UI);
+                if (Seen.size() > 256) return false;         // budget
+            }
+            return true;
+        };
+        if (!PushUsers(V)) return false;
+        while (!Work.empty()) {
+            const Instruction *UI = Work.pop_back_val();
+            if (isNoSanitizeEquivalent(*UI)) continue;       // MSan never visits it: dead leaf
+            bool Pure = isa<GetElementPtrInst>(UI) || isa<CastInst>(UI) || isa<PHINode>(UI) ||
+                        isa<SelectInst>(UI) || isa<BinaryOperator>(UI) || isa<ICmpInst>(UI) ||
+                        isa<FreezeInst>(UI) || isa<ExtractElementInst>(UI) ||
+                        isa<InsertElementInst>(UI) || isa<ShuffleVectorInst>(UI) ||
+                        isa<UnaryOperator>(UI);
+            if (!Pure) {
+                if (const auto *II = dyn_cast<IntrinsicInst>(UI)) {
+                    switch (II->getIntrinsicID()) {
+                    case Intrinsic::umax: case Intrinsic::umin:
+                    case Intrinsic::smax: case Intrinsic::smin: case Intrinsic::abs:
+                    case Intrinsic::ctpop: case Intrinsic::ctlz: case Intrinsic::cttz:
+                    case Intrinsic::bswap: case Intrinsic::fshl: case Intrinsic::fshr:
+                        Pure = true; break;
+                    default: break;
+                    }
+                }
+            }
+            if (!Pure) return false;                         // observable consumer
+            if (!PushUsers(UI)) return false;
+        }
+        return true;
     }
 
     bool hasDominatingConstantStoreInBB(AllocaInst *AI, LoadInst *LI) {
@@ -1992,6 +2164,17 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // This is the limit of the optimization of the load instrumentation.
         if (!ClInstrumentLoads) {
             setShadow(&I, getCleanShadow(&I));
+            return;
+        }
+
+        // [ClSkipNoSanitizeOnlyLoads] MSan-equivalent dead shadow: no sanitized instruction
+        // can ever consume the shadow of this value, so MSan's DCE would delete the shadow
+        // load and there would be no check. Emit neither. (Address check kept if enabled.)
+        if (ClSkipNoSanitizeOnlyLoads && onlyFeedsNoSanitize(&I)) {
+            LLVM_DEBUG(dbgs() << "Load feeds only nosanitize users, no shadow/check: " << I << "\n");
+            setShadow(&I, getCleanShadow(&I));
+            if (ClCheckAccessAddress)
+                insertShadowCheck(I.getPointerOperand(), &I);
             return;
         }
 
