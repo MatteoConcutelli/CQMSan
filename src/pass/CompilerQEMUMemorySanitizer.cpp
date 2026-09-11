@@ -149,6 +149,22 @@ static cl::opt<bool> ClSkipAFLRuntimeAccesses("cqmsan-skip-afl-runtime-accesses"
              "(@__afl_*, @__sancov_gen_*, map counters) as nosanitize"),
     cl::Hidden, cl::init(true));
 
+// [OPPORTUNISTIC 2026-09-10] Where the coalesced OR is BUILT, not how many checks there are.
+// emitCoalescedCheck used to create the whole `or` chain at the anchor, so every shadow value in
+// the group stayed LIVE from its own load down to the end of the straight-line segment. On large
+// unrolled blocks that is a register-pressure bomb: SEED_encrypt (2 blocks, 481 shadow loads, one
+// 239-deep OR chain at the terminator) spilled 339 reloads against 36 for MSan, which checks at
+// sinks and lets each shadow die immediately. Building the SAME chain incrementally - one
+// convertToBool+or placed right after each shadow definition - keeps exactly one accumulator live,
+// with an identical instruction count and an identical (already linear) dependency chain.
+// Measured excess before the fix: 4272 reloads over 648 functions, 36% of it in 12 unrolled
+// cipher primitives (03_risultati/ir_diff_openssl_2026-09-10).
+static cl::opt<bool> ClCoalescedIncrementalOr("cqmsan-coalesced-incremental-or",
+    cl::desc("Build the coalesced check's OR chain incrementally at each shadow definition "
+             "instead of entirely at the anchor (same instruction count, far less register "
+             "pressure on long straight-line blocks)"),
+    cl::Hidden, cl::init(true));
+
 static cl::opt<bool> ClPCOnly(
     "cqmsan_pc-only",
     cl::desc("Fast warning updated the AFL map by PC only (no unwind, no CS_EDGE)."
@@ -1249,8 +1265,68 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     // OR aggregate-safe di piu' shadow in un solo check prima di At (convertToBool, non normalizeShadow che crasha sugli aggregati)
+    /// Insertion point just after I, valid for a non-PHI instruction (skips the PHI block and any
+    /// EH pad at the top of the block).
+    static BasicBlock::iterator insertPointAfter(Instruction *I) {
+        BasicBlock *BB = I->getParent();
+        if (isa<PHINode>(I))
+            return BB->getFirstInsertionPt();
+        BasicBlock::iterator IP = std::next(I->getIterator());
+        while (IP != BB->end() && (isa<PHINode>(*IP) || IP->isEHPad()))
+            ++IP;
+        return IP;
+    }
+
     void emitCoalescedCheck(ArrayRef<Value *> Shadows, Instruction *At) {
         if (Shadows.empty()) return;
+
+        // [ClCoalescedIncrementalOr] Place each OR right after its shadow definition so that only
+        // the accumulator stays live across the segment (see the flag's comment). Only shadows
+        // defined by an instruction that sits in the anchor's own block STRICTLY BEFORE the anchor
+        // are chained early (their position then trivially dominates every later OR and the check);
+        // constants and shadows coming from other blocks are folded in at the anchor as before.
+        if (ClCoalescedIncrementalOr && Shadows.size() > 1) {
+            BasicBlock *BB = At->getParent();
+            DenseMap<const Instruction *, unsigned> Ord;
+            unsigned N = 0;
+            for (Instruction &I : *BB)
+                Ord[&I] = N++;
+            const unsigned AtOrd = Ord.lookup(At);
+
+            SmallVector<Instruction *, 32> Local;
+            SmallVector<Value *, 8> Remote;
+            SmallPtrSet<Value *, 32> SeenLocal;
+            for (Value *S : Shadows) {
+                auto *SI = dyn_cast<Instruction>(S);
+                auto It = SI ? Ord.find(SI) : Ord.end();
+                if (SI && It != Ord.end() && It->second < AtOrd) {
+                    if (SeenLocal.insert(SI).second)   // OR is idempotent: drop duplicates
+                        Local.push_back(SI);
+                } else {
+                    Remote.push_back(S);
+                }
+            }
+
+            if (Local.size() > 1) {
+                llvm::sort(Local, [&Ord](const Instruction *A, const Instruction *B) {
+                    return Ord.lookup(A) < Ord.lookup(B);
+                });
+                Value *Acc = nullptr;
+                for (Instruction *SI : Local) {
+                    BasicBlock::iterator IP = insertPointAfter(SI);
+                    assert(IP != BB->end() && "straight-line segment must have a terminator");
+                    IRBuilder<> B2(&*IP);
+                    Value *Cur = convertToBool(SI, B2, "_cqmscoal");
+                    Acc = Acc ? B2.CreateOr(Acc, Cur, "_cqmsor") : Cur;
+                }
+                IRBuilder<> IRB(At);
+                for (Value *S : Remote)
+                    Acc = IRB.CreateOr(Acc, convertToBool(S, IRB, "_cqmscoal"), "_cqmsor");
+                materializeOneCheck(IRB, Acc);
+                return;
+            }
+        }
+
         IRBuilder<> IRB(At);
         Value *Acc = convertToBool(Shadows[0], IRB, "_cqmscoal");
         for (size_t i = 1; i < Shadows.size(); ++i)
