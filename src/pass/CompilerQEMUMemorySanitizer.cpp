@@ -245,6 +245,28 @@ static cl::opt<bool> ClTrustReturn(
     cl::desc("Trust return values from functions"),
     cl::Hidden, cl::init(true));
 
+// [PROTOTIPO check-at-return 2026-09-24] Chiude l'unico buco rimasto del modello check-at-load:
+// il valore di RITORNO non inizializzato. Oggi il chiamante lo assume pulito (ClTrustReturn),
+// quindi `int h(void){int x; return x;}` + `if (h()==42)` non viene visto (verificato: CQMSan 0
+// warning, MSan rileva). Il check-at-load non puo' vederlo: il valore vive solo nei registri e
+// non passa mai dalla memoria.
+//
+// La soluzione naturale nel modello check-at-load e' simmetrica al load: "ritornare dato non
+// inizializzato e' un bug", controllato DOVE nasce, cioe' nel callee. Costa UN check per ogni
+// istruzione di return del programma, e zero traffico TLS.
+// Scartata l'alternativa via retval-TLS (callee scrive la shadow, chiamante la rilegge):
+// prototipata e verificata, il callee scrive correttamente ma il chiamante non segnala nulla
+// perche' nessuno controlla quella shadow -- servirebbe comunque un check dopo ogni call, cioe'
+// PIU' check (uno per call site invece di uno per return) per la stessa identica detection.
+//
+// Solo ritorni SCALARI: un aggregato ritornato per valore e' spesso inizializzato solo in parte
+// (`struct R r; r.a = 1; return r;` e' C legittimo se il chiamante legge solo `.a`) e darebbe
+// falsi positivi. MSan non li ha perche' controlla al sink, non al ritorno.
+static cl::opt<bool> ClCheckReturns("cqmsan-check-returns",
+    cl::desc("Check in the callee that the returned scalar value is initialized, instead of "
+             "trusting it clean at the call site. Prototype."),
+    cl::Hidden, cl::init(false));
+
 // [OPTIMIZATION]
 static cl::opt<bool> ClBBCoalescedChecks(
     "cqmsan-bb-coalesced-checks",
@@ -3128,7 +3150,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         if (!RetVal) return;                       // void return
         if (isAMustTailRetVal(RetVal)) return;     // mustTail
 
-        if (F.hasRetAttribute(Attribute::NoUndef))
+        // [ClCheckReturns] controlla ogni ritorno scalare, non solo quelli marcati noundef
+        // (nel caso che ci interessa -- `int h(void){int x; return x;}` -- clang NON mette
+        // noundef, quindi la condizione originale non scatta mai).
+        Type *RT = RetVal->getType();
+        bool ScalarRet = RT->isIntegerTy() || RT->isPointerTy() || RT->isFloatingPointTy();
+        if (ClCheckReturns ? ScalarRet : F.hasRetAttribute(Attribute::NoUndef))
             insertShadowCheck(RetVal, &I);
 
         // No retval-TLS store: the caller always assumes clean (ClTrustReturn=true)
