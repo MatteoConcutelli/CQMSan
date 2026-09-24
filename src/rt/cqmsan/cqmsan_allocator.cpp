@@ -31,6 +31,13 @@ using namespace __cqmsan;
 namespace {
 struct Metadata {
   __sanitizer::uptr requested_size;
+  // [poison-reuse 2026-09-12] Bytes from the start of this chunk that are known to carry
+  // POISONED shadow right now. Set at free() (which poisons `requested_size` bytes) and
+  // consumed by the next malloc() of the same chunk, which then only has to poison the
+  // part not already covered instead of memset-ing the whole allocation again.
+  // 0 = nothing known, poison everything. Chunk metadata comes from a fresh mmap, so it
+  // starts zeroed, which is the safe value.
+  __sanitizer::uptr poisoned_size;
 };
 
 // Handles actions on memory mapping and unmapping, such as unpoisoning
@@ -543,6 +550,7 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
       __cqmsan_clear_and_unpoison(allocated, size);
     else
       __cqmsan_unpoison(allocated, size);  // Mem is already unoed.
+    meta->poisoned_size = 0;  // [poison-reuse] calloc leaves it CLEAN, not poisoned
 #ifdef CQMSAN_FLIP_CONVENTION
     // [FLIP experiment] See the CQMSAN_GLIBC_ALLOC branch above for the
     // rationale: under 0=uninit, malloc-time poisoning is redundant once
@@ -554,7 +562,14 @@ static void *CQMsanAllocate(__sanitizer::BufferedStackTrace *stack, __sanitizer:
 #else
   } else if (flags()->poison_in_malloc) {
 #endif
-    __cqmsan_poison(allocated, size);
+    // [poison-reuse] A chunk that came back from free() is already poisoned for
+    // meta->poisoned_size bytes; only the tail beyond that needs the memset. Nothing
+    // writes to a chunk while it sits in the free list, so the shadow is still poisoned.
+    __sanitizer::uptr already =
+        flags()->poison_reuse && allocator.FromPrimary(allocated) ? meta->poisoned_size : 0;
+    if (already < size)
+      __cqmsan_poison(reinterpret_cast<char *>(allocated) + already, size - already);
+    meta->poisoned_size = size;
     if (__cqmsan_get_track_origins()) {
       stack->tag = __sanitizer::StackTrace::TAG_ALLOC;
       Origin o = Origin::CreateHeapOrigin(stack);
@@ -577,8 +592,10 @@ void __cqmsan::CQMsanDeallocate(__sanitizer::BufferedStackTrace *stack, void *p)
   // This memory will not be reused by anyone else, so we are free to keep it
   // poisoned. The secondary allocator will unmap and unpoison by
   // CQMsanMapUnmapCallback, no need to poison it here.
+  meta->poisoned_size = 0;  // [poison-reuse] invalidate; set below if we really poison
   if (flags()->poison_in_free && allocator.FromPrimary(p)) {
     __cqmsan_poison(p, size);
+    meta->poisoned_size = size;
     if (__cqmsan_get_track_origins()) {
       stack->tag = __sanitizer::StackTrace::TAG_DEALLOC;
       Origin o = Origin::CreateHeapOrigin(stack);

@@ -66,3 +66,15 @@ CQMSAN_FLAG(int, umr_unwind_depth, 4,
           "Max frames unwound for the UMR-map callstack hash (0 = full stack, 1 = pc only).")
 CQMSAN_FLAG(bool, umr_fast_unwind, true,
           "Use the frame-pointer unwinder for the UMR-map callstack hash (false = DWARF unwinder).")
+
+// [poison-reuse 2026-09-12] Do not memset the shadow again at malloc() for the part of a
+// chunk that free() already poisoned. Metadata records how many bytes of the chunk carry
+// poisoned shadow; the next malloc of the same chunk poisons only the tail beyond that.
+// Nothing writes to a chunk while it sits in the allocator free list (the primary keeps
+// its free lists outside the chunks), so the recorded extent stays valid. Measured on
+// libxml2: malloc-time poisoning is 9.5M of the 67M cycles of CQMSan overhead per parse.
+// Opportunistic: a write through a dangling pointer after free() would unpoison part of
+// the chunk and we would trust the stale record. Set to false for the conservative
+// behaviour (always re-poison the whole allocation).
+CQMSAN_FLAG(bool, poison_reuse, true,
+            "Skip the malloc-time shadow memset for the extent already poisoned at free.")

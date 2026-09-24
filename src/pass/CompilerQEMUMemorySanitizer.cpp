@@ -159,6 +159,28 @@ static cl::opt<bool> ClSkipAFLRuntimeAccesses("cqmsan-skip-afl-runtime-accesses"
 // with an identical instruction count and an identical (already linear) dependency chain.
 // Measured excess before the fix: 4272 reloads over 648 functions, 36% of it in 12 unrolled
 // cipher primitives (03_risultati/ir_diff_openssl_2026-09-10).
+// [OPPORTUNISTIC 2026-09-11] Base shadow condivisa.
+// Il mapping e' `shadow = addr ^ 0x500000000000`: uno XOR NON e' una funzione affine, quindi
+// l'ottimizzatore non puo' dedurre che gli shadow di `p` e `p+8` siano contigui, e per ogni
+// accesso ricalcola `gep app,k -> ptrtoint -> xor -> inttoptr` (un lea + uno xor in piu' ciascuno).
+// ASan non ha il problema perche' usa una mappatura affine (shr+add) e il compilatore gli fonde
+// gli indirizzi da solo. Qui lo facciamo esplicitamente: se l'indirizzo applicativo e'
+// `gep inbounds base, costante`, riusiamo il puntatore shadow gia' calcolato per `base` ed
+// emettiamo un gep sullo shadow.
+//
+// CORRETTEZZA: vale `shadow(p+k) == shadow(p)+k` finche' p e p+k stanno nella stessa regione
+// applicativa, perche' la maschera ha il bit piu' basso a 2^44 e le regioni app del layout x86-64
+// (0x510000000000-0x600000000000 e 0x740000000000-0x800000000000) non attraversano i confini di
+// 2^44/2^46 che lo XOR ribalta. Un `getelementptr inbounds` resta nello stesso oggetto e quindi
+// nella stessa regione: per questo accettiamo SOLO offset da gep inbounds (AllowNonInbounds=false)
+// e solo mapping XOR puro (AndMask e ShadowBase nulli).
+// Censito su IR reale: il 57% dei calcoli di indirizzo shadow di libxml2 e il 55% di openssl
+// condivide la base (03_risultati/store_shadow_base_condivisa_2026-09-11).
+static cl::opt<bool> ClSharedShadowBase("cqmsan-shared-shadow-base",
+    cl::desc("Reuse the shadow pointer of the base object and emit a gep for constant-offset "
+             "accesses, instead of recomputing ptrtoint/xor/inttoptr for each access"),
+    cl::Hidden, cl::init(true));
+
 static cl::opt<bool> ClCoalescedIncrementalOr("cqmsan-coalesced-incremental-or",
     cl::desc("Build the coalesced check's OR chain incrementally at each shadow definition "
              "instead of entirely at the anchor (same instruction count, far less register "
@@ -1753,6 +1775,55 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Addr can be a ptr or <N x ptr>. In both cases ShadowTy the shadow type of
     /// a single pointee.
     /// Returns shadow_ptr or <<N x shadow_ptr>
+    /// [ClSharedShadowBase] Puntatori shadow gia' calcolati, per oggetto base applicativo.
+    /// Il riuso e' ammesso solo se il valore in cache DOMINA il punto di inserimento corrente:
+    /// una costante domina sempre, un'istruzione solo se e' nello stesso blocco e viene prima.
+    /// (materializeChecks splitta i blocchi prima di materializeStores, quindi il controllo va
+    /// fatto sullo stato dell'IR al momento dell'emissione, non su quello del visit.)
+    DenseMap<Value *, Value *> ShadowBaseCache;
+
+    bool shadowBaseUsableHere(Value *Cached, IRBuilder<> &IRB) const {
+        auto *I = dyn_cast<Instruction>(Cached);
+        if (!I) return true;                       // costante / argomento: sempre disponibile
+        BasicBlock *IB = IRB.GetInsertBlock();
+        if (I->getParent() != IB) return false;
+        BasicBlock::iterator IP = IRB.GetInsertPoint();
+        return IP == IB->end() || I->comesBefore(&*IP);
+    }
+
+    /// Puntatore shadow per l'indirizzo Addr riusando la base, se possibile.
+    /// Ritorna nullptr se la condivisione non e' applicabile e va emesso il calcolo completo.
+    Value *tryGetShadowPtrFromBase(Value *Addr, IRBuilder<> &IRB) {
+        if (!ClSharedShadowBase) return nullptr;
+        // solo mapping XOR puro: con AndMask o ShadowBase l'identita' shadow(p+k)=shadow(p)+k
+        // non e' garantita dall'argomento sulle regioni.
+        if (CQMS.MapParams->AndMask || CQMS.MapParams->ShadowBase) return nullptr;
+        if (!Addr->getType()->isPointerTy()) return nullptr;   // niente vettori di puntatori
+
+        const DataLayout &DL = F.getDataLayout();
+        int64_t Offset = 0;
+        Value *Base = GetPointerBaseWithConstantOffset(Addr, Offset, DL,
+                                                       /*AllowNonInbounds=*/false);
+        if (!Base || Base == Addr) return nullptr;   // nessun offset costante da sfruttare
+
+        Value *ShadowBase = nullptr;
+        auto It = ShadowBaseCache.find(Base);
+        if (It != ShadowBaseCache.end() && shadowBaseUsableHere(It->second, IRB))
+            ShadowBase = It->second;
+
+        if (!ShadowBase) {
+            // calcola (una volta) lo shadow della base e mettilo in cache
+            Value *BaseOffset = getShadowPtrOffset(Base, IRB);
+            ShadowBase = IRB.CreateIntToPtr(BaseOffset, IRB.getPtrTy(0), "_cqmssbase");
+            ShadowBaseCache[Base] = ShadowBase;
+        }
+
+        if (Offset == 0) return ShadowBase;
+        // gep NON inbounds: la memoria shadow non e' un oggetto allocato dal punto di vista di LLVM
+        return IRB.CreateGEP(IRB.getInt8Ty(), ShadowBase,
+                             ConstantInt::get(IRB.getInt64Ty(), Offset), "_cqmssoff");
+    }
+
     Value* getShadowPtrUserspace(Value *Addr, IRBuilder<> &IRB, Type *ShadowTy, [[maybe_unused]] MaybeAlign Alignment) {
 
         VectorType *VectTy = dyn_cast<VectorType>(Addr->getType());
@@ -1761,6 +1832,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         } else {
             assert(VectTy->getElementType()->isPointerTy());
         }
+
+        // [ClSharedShadowBase] accessi a offset costante dalla stessa base: un gep invece di
+        // un nuovo ptrtoint/xor/inttoptr.
+        if (!VectTy)
+            if (Value *Shared = tryGetShadowPtrFromBase(Addr, IRB))
+                return Shared;
 
         Value *ShadowOffset = getShadowPtrOffset(Addr, IRB); 
         // returns the offset calculator instruction
