@@ -340,13 +340,11 @@ INTERCEPTOR(char *, strcpy, char *dest, const char *src) {
 
 INTERCEPTOR(char *, strncpy, char *dest, const char *src, SIZE_T n) {
   ENSURE_CQMSAN_INITED();
-  //GET_STORE_STACK_TRACE;
-  SIZE_T copy_size = internal_strnlen(src, n);
-  if (copy_size < n)
-    copy_size++;  // trailing \0
   char *res = REAL(strncpy)(dest, src, n);
-  //CopyShadowAndOrigin(dest, src, copy_size, &stack);
-  __cqmsan_unpoison(dest, n); // unpoison the whole destination buffer since strncpy write \0
+  // strncpy scrive ESATTAMENTE n byte: copia fino al NUL e poi riempie di NUL fino a n
+  // (POSIX). Quindi l'estensione scritta e' [dest, dest+n): unpoison di tutti gli n byte.
+  // Niente strnlen: il suo risultato non serve piu' e sarebbe una scansione O(n) buttata.
+  __cqmsan_unpoison(dest, n);
   return res;
 }
 
@@ -364,13 +362,12 @@ INTERCEPTOR(char *, stpcpy, char *dest, const char *src) {
 
 INTERCEPTOR(char *, stpncpy, char *dest, const char *src, SIZE_T n) {
   ENSURE_CQMSAN_INITED();
-  //GET_STORE_STACK_TRACE;
-  SIZE_T copy_size = internal_strnlen(src, n);
-  if (copy_size < n)
-    copy_size++;  // trailing \0
   char *res = REAL(stpncpy)(dest, src, n);
-  //CopyShadowAndOrigin(dest, src, copy_size, &stack);
-  __cqmsan_unpoison(dest, copy_size);
+  // [fix 2026-09-24] stpncpy, come strncpy, scrive ESATTAMENTE n byte: riempie di NUL
+  // fino a n (POSIX). Prima si faceva unpoison dei soli copy_size byte copiati, lasciando
+  // il padding AVVELENATO -> falso positivo garantito su ogni lettura del padding
+  // (riprodotto: stpncpy(d,"ab",64) poi lettura di d[60] = 1 warning; strncpy 0).
+  __cqmsan_unpoison(dest, n);
   return res;
 }
 #  define CQMSAN_MAYBE_INTERCEPT_STPCPY INTERCEPT_FUNCTION(stpcpy)
