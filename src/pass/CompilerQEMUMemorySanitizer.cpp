@@ -1363,8 +1363,13 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // La prima barriera at-or-after OrigIns e' OrigIns stesso -> l'anchor deve essere OrigIns
         // (coerente con findSinkFor/guaranteedPathHasBarrier, che il sink NON lo conta come barriera
         // proprio perche' il check gli va davanti). Dominanza: sicuro, ogni shadow e' definito prima
-        // del proprio OrigIns (lo shadow-load e' inserito PRIMA della load applicativa) ed e' lo
-        // stesso punto d'inserimento del path legacy, IRBuilder<>(OrigIns).
+        // del proprio OrigIns. Il fix [fix ordine shadow/load] emette ora lo shadow-load DOPO la
+        // load applicativa, ma qui non cambia nulla: questo ramo scatta solo se OrigIns e' una
+        // barriera, e una LoadInst non lo e' mai (isGuaranteedToTransferExecutionToSuccessor e' vero
+        // per una load), quindi OrigIns resta un'istruzione - tipicamente la call-sink di
+        // findSinkFor - che viene dopo gli shadow del gruppo. E' inoltre lo stesso punto
+        // d'inserimento del path legacy (materializeInstructionChecks, dove checkInsertPoint()
+        // ritorna OrigIns per tutti i gruppi che non sono quelli di una load).
         // Terminatori esclusi: per loro il return finale da' gia' Term (== OrigIns) e conserva il
         // filtro isUnsplittableTerminator (catchswitch/cleanupret/callbr/EH pad).
         if (isBBBarrier(OrigIns) && !OrigIns->isTerminator())
