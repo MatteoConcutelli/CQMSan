@@ -355,7 +355,10 @@ static cl::opt<bool> ClInstrumentStores(
 //    that only fed store-propagation become dead and are DCE'd.
 //  + still detects read-of-NEVER-WRITTEN memory (stack/malloc poison stays until stored).
 //  - loses detection of store-of-an-UNINITIALIZED-value then read (false negative),
-//    exactly the precision QMSan's fast tier trades away. Ablation flag, default OFF.
+//    exactly the precision QMSan's fast tier trades away.
+// [default] Ablation flag, default ON (cl::init(true) qui sotto): lo store
+// opportunistico E' la configurazione spedita. Per tornare alla propagazione
+// MSan-style dello shadow del valore: -mllvm -cqmsan-unpoison-stores=false.
 static cl::opt<bool> ClUnpoisonStores(
     "cqmsan-unpoison-stores",
     cl::desc("Opportunistic (QMSan-style) stores: mark the destination shadow clean "
@@ -410,8 +413,10 @@ static cl::opt<bool> ClHandleAsmConservative("cqmsan-handle-asm-conservative",
     cl::init(true));
     // when true it reduces the false positives, but it may cause false negatives 
     // (e.g. if the inline assembly does not initialize the entire array)
-    // So in opportunistic mode we leave it to false, to avoid false negatives and 
-    // let the fuzzer find and filter the False positives. 
+    // [default] Spedito a TRUE (cl::init(true) qui sopra): nel loop di fuzzing un
+    // flood di falsi positivi da inline asm costa piu' di qualche falso negativo
+    // (ogni warning e' lavoro extra del fast tier e, nel two-tier, una validazione).
+    // Si disattiva con -mllvm -cqmsan-handle-asm-conservative=false. 
 
 // This flag controls whether we check the shadow of the address
 // operand of load or store. Such bugs are very rare, since load from
@@ -1160,15 +1165,49 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
     }
 
+    // [fix ordine shadow/load] Punto in cui materializzare il check di un gruppo (tutte le entry
+    // del gruppo condividono OrigIns). Storicamente e' sempre stato OrigIns stesso, cioe' DAVANTI
+    // al sito. Da quando visitLoadInst emette lo shadow load DOPO la load applicativa (come MSan),
+    // per il gruppo di una LoadInst inserire davanti a OrigIns userebbe un valore non ancora
+    // definito: violazione di dominanza SSA e modulo rifiutato dal verifier. In quel caso il check
+    // va subito DOPO l'ultimo shadow del gruppo definito nello stesso blocco a partire da OrigIns.
+    // Gli shadow definiti in altri blocchi non aggiungono vincoli: o dominano gia' OrigIns, o il
+    // check era gia' invalido prima di questa modifica (es. remap ClSinkChecks cross-blocco).
+    Instruction *checkInsertPoint(ArrayRef<ShadowAndInsertPoint> Checks) const {
+        Instruction *OrigIns = Checks.front().OrigIns;
+        BasicBlock *BB = OrigIns->getParent();
+        Instruction *Last = nullptr;              // ultimo shadow definito in BB da OrigIns in poi
+        for (const auto &C : Checks) {
+            auto *SI = dyn_cast<Instruction>(C.Shadow);
+            if (!SI || SI->getParent() != BB || SI->comesBefore(OrigIns))
+                continue;                         // costante, altro blocco, o definito prima: ok
+            if (!Last || Last->comesBefore(SI))
+                Last = SI;
+        }
+        if (!Last)
+            return OrigIns;                       // nessun vincolo nuovo: posizione storica
+        // insertPointAfter salta PHI/EH pad (che non possono seguire uno shadow load) e dopo lo
+        // shadow load c'e' sempre almeno il terminatore: l'iteratore non e' mai end().
+        BasicBlock::iterator IP = insertPointAfter(Last);
+        assert(IP != BB->end() && "nessun punto di inserimento dopo lo shadow del gruppo");
+        if (IP == BB->end())
+            return BB->getTerminator();
+        return &*IP;
+    }
+
     void materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint> InstructionChecks) {
         const DataLayout &DL = F.getDataLayout();
 
         Instruction *OrigIns = InstructionChecks.front().OrigIns;
+        // [fix ordine shadow/load] di norma coincide con OrigIns; vedi checkInsertPoint().
+        Instruction *InsertPt = checkInsertPoint(InstructionChecks);
         Value *Shadow = nullptr;
         
         for (const auto &ShadowData : InstructionChecks) {
             assert(ShadowData.OrigIns == OrigIns);
-            IRBuilder<> IRB(OrigIns);
+            IRBuilder<> IRB(InsertPt);
+            // il report resta attribuito al sito originale anche quando il check scivola dopo
+            IRB.SetCurrentDebugLocation(OrigIns->getDebugLoc());
             Value *ConvertedShadow = ShadowData.Shadow;
             
             if (auto *ConstantShadow = dyn_cast<Constant>(ConvertedShadow)) {
@@ -1197,7 +1236,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
         
         if (Shadow) {
-            IRBuilder<> IRB(OrigIns);
+            IRBuilder<> IRB(InsertPt);
+            IRB.SetCurrentDebugLocation(OrigIns->getDebugLoc());
             materializeOneCheck(IRB, Shadow);
         }
 
@@ -1233,8 +1273,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             if (CB->isIndirectCall())
                 return true;
 
-        // Memory intrinsics: OOB execution prima del check sarebbe catastrofica
-        if (isa<MemIntrinsic>(OrigIns)) return true;
+        // [fix] Nessun arm per i MemIntrinsic: e' irraggiungibile per costruzione.
+        // visitMemMoveInst / visitMemCpyInst / visitMemSetInst abbassano l'intrinsic a
+        // una call __cqmsan_mem* e fanno I.eraseFromParent() senza mai spingere un check,
+        // quindi nessuna entry di InstrumentationList puo' avere un MemIntrinsic come
+        // OrigIns. Non era nemmeno una rete di sicurezza: i check si materializzano dopo
+        // la visita, percio' un OrigIns del genere sarebbe gia' memoria liberata e il
+        // dyn_cast leggerebbe un puntatore dangling prima di poter decidere qualsiasi
+        // cosa. L'invariante da mantenere e': mai spingere un check su un'istruzione
+        // che il visitor cancella.
         // Atomic: race effects materializzati prima del check
         if (isa<AtomicCmpXchgInst>(OrigIns) || isa<AtomicRMWInst>(OrigIns))
             return true;
@@ -1298,10 +1345,30 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                isa<CatchReturnInst>(T) || isa<CallBrInst>(T) || T->isEHPad();
     }
 
-    // flush di un check differibile: prima barriera dopo OrigIns nel BB, altrimenti il terminatore (nullptr se non splittabile)
+    // flush di un check differibile: prima barriera AT-OR-AFTER OrigIns nel BB, altrimenti il
+    // terminatore (nullptr se non splittabile). "Anchor" = punto di EMISSIONE: chi lo consuma fa
+    // IRBuilder<>(At) (emitCoalescedCheck), quindi il check finisce sempre PRIMA dell'anchor.
     Instruction *anchorFor(Instruction *OrigIns) const {
         BasicBlock *BB = OrigIns->getParent();
         Instruction *Term = BB->getTerminator();
+        // [FIX anchor-su-OrigIns-barriera] Il ciclo sotto parte da getNextNode() e quindi NON
+        // esamina OrigIns: se OrigIns e' esso stesso una barriera il check viene ancorato DOPO di
+        // lui. Con ClSinkChecks (default true) OrigIns e' spesso la CALL che consuma il valore
+        // caricato (findSinkFor), e una call che puo' unwind / noreturn / non-willreturn E' una
+        // barriera (isBBBarrier = !isGuaranteedToTransferExecutionToSuccessor);
+        // isImmediateEssentialSink intercetta solo call indirette, mem-intrinsics e atomiche, quindi
+        // una call DIRETTA resta fra i Deferrable. Nell'IR reale: `call @may_throw(v)` seguita da
+        // icmp/br + __cqmsan_warning_fast -> check DOPO il sink; con un sink noreturn il check
+        // finisce nel blocco che termina con `unreachable` = codice morto -> falso negativo certo.
+        // La prima barriera at-or-after OrigIns e' OrigIns stesso -> l'anchor deve essere OrigIns
+        // (coerente con findSinkFor/guaranteedPathHasBarrier, che il sink NON lo conta come barriera
+        // proprio perche' il check gli va davanti). Dominanza: sicuro, ogni shadow e' definito prima
+        // del proprio OrigIns (lo shadow-load e' inserito PRIMA della load applicativa) ed e' lo
+        // stesso punto d'inserimento del path legacy, IRBuilder<>(OrigIns).
+        // Terminatori esclusi: per loro il return finale da' gia' Term (== OrigIns) e conserva il
+        // filtro isUnsplittableTerminator (catchswitch/cleanupret/callbr/EH pad).
+        if (isBBBarrier(OrigIns) && !OrigIns->isTerminator())
+            return OrigIns;
         for (Instruction *I = OrigIns->getNextNode(); I && I != Term; I = I->getNextNode())
             if (isBBBarrier(I))
                 return I;
@@ -1386,24 +1453,36 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
         Type *I8 = EntryB.getInt8Ty();
 
-        // [FIX 2026-09-10] Accumulo dello shadow GREZZO per (loop, tipo-shadow), 1 OR nativo per load
+        // [FIX] Accumulo dello shadow GREZZO per (loop, tipo-shadow), 1 OR nativo per load
         // (come MSan: niente icmp/zext-di-bool per iterazione dentro il loop caldo; l'OR raw same-width
         // e' vettorizzabile). Il vecchio schema faceva `or(acc, zext(icmp ne shadow,0))` per load -> un
         // icmp + una zext + un or i8 per iterazione = piu' pesante di check-at-load (di qui il +7.4%).
         // Ora la riduzione + l'UNICO icmp sono al loop-exit. mem2reg promuove gli accumulatori a PHI SSA.
         DenseMap<std::pair<Loop *, Type *>, AllocaInst *> Acc;    // 1 accumulatore per (loop, tipo)
         MapVector<Loop *, SmallVector<AllocaInst *, 4>> AccsByLoop;
-        DenseMap<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
+        // [determinismo] MapVector e NON DenseMap: il fallback sotto emette un check per ogni BB
+        // di questa mappa e l'ordine di iterazione di una DenseMap dipende dall'hash del puntatore
+        // (= indirizzo dell'allocatore) -> IR diverso a ogni compilazione dello stesso TU. Stesso
+        // criterio gia' adottato per AccsByLoop qui sopra. Ordine = primo inserimento.
+        MapVector<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
         // [FIX 2026-09-09] Defer essential-sink checks: materializeOneCheck SPLITS the CFG,
         // which invalidates LoopInfo/Loop* used below. Collect now, materialize AFTER all
         // LoopInfo use (getLoopFor + getExitBlocks). Fixes a nondeterministic codegen crash
         // (dangling Loop* -> stale exit blocks) seen on libxml2 with the flag on.
-        SmallVector<std::pair<Value *, Instruction *>, 16> Essential;
+        SmallVector<ShadowAndInsertPoint, 16> Essential;
 
         // FASE 1: accumula lo shadow GREZZO per (loop,tipo) -- nessun cambio di CFG
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
-            if (isImmediateEssentialSink(It->OrigIns)) {
-                Essential.push_back({It->Shadow, It->OrigIns});   // [FIX] defer (splits CFG)
+            // [FIX] Onora il bit Essential, esattamente come il path BB-coalesced
+            // (`C.Essential || isImmediateEssentialSink(C.OrigIns)`). Il bit e' default-TRUE in
+            // insertShadowCheck/pushShadowCheck proprio perche' ogni sito di push, presente e
+            // futuro, sia sound per costruzione; isImmediateEssentialSink e' solo la rete
+            // RIDONDANTE (indirect call / memintrinsic / atomic). Da sola lasciava differire al
+            // loop-exit check marcati essenziali ma non "sink immediati": return check
+            // (visitReturnInst), eager-arg check (visitCallBase), check d'indirizzo con
+            // ClCheckAccessAddress, pointer-shadow di handleMaskedGather/Scatter.
+            if (It->Essential || isImmediateEssentialSink(It->OrigIns)) {
+                Essential.push_back(*It);   // [FIX] defer (splitta il CFG)
                 continue;
             }
             Loop *L = LI.getLoopFor(It->OrigIns->getParent());
@@ -1488,11 +1567,42 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             materializeOneCheck(IRB, Accd);
         }
 
-        // essential-sink checks LAST (splittano il CFG; nessuno legge piu' gli shadow dopo di qui)
-        for (auto &E : Essential) {
-            IRBuilder<> IRB(E.second);
-            materializeOneCheck(IRB, E.first);
+        // essential checks LAST (splittano il CFG; nessuno legge piu' gli shadow dopo di qui).
+        // [FIX] Materializzati con materializeInstructionChecks come nel path legacy e
+        // in FASE 2a del BB-coalesced, non con materializeOneCheck per entry: (a) filtra gli shadow
+        // COSTANTI -- ClCheckConstantShadow e' init(true), quindi insertShadowCheck spinge shadow
+        // costanti-zero (tipico degli eager-arg check noundef) che con materializeOneCheck diretta
+        // diventavano uno split su `i1 false` per argomento; (b) fonde in UN solo check gli entry
+        // che condividono OrigIns (piu' eager-arg sulla stessa call). Raggruppamento per run
+        // consecutivi e NON per sort: InstrumentationList tiene gia' adiacenti gli entry con lo
+        // stesso OrigIns (invariante asserita in materializeChecksLegacy) e il filtro di FASE 1
+        // preserva l'ordine relativo -- cosi' l'ordine di emissione resta quello della lista
+        // (deterministico), mentre qui non esiste il ricadere-in-Essential che nel BB-coalesced
+        // rende necessario lo stable_sort.
+        for (auto I = Essential.begin(); I != Essential.end();) {
+            Instruction *O = I->OrigIns;
+            auto J = std::find_if(I + 1, Essential.end(),
+                         [O](const ShadowAndInsertPoint &R){ return R.OrigIns != O; });
+            materializeInstructionChecks(ArrayRef<ShadowAndInsertPoint>(I, J));
+            I = J;
         }
+    }
+
+    // [determinismo] Rende CONSECUTIVE le entry con lo stesso OrigIns senza ordinare per VALORE del
+    // puntatore: gli indirizzi delle Instruction cambiano da una compilazione all'altra, quindi
+    // `stable_sort(A.OrigIns < B.OrigIns)` produceva IR diverso a ogni build dello stesso TU (stessi
+    // conteggi -- check/xor/istruzioni -- ma ordine di blocchi e icmp diverso). Il grouping a valle
+    // (find_if su run consecutivi) chiede solo l'ADIACENZA, non un ordine totale: MapVector conserva
+    // l'ordine di PRIMO inserimento -> raggruppamento deterministico, come gia' ByAnchor/AccsByLoop.
+    static void groupByOrigIns(SmallVectorImpl<ShadowAndInsertPoint> &V) {
+        if (V.size() < 2)
+            return;
+        MapVector<Instruction *, SmallVector<ShadowAndInsertPoint, 2>> ByOrigIns;
+        for (const ShadowAndInsertPoint &E : V)
+            ByOrigIns[E.OrigIns].push_back(E);
+        V.clear();
+        for (auto &KV : ByOrigIns)
+            V.append(KV.second.begin(), KV.second.end());
     }
 
     void materializeChecks() {
@@ -1527,10 +1637,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
 
         // Rende consecutive le entry con lo stesso OrigIns: un check-valore ricaduto in Essential (anchor
-        // assente) puo' condividere OrigIns col check-indirizzo del load -> senza sort verrebbe processato
-        // due volte (2 check invece di 1 fuso). Il grouping sotto (find_if su run consecutivi) lo esige.
-        std::stable_sort(Essential.begin(), Essential.end(),
-            [](const ShadowAndInsertPoint &A, const ShadowAndInsertPoint &B){ return A.OrigIns < B.OrigIns; });
+        // assente) puo' condividere OrigIns col check-indirizzo del load -> senza raggruppamento verrebbe
+        // processato due volte (2 check invece di 1 fuso). Il grouping sotto (find_if su run consecutivi)
+        // esige solo l'adiacenza -> ordine di primo inserimento, non di puntatore (vedi groupByOrigIns).
+        groupByOrigIns(Essential);
 
         // FASE 2a: essenziali come legacy (1 check OR-ed per OrigIns, al sito)
         for (auto I = Essential.begin(); I != Essential.end();) {
@@ -1595,11 +1705,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             }
 
             // Rende consecutive le entry con lo stesso OrigIns (richiesto dal grouping di
-            // materializeChecksLegacy: assert Done + find_if su run consecutivi).
-            std::stable_sort(InstrumentationList.begin(), InstrumentationList.end(),
-                [](const ShadowAndInsertPoint &A, const ShadowAndInsertPoint &B) {
-                    return A.OrigIns < B.OrigIns;
-                });
+            // materializeChecksLegacy: assert Done + find_if su run consecutivi). Ordine di primo
+            // inserimento, non di puntatore: il sort su OrigIns non era deterministico (vedi groupByOrigIns).
+            groupByOrigIns(InstrumentationList);
         
         }
 
@@ -2287,21 +2395,69 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         Value *LPtr = LI->getPointerOperand();
         uint64_t LSize = DL.getTypeStoreSize(LI->getType());
 
+        // [Fix] Non basta trovare lo store costante: bisogna
+        // continuare a scandire FINO alla load. Fermarsi al primo store che copre la
+        // locazione era un FALSE NEGATIVE reale - in `int y = 0; foo(&y); return y;`
+        // la load di y veniva marcata "provably clean" e il check spariva (a -O1 il bug
+        // e' mascherato solo perche' clang emette llvm.lifetime.start subito dopo
+        // l'alloca e quell'intrinsic fa abortire il loop prima dello store; con
+        // -Xclang -disable-lifetime-markers il conteggio dei check passa 1 -> 0).
+        // Dopo la copertura, quindi, qualunque cosa possa riscrivere o ri-poisonare lo
+        // slot fa abortire: call che scrivono memoria, memcpy/memmove/memset,
+        // lifetime.start/end (handleLifetimeStart ri-poisona l'alloca), atomici, e ogni
+        // store che non si possa provare estraneo ad AI.
+        auto isCoveringConstantStore = [&](StoreInst *SI) {
+            // Deve anche essere davvero instrumentato: uno store nosanitize(-equivalente)
+            // non scrive shadow pulito, quindi non "pulisce" un bel niente.
+            return !isNoSanitizeEquivalent(*SI) &&
+                   SI->getPointerOperand() == LPtr &&
+                   isa<Constant>(SI->getValueOperand()) &&
+                   DL.getTypeStoreSize(SI->getValueOperand()->getType()) >= LSize;
+        };
+
+        bool SawCoveringStore = false;
         for (Instruction *I = AI->getNextNode(); I && I != LI; I = I->getNextNode()) {
             // Intermediate call: conservative, abort
-            if (auto *CB = dyn_cast<CallBase>(I))
+            if (auto *CB = dyn_cast<CallBase>(I)) {
                 if (!isa<IntrinsicInst>(CB) || CB->mayWriteToMemory())
                     return false;
+                // Espliciti, per non dipendere solo dagli attributi di memoria della
+                // declaration: memcpy/memmove/memset riscrivono lo shadow dalla
+                // sorgente, lifetime.start/end ri-poisonano lo slot.
+                if (isa<MemIntrinsic>(CB))
+                    return false;
+                if (auto *II = dyn_cast<IntrinsicInst>(CB))
+                    if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+                        II->getIntrinsicID() == Intrinsic::lifetime_end)
+                        return false;
+                continue;
+            }
 
             if (auto *SI = dyn_cast<StoreInst>(I)) {
-                if (SI->getPointerOperand() == LPtr &&
-                    isa<Constant>(SI->getValueOperand()) &&
-                    DL.getTypeStoreSize(SI->getValueOperand()->getType()) >= LSize)
-                    return true; 
+                if (isCoveringConstantStore(SI)) {
+                    SawCoveringStore = true;   // NON si esce: la load e' piu' avanti
+                    continue;
+                }
+                // Prima della copertura: come prima, qualunque altro store aborta.
+                // Dopo la copertura si tollera SOLO uno store la cui base (dopo lo strip
+                // dei GEP inbounds costanti) e' una alloca DIVERSA da AI: due oggetti
+                // alloca distinti non possono aliasare. Qui non abbiamo AliasAnalysis,
+                // quindi tutto il resto (puntatori generici, GEP non inbounds, offset
+                // variabili sulla stessa alloca) aborta.
+                if (SawCoveringStore)
+                    if (auto *OtherAI = dyn_cast<AllocaInst>(
+                            SI->getPointerOperand()->stripInBoundsConstantOffsets()))
+                        if (OtherAI != AI)
+                            continue;
                 return false;
             }
+
+            // Qualunque altra istruzione che scrive memoria (atomicrmw, cmpxchg,
+            // va_arg, load volatile, ...) puo' toccare la locazione: conservativo.
+            if (I->mayWriteToMemory())
+                return false;
         }
-        return false;
+        return SawCoveringStore;
     }
 
     bool isLoadFromGlobalConstant(LoadInst *LI) {
@@ -2353,7 +2509,32 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             return;
         }
 
-        IRBuilder<> IRB(&I);
+        // [fix ordine shadow/load] Lo shadow load va emesso DOPO la load applicativa (e' quello
+        // che fa MSan con NextNodeIRBuilder). Con l'ordine invertito, per un puntatore nullo o
+        // selvaggio CQMSan toccava `addr ^ 0x500000000000` PRIMA dell'accesso del programma:
+        //  - addr == 0: la pagina shadow e' mappata, quindi si poteva riportare un UMR spurio
+        //    prima del SIGSEGV vero;
+        //  - puntatore garbage: il processo faultava a un indirizzo di SHADOW e il crash che AFL
+        //    registra puntava nella regione shadow invece che all'indirizzo applicativo.
+        // Il check-valore segue lo shadow: vedi checkInsertPoint() (senza quello si violerebbe la
+        // dominanza SSA, perche' il check e' materializzato sul sito OrigIns = la load stessa).
+        //
+        // Due carve-out in cui si tiene l'ordine inverso (shadow PRIMA della load):
+        //  1) terminatore non splittabile (catchswitch/cleanupret/catchret/callbr/EH pad): li'
+        //     anchorFor() ritorna nullptr, il check ricade su materializeInstructionChecks e
+        //     l'unico punto utile dopo lo shadow load sarebbe proprio quel terminatore, che
+        //     materializeOneCheck non puo' splittare;
+        //  2) CQMSAN_FLIP_CONVENTION: lo slow-path splitta il blocco proprio qui, lo shadow
+        //     effettivo diventa una PHI del blocco di coda mentre OrigIns (&I) resterebbe nella
+        //     testa, e il check al load non lo dominerebbe piu'.
+#ifdef CQMSAN_FLIP_CONVENTION
+        const bool ShadowAfterLoad = false;
+#else
+        const bool ShadowAfterLoad = !isUnsplittableTerminator(I.getParent()->getTerminator());
+#endif
+        // una load non e' mai un terminatore: getNextNode() non e' mai nullo.
+        IRBuilder<> IRB(ShadowAfterLoad ? I.getNextNode() : &I);
+        IRB.SetCurrentDebugLocation(I.getDebugLoc());   // come NextNodeIRBuilder
         Type *ShadowTy        = getShadowTy(&I);
         Value *Addr           = I.getPointerOperand();
         const Align Alignment = I.getAlign();
@@ -2553,9 +2734,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     bool handleVectorStoreIntrinsic(IntrinsicInst &I) {
         assert(I.arg_size() == 2);
 
+        // [ablazione] stesso gate dello store scalare (visitStoreInst): con
+        // -cqmsan-instrument-stores=0 questo sito non deve emettere NULLA (ne' shadow-store
+        // ne' check d'indirizzo), altrimenti i numeri dell'ablazione store sono sporchi.
+        // Torna true: l'intrinseco e' comunque "riconosciuto", non deve ricadere su visitInstruction().
+        if (!ClInstrumentStores) return true;
+
         IRBuilder<> IRB(&I);
         Value *Addr = I.getArgOperand(0);
-        Value *Shadow = getShadow(&I, 1);
+        // [ClUnpoisonStores] stessa semantica dello store scalare (materializeStores):
+        // shadow PULITA sulla destinazione invece di propagare getShadow(val) (modello MSan).
+        Value *V = I.getArgOperand(1);
+        Value *Shadow = ClUnpoisonStores ? getCleanShadow(V) : getShadow(V);
         Value *ShadowPtr;
 
         // We don't know the pointer alignment (could be unaligned SSE store!).
@@ -2707,6 +2897,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     void handleMaskedCompressStore(IntrinsicInst &I) {
+        // [ablazione] stesso gate dello store scalare (visitStoreInst).
+        if (!ClInstrumentStores) return;
+
         IRBuilder<> IRB(&I);
         Value *Values = I.getArgOperand(0);
         Value *Ptr = I.getArgOperand(1);
@@ -2717,7 +2910,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             insertShadowCheck(Mask, &I);
         }
 
-        Value *Shadow = getShadow(Values);
+        // [ClUnpoisonStores] shadow PULITA: la compress-store usa la stessa Mask,
+        // quindi marca init esattamente le lane che lo store applicativo scrive.
+        Value *Shadow = ClUnpoisonStores ? getCleanShadow(Values) : getShadow(Values);
         Type *ElementShadowTy =
             getShadowTy(cast<VectorType>(Values->getType())->getElementType());
         Value *ShadowPtr =
@@ -2772,6 +2967,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     void handleMaskedScatter(IntrinsicInst &I) {
+        // [ablazione] stesso gate dello store scalare (visitStoreInst).
+        if (!ClInstrumentStores) return;
+
         IRBuilder<> IRB(&I);
         Value *Values = I.getArgOperand(0);
         Value *Ptrs = I.getArgOperand(1);
@@ -2795,7 +2993,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             pushShadowCheck(MaskedPtrShadow, &I);
         }
 
-        Value *Shadow = getShadow(Values);
+        // [ClUnpoisonStores] shadow PULITA sulle lane scritte dalla scatter (stessa Mask).
+        Value *Shadow = ClUnpoisonStores ? getCleanShadow(Values) : getShadow(Values);
         Type *ElementShadowTy =
             getShadowTy(cast<VectorType>(Values->getType())->getElementType());
         Value *ShadowPtrs = getShadowPtr(
@@ -2805,13 +3004,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     void handleMaskedStore(IntrinsicInst &I) {
+        // [ablazione] stesso gate dello store scalare (visitStoreInst).
+        if (!ClInstrumentStores) return;
+
         IRBuilder<> IRB(&I);
         Value *V = I.getArgOperand(0);
         Value *Ptr = I.getArgOperand(1);
         const Align Alignment(
             cast<ConstantInt>(I.getArgOperand(2))->getZExtValue());
         Value *Mask = I.getArgOperand(3);
-        Value *Shadow = getShadow(V);
+        // [ClUnpoisonStores] shadow PULITA sulle lane attive (la masked-store usa la stessa
+        // Mask: le lane inattive non vengono scritte ne' in app ne' in shadow).
+        Value *Shadow = ClUnpoisonStores ? getCleanShadow(V) : getShadow(V);
         
         if (ClCheckAccessAddress) {
             insertShadowCheck(Ptr, &I);
