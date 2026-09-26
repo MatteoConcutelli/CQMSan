@@ -35,7 +35,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/Analysis/PostDominators.h"
-#include "llvm/Analysis/LoopInfo.h"          // [ClLoopCoalescedChecks] LoopInfo for per-loop shadow accumulation
+#include "llvm/Analysis/LoopInfo.h"           // [ClLoopCoalescedChecks] LoopInfo for per-loop shadow accumulation
 #include "llvm/IR/Dominators.h"               // [ClLoopCoalescedChecks] DominatorTree for LoopInfo
 #include "llvm/Transforms/Utils/Mem2Reg.h"    // [ClLoopCoalescedChecks] PromotePass: alloca accumulators -> SSA PHI
 #include "llvm/IR/CFG.h"
@@ -50,7 +50,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Operator.h"            // [ClSkipAFLRuntimeAccesses] strip inttoptr/add/ptrtoint constexprs
+#include "llvm/IR/Operator.h"                 // [ClSkipAFLRuntimeAccesses] strip inttoptr/add/ptrtoint constexprs
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAArch64.h"
@@ -99,17 +99,13 @@ using namespace llvm;
 
 #define DEBUG_TYPE "cqmsan"
 
-// TODO - not used
-DEBUG_COUNTER(DebugInsertCheck, "cqmsan-insert-check",
-    "Controls which checks to insert");
-
 DEBUG_COUNTER(DebugInstrumentInstruction, "cqmsan-instrument-instruction",
     "Controls which instruction to instrument");
-
 
 // Thread Local Storage buffers handling //
 
 static const Align kShadowTLSAlignment = Align(8);
+
 // These constants must be kept in sync with the ones in cqmsan.h.
 static const unsigned kParamTLSSize = 800;
 static const unsigned kRetvalTLSSize = 800;
@@ -119,73 +115,53 @@ static const size_t kNumberOfAccessSizes = 4;
 
 
 // ------------- FLAGS --------------- //
-static cl::opt<bool> ClSkipProvableCleanLoads("cqmsan-skip-provable-clean-loads",
-    cl::desc("Skip loads that can be proven to be clean (no UMR)"),
-    cl::Hidden, cl::init(true));
 
-// [OPPORTUNISTIC 2026-09-10] MSan-equivalent "dead shadow" skip.
-// Under propagate-to-sink (MSan) the shadow of a load whose value only ever flows into
-// !nosanitize instructions is never consumed, so DCE deletes the shadow load and no check
-// exists. Check-at-load keeps that shadow alive (the check IS the consumer). Make the
-// equivalence explicit: when every transitive use of the loaded value (followed through
-// pure value ops: gep/cast/arith/phi/select/icmp/min-max intrinsics) ends in a nosanitize
-// instruction or in nothing, emit neither shadow load nor check. Zero detection loss w.r.t.
-// MSan by construction. Measured on OpenSSL 1.0.1f built with afl-clang-fast (PCGUARD):
-// 12.5k shadow-loads+checks of @__afl_area_ptr avoided (03_risultati/ir_diff_openssl_2026-09-10).
 static cl::opt<bool> ClSkipNoSanitizeOnlyLoads("cqmsan-skip-nosanitize-only-loads",
     cl::desc("Do not load/check shadow for loads whose value only feeds !nosanitize "
              "instructions (MSan-equivalent dead shadow)"),
     cl::Hidden, cl::init(true));
 
-// AFL++ PCGUARD (LLVM >= 16) registers at OptimizerEarlyEP, so the whole -O3 pipeline runs
-// AFTER coverage instrumentation: PRE/LICM/unrolling hoist and duplicate its loads/stores of
-// @__afl_area_ptr, @__sancov_gen_* and the map counters, and the new copies lose the
-// !nosanitize metadata (37% of the __afl_area_ptr loads on OpenSSL). Recognise accesses whose
-// underlying object is AFL runtime state and treat them as nosanitize, restoring the
-// instrumentation's intent. MSan reaches the same result by folding (identity propagation),
-// so this is parity, not a detection loss.
 static cl::opt<bool> ClSkipAFLRuntimeAccesses("cqmsan-skip-afl-runtime-accesses",
     cl::desc("Treat loads/stores whose underlying object is AFL runtime state "
              "(@__afl_*, @__sancov_gen_*, map counters) as nosanitize"),
     cl::Hidden, cl::init(true));
 
-// [OPPORTUNISTIC 2026-09-10] Where the coalesced OR is BUILT, not how many checks there are.
-// emitCoalescedCheck used to create the whole `or` chain at the anchor, so every shadow value in
-// the group stayed LIVE from its own load down to the end of the straight-line segment. On large
-// unrolled blocks that is a register-pressure bomb: SEED_encrypt (2 blocks, 481 shadow loads, one
-// 239-deep OR chain at the terminator) spilled 339 reloads against 36 for MSan, which checks at
-// sinks and lets each shadow die immediately. Building the SAME chain incrementally - one
-// convertToBool+or placed right after each shadow definition - keeps exactly one accumulator live,
-// with an identical instruction count and an identical (already linear) dependency chain.
-// Measured excess before the fix: 4272 reloads over 648 functions, 36% of it in 12 unrolled
-// cipher primitives (03_risultati/ir_diff_openssl_2026-09-10).
-// [OPPORTUNISTIC 2026-09-11] Base shadow condivisa.
-// Il mapping e' `shadow = addr ^ 0x500000000000`: uno XOR NON e' una funzione affine, quindi
-// l'ottimizzatore non puo' dedurre che gli shadow di `p` e `p+8` siano contigui, e per ogni
-// accesso ricalcola `gep app,k -> ptrtoint -> xor -> inttoptr` (un lea + uno xor in piu' ciascuno).
-// ASan non ha il problema perche' usa una mappatura affine (shr+add) e il compilatore gli fonde
-// gli indirizzi da solo. Qui lo facciamo esplicitamente: se l'indirizzo applicativo e'
-// `gep inbounds base, costante`, riusiamo il puntatore shadow gia' calcolato per `base` ed
-// emettiamo un gep sullo shadow.
-//
-// CORRETTEZZA: vale `shadow(p+k) == shadow(p)+k` finche' p e p+k stanno nella stessa regione
-// applicativa, perche' la maschera ha il bit piu' basso a 2^44 e le regioni app del layout x86-64
-// (0x510000000000-0x600000000000 e 0x740000000000-0x800000000000) non attraversano i confini di
-// 2^44/2^46 che lo XOR ribalta. Un `getelementptr inbounds` resta nello stesso oggetto e quindi
-// nella stessa regione: per questo accettiamo SOLO offset da gep inbounds (AllowNonInbounds=false)
-// e solo mapping XOR puro (AndMask e ShadowBase nulli).
-// Censito su IR reale: il 57% dei calcoli di indirizzo shadow di libxml2 e il 55% di openssl
-// condivide la base (03_risultati/store_shadow_base_condivisa_2026-09-11).
 static cl::opt<bool> ClSharedShadowBase("cqmsan-shared-shadow-base",
     cl::desc("Reuse the shadow pointer of the base object and emit a gep for constant-offset "
              "accesses, instead of recomputing ptrtoint/xor/inttoptr for each access"),
     cl::Hidden, cl::init(true));
 
+static cl::opt<bool> ClBBCoalescedChecks( "cqmsan-bb-coalesced-checks",
+    cl::desc("Group shadow checks per basic block."),
+    cl::Hidden, cl::init(true));
+
+// Depends from ClBBCoalescedChecks
 static cl::opt<bool> ClCoalescedIncrementalOr("cqmsan-coalesced-incremental-or",
     cl::desc("Build the coalesced check's OR chain incrementally at each shadow definition "
-             "instead of entirely at the anchor (same instruction count, far less register "
-             "pressure on long straight-line blocks)"),
+            "instead of entirely at the anchor (same instruction count, far less register "
+            "pressure on long straight-line blocks)"),
     cl::Hidden, cl::init(true));
+
+// This flag wins on ClBBCoalescedChecks 
+static cl::opt<bool> ClLoopCoalescedChecks("cqmsan-loop-coalesced-checks",
+    cl::desc("Accumulate shadow per-loop (memory acc + mem2reg) and check at loop exits. "
+             "Prototype: may lose detection on loop-carried uninitialized values."),
+    cl::Hidden, cl::init(false));
+
+// Declared only so that this tree compiles (it was referenced but never declared).
+// The inline-exit emission of the loop-coalesced experiment is NOT ported to this tree:
+// enabling the flag aborts compilation instead of silently dropping the loop-exit checks.
+static cl::opt<bool> ClLoopCoalescedInlineExit("cqmsan-loop-coalesced-inline-exit",
+    cl::desc("EXPERIMENT ONLY / NOT IMPLEMENTED IN THIS TREE: keep false"),
+    cl::Hidden, cl::init(false));
+    // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
+
+static cl::opt<bool> ClSinkChecks("cqmsan-sink-checks",
+    cl::desc("Defer the loaded-value check to the first dominated sink (fused). Prototype."),
+    cl::Hidden, cl::init(true));
+
+/// ------------------------------------------------------------------------------------ ///
+// REPORTING 
 
 static cl::opt<bool> ClPCOnly(
     "cqmsan_pc-only",
@@ -193,18 +169,6 @@ static cl::opt<bool> ClPCOnly(
              "Requires -cqmsan-fast-warning. "),
     cl::Hidden, cl::init(false));
 
-// [ClUpdateUMRMap] Su un UMR scattato, aggiorna la mappa AFL (e lo stack). false =
-// stub fast-warning che conta soltanto (niente cqmsan_update_map, niente unwind) —
-// ablazione per MISURARE il costo delle operazioni UMR (mappa/stack). Ha effetto solo
-// quando un check SCATTA (a firing=0 e' un no-op). Richiede -cqmsan-fast-warning.
-// NB: false = nessun feedback al two-tier/AFL -> solo misura di perf, non sound.
-static cl::opt<bool> ClUpdateUMRMap(
-    "cqmsan-update-umr-map",
-    cl::desc("Update the AFL feedback map/stack on a fired UMR. false = count-only stub "
-             "(ablation of the UMR-map/stack cost). Requires -cqmsan-fast-warning."),
-    cl::Hidden, cl::init(true));
-
-// [OPTIMIZATION]
 static cl::opt<bool> ClFastWarning(
     "cqmsan-fast-warning",
     cl::desc("Use bitmap-only warning handler (__cqmsan_warning_fast) instead "
@@ -213,25 +177,12 @@ static cl::opt<bool> ClFastWarning(
              "fuzzing campaigns; not recommended for developer debugging."),
     cl::Hidden, cl::init(true));
 
-// [PARAMETIZATION]
 static cl::opt<bool> ClColdWarning(
     "cqmsan-cold-warning",
     cl::desc("Mark warning handler as cold (keep out of I-cache hot path)."),
     cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
     // It may be hot if the program is small and the warning is triggered often.
 
-// [OPTIMIZATION] keep-going codegen (audit 2026-09-08).
-// In keep-going mode the warning callee RETURNS, so every check is a diamond with a real call on
-// the cold edge: every value live across the check is call-clobbered and the register allocator
-// has to pin it in a callee-saved register or spill/reload it around EVERY check. Measured on
-// libxml2 vs the same instrumentation with a noreturn callee: spills x2.06, reloads x2.44, shadow-
-// mask rematerialisations x3.7, .text +28% (MSan-halt does not pay this: noreturn + unreachable).
-// preserve_all makes the CALLEE save/restore every register (all GPRs except the R11 scratch, all
-// XMM/YMM), so the caller's hot path is left unconstrained while keep-going is preserved.
-// REQUIRES a runtime whose warning entry points are compiled with __attribute__((preserve_all))
-// (see CQMSAN_WARNING_CC in cqmsan_interface_internal.h); the module ctor references
-// __cqmsan_warning_preserve_all_abi so that linking against an old (C-CC) runtime fails loudly
-// instead of corrupting registers on the first fired check. No effect on the noreturn variant.
 static cl::opt<bool> ClWarningPreserveAll(
     "cqmsan-warning-preserve-all",
     cl::desc("Give the returning (keep-going) warning callee the preserve_all calling "
@@ -239,134 +190,48 @@ static cl::opt<bool> ClWarningPreserveAll(
              "The runtime entry points must be built with the same convention."),
     cl::Hidden, cl::init(true));
 
-// [PARAMETRIZATION]
+// TODO maybe conflict with ClCheckReturns
 static cl::opt<bool> ClTrustReturn(
     "cqmsan-trust-return",
     cl::desc("Trust return values from functions"),
     cl::Hidden, cl::init(true));
 
-// [PROTOTIPO check-at-return 2026-09-24] Chiude l'unico buco rimasto del modello check-at-load:
-// il valore di RITORNO non inizializzato. Oggi il chiamante lo assume pulito (ClTrustReturn),
-// quindi `int h(void){int x; return x;}` + `if (h()==42)` non viene visto (verificato: CQMSan 0
-// warning, MSan rileva). Il check-at-load non puo' vederlo: il valore vive solo nei registri e
-// non passa mai dalla memoria.
-//
-// La soluzione naturale nel modello check-at-load e' simmetrica al load: "ritornare dato non
-// inizializzato e' un bug", controllato DOVE nasce, cioe' nel callee. Costa UN check per ogni
-// istruzione di return del programma, e zero traffico TLS.
-// Scartata l'alternativa via retval-TLS (callee scrive la shadow, chiamante la rilegge):
-// prototipata e verificata, il callee scrive correttamente ma il chiamante non segnala nulla
-// perche' nessuno controlla quella shadow -- servirebbe comunque un check dopo ogni call, cioe'
-// PIU' check (uno per call site invece di uno per return) per la stessa identica detection.
-//
-// Solo ritorni SCALARI: un aggregato ritornato per valore e' spesso inizializzato solo in parte
-// (`struct R r; r.a = 1; return r;` e' C legittimo se il chiamante legge solo `.a`) e darebbe
-// falsi positivi. MSan non li ha perche' controlla al sink, non al ritorno.
 static cl::opt<bool> ClCheckReturns("cqmsan-check-returns",
     cl::desc("Check in the callee that the returned scalar value is initialized, instead of "
              "trusting it clean at the call site. Prototype."),
     cl::Hidden, cl::init(false));
 
-// [OPTIMIZATION]
-static cl::opt<bool> ClBBCoalescedChecks(
-    "cqmsan-bb-coalesced-checks",
-    cl::desc("Group shadow checks per basic block."),
-    cl::Hidden, cl::init(true));
-
-// [EXP#2 / ClLoopCoalescedChecks] Loop-carried coalescing: accumulate each loop load's shadow
-// (branchless, in a per-loop i8 memory accumulator: acc |= shadow!=0) and emit ONE check at each
-// loop-exit block, instead of one check per iteration. The memory accumulator + PromotePass(mem2reg)
-// in the post-pass pipeline becomes a loop-carried SSA PHI, handling MULTI-BLOCK loops without
-// hand-resolving conditional-shadow dominance. Essential sinks and non-loop shadows fall back to the
-// per-BB coalesced check. init(false): DEV default unchanged; measured slower than check-at-load even
-// on memory-bound (audit 2026-09-09) -> experiment flag, not a default. Requires the runtime's
-// __cqmsan_maybe_warning* (MaybeWarningFn) which DEV already provides in the _fast variant.
-static cl::opt<bool> ClLoopCoalescedChecks(
-    "cqmsan-loop-coalesced-checks",
-    cl::desc("EXP#2: accumulate shadow per-loop (memory acc + mem2reg) and check at loop exits. "
-             "Measured SLOWER than check-at-load (+7.4% wall-time on libxml2 memory-bound); it also "
-             "loses per-PC AFL feedback granularity. EXPERIMENT ONLY, init(false). Verified to build "
-             "cleanly (opt -verify + full builds) on libxml2/c-ares/pcre2/re2/json/openssl (2026-09-09)."),
-    cl::Hidden, cl::init(false));
-
-// [2026-09-10] Declared only so that this tree compiles (it was referenced but never declared).
-// The inline-exit emission of the loop-coalesced experiment is NOT ported to this tree:
-// enabling the flag aborts compilation instead of silently dropping the loop-exit checks.
-static cl::opt<bool> ClLoopCoalescedInlineExit("cqmsan-loop-coalesced-inline-exit",
-    cl::desc("EXPERIMENT ONLY / NOT IMPLEMENTED IN THIS TREE: keep false"),
-    cl::Hidden, cl::init(false));
-    // sound: check-valore differiti al primo barrier/terminator, essenziali (indirizzi/arg) al sito; feedback AFL piu' grossolano
-
-
-/// ------------------------------ABLATION--------------------------------------------- ///
-
-// Default true ⇒ default behavior UNCHANGED. 
-// ONLY used to measure the load-skipping throughput 
-// ceiling (they are NOT real detectors: setting false loses detection).
-//
-// ClInstrumentLoads=false : visitLoadInst does not instrument loads at all (no
-// shadow-loads, no checks; the load shadow is treated as clean). This is the ceiling:
-// no load-skipping optimization can go faster than this.
-// Per-target selection: -mllvm -cqmsan-instrument-loads=0
-static cl::opt<bool> ClInstrumentLoads(
-    "cqmsan-instrument-loads",
-    cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
-    cl::Hidden, cl::init(true));
-
-// ClCheckLoads=false : the shadow load is loaded but the UMR check is NOT
-// issued. Without propagation, the shadow load becomes dead and the DCE removes it ⇒ in
-// practice, it collapses on instrument-loads=0 (useful for confirming that the cost is the
-// shadow load, not just the check branch).
-// Per-target selection: -mllvm -cqmsan-check-loads=0
-static cl::opt<bool> ClCheckLoads(
-    "cqmsan-check-loads",
-    cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
-    cl::Hidden, cl::init(true));
-
-// [ClEmitChecks] MASTER switch di TUTTI i check UMR. false = nessun check emesso da
-// NESSUN sito (load-value, indirizzo/ClCheckAccessAddress, return, eager-arg, atomic):
-// gata l'unico imbuto InsertChecks -> push/insertShadowCheck diventano no-op ->
-// __cqmsan_warning_fast NON puo' mai partire. Per ablazioni PULITE del solo costo
-// shadow-load/store (senza contaminazione del path UMR/warning). Ortogonale a
-// ClInstrumentLoads/Stores (quelli tolgono anche le shadow-load/store).
-static cl::opt<bool> ClEmitChecks(
-    "cqmsan-emit-checks",
-    cl::desc("Master switch: emit ANY UMR check. false = zero checks anywhere "
-             "(load/address/return/eager/atomic) -> warning_fast never fires."),
-    cl::Hidden, cl::init(true));
-
-// [PROTOTIPO sink-based] deferisce il check del valore caricato al primo sink che il load domina,
-// e la fusione avviene per OrigIns (materialize). Riduce il n. di check-branch. init(false).
-static cl::opt<bool> ClSinkChecks(
-    "cqmsan-sink-checks",
-    cl::desc("Defer the loaded-value check to the first dominated sink (fused). Prototype."),
-    cl::Hidden, cl::init(true));
-
-static cl::opt<bool> ClInstrumentStores(
-    "cqmsan-instrument-stores",
-    cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
-    cl::Hidden, cl::init(true));
-
-// [OPPORTUNISTIC / QMSan-style stores] Instead of propagating the stored value's
-// shadow (shadow[addr] = getShadow(val), the MSan model), mark the destination
-// shadow CLEAN/initialized unconditionally (shadow[addr] = 0). This is QMSan's
-// fast-tier model: a store means "this location now holds a written value" -> init.
-//  + cheaper: the store operand's shadow is never materialized, so shadow-loads
-//    that only fed store-propagation become dead and are DCE'd.
-//  + still detects read-of-NEVER-WRITTEN memory (stack/malloc poison stays until stored).
-//  - loses detection of store-of-an-UNINITIALIZED-value then read (false negative),
-//    exactly the precision QMSan's fast tier trades away.
-// [default] Ablation flag, default ON (cl::init(true) qui sotto): lo store
-// opportunistico E' la configurazione spedita. Per tornare alla propagazione
-// MSan-style dello shadow del valore: -mllvm -cqmsan-unpoison-stores=false.
-static cl::opt<bool> ClUnpoisonStores(
-    "cqmsan-unpoison-stores",
+static cl::opt<bool> ClUnpoisonStores("cqmsan-unpoison-stores",
     cl::desc("Opportunistic (QMSan-style) stores: mark the destination shadow clean "
              "unconditionally instead of propagating the stored value's shadow."),
     cl::Hidden, cl::init(true));
 
 /// ------------------------------------------------------------------------------------ ///
+// ABLATION
 
+static cl::opt<bool> ClUpdateUMRMap("cqmsan-update-umr-map",
+    cl::desc("Update the AFL feedback map/stack on a fired UMR. false = count-only stub "
+             "(ablation of the UMR-map/stack cost). Requires -cqmsan-fast-warning."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentLoads("cqmsan-instrument-loads",
+    cl::desc("Instrument loads (shadow load + check). false = upper-bound ablation."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClInstrumentStores("cqmsan-instrument-stores",
+    cl::desc("Instrument stores (shadow store). false = ablation, no shadow store."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClCheckLoads("cqmsan-check-loads",
+    cl::desc("Emit the UMR check at loads. false = load shadow but never check."),
+    cl::Hidden, cl::init(true));
+
+static cl::opt<bool> ClEmitChecks("cqmsan-emit-checks",
+    cl::desc("Master switch: emit ANY UMR check. false = zero checks anywhere "
+             "(load/address/return/eager/atomic) -> warning_fast never fires."),
+    cl::Hidden, cl::init(true));
+
+/// ------------------------------------------------------------------------------------ ///ì
 /// Originals
 
 static cl::opt<bool> ClKeepGoing("cqmsan-keep-going",
@@ -454,7 +319,8 @@ static cl::opt<bool> ClWithComdat("cqmsan-with-comdat",
         cl::desc("Place MSan constructors in comdat sections"),
         cl::Hidden, cl::init(false));
 
-/* SHADOW MAPPING */
+
+// SHADOW MAPPING
 // TODO - future work is to handle these 3 options.
 
 // These options allow to specify custom memory map parameters
@@ -476,6 +342,9 @@ static cl::opt<uint64_t> ClShadowBase("cqmsan-shadow-base",
 static cl::opt<bool> ClPrintStackNames("cqmsan-print-stack-names",
     cl::desc("Print name of local stack variable"),
     cl::Hidden, cl::init(false));
+
+/// ------------------------------------------------------------------------------------ ///
+
 
 // Define the constructor name and the init function name of the runtime library
 const char kCQMSanModuleCtorName[] = "cqmsan.module_ctor";
@@ -1266,9 +1135,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         //LLVM_DEBUG(dbgs() << "DONE:\n" << F);
     }
 
-    // rete ridondante (non piu' il classificatore primario): forza essenziali certi sink anche senza bit essential
     bool isImmediateEssentialSink(Instruction *OrigIns) const {
-        // Indirect call: ptr deve essere checked PRIMA della call execution
+        // Indirect call: ARM VIVO (solo con ClSinkChecks=1). findSinkFor accetta come sink una
+        // CallBase che usa il valore come argomento, e quella call puo' essere indiretta: il
+        // puntatore va checkato PRIMA di eseguirla.
         if (auto *CB = dyn_cast<CallBase>(OrigIns))
             if (CB->isIndirectCall())
                 return true;
@@ -1282,7 +1152,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // dyn_cast leggerebbe un puntatore dangling prima di poter decidere qualsiasi
         // cosa. L'invariante da mantenere e': mai spingere un check su un'istruzione
         // che il visitor cancella.
-        // Atomic: race effects materializzati prima del check
+        // Atomic: ARM OGGI IRRAGGIUNGIBILE, tenuto come guardia. Nessuno dei sette siti
+        // Essential=false ha un'atomica come OrigIns, e findSinkFor non ne restituisce mai una:
+        // AtomicCmpXchgInst/AtomicRMWInst non compaiono nella sua catena di dispatch, quindi
+        // cadono fino in fondo con cand == nullptr. Lo si tiene per la stessa ragione per cui il
+        // bit Essential e' default-TRUE: se domani findSinkFor imparasse a deferire su un'atomica,
+        // o un nuovo sito spingesse Essential=false su una, il check non deve poter scavalcare
+        // effetti gia' visibili agli altri thread. NB: e' un caso DIVERSO dall'arm MemIntrinsic
+        // rimosso qui sopra -- quello non era solo irraggiungibile, era PERICOLOSO (avrebbe letto
+        // un puntatore gia' liberato dal visitor).
         if (isa<AtomicCmpXchgInst>(OrigIns) || isa<AtomicRMWInst>(OrigIns))
             return true;
         return false;
@@ -1339,6 +1217,29 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return false;
     }
 
+    bool loopFlushIsSound(const Loop *L, DenseMap<const Loop *, bool> &Cache) const {
+        auto It = Cache.find(L);
+        if (It != Cache.end())
+            return It->second;
+        bool Sound = true;
+        SmallVector<BasicBlock *, 4> Exits;
+        L->getExitBlocks(Exits);
+        if (Exits.empty())
+            Sound = false;                                            // (1)
+        for (BasicBlock *E : Exits)
+            if (E->isEHPad() || E->getFirstInsertionPt() == E->end()) {
+                Sound = false; break;                                 // (2) -- stesso filtro della FASE 2
+            }
+        if (Sound)
+            for (const BasicBlock *B : L->blocks()) {                 // (3)
+                for (const Instruction &I : *B)
+                    if (isBBBarrier(&I)) { Sound = false; break; }
+                if (!Sound) break;
+            }
+        Cache[L] = Sound;
+        return Sound;
+    }
+
     // terminatori davanti ai quali non possiamo splittare/inserire in sicurezza
     static bool isUnsplittableTerminator(const Instruction *T) {
         return isa<CatchSwitchInst>(T) || isa<CleanupReturnInst>(T) ||
@@ -1356,7 +1257,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // lui. Con ClSinkChecks (default true) OrigIns e' spesso la CALL che consuma il valore
         // caricato (findSinkFor), e una call che puo' unwind / noreturn / non-willreturn E' una
         // barriera (isBBBarrier = !isGuaranteedToTransferExecutionToSuccessor);
-        // isImmediateEssentialSink intercetta solo call indirette, mem-intrinsics e atomiche, quindi
+        // isImmediateEssentialSink intercetta solo le call INDIRETTE (l'arm mem-intrinsic e' stato
+        // rimosso, quello sulle atomiche e' irraggiungibile), quindi
         // una call DIRETTA resta fra i Deferrable. Nell'IR reale: `call @may_throw(v)` seguita da
         // icmp/br + __cqmsan_warning_fast -> check DOPO il sink; con un sink noreturn il check
         // finisce nel blocco che termina con `unreachable` = codice morto -> falso negativo certo.
@@ -1452,7 +1354,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     // [EXP #2 multi-blocco] accumulatore-memoria per-loop (i8) + check ai loop-exit; mem2reg lo promuove a PHI.
     // Robusto sui loop multi-blocco: l'OR in memoria evita i problemi di dominanza degli shadow condizionali.
-    void materializeChecksLoopCoalesced() {
+    void materializeCoalescedLoopChecks() {
         DominatorTree DT(F);
         LoopInfo LI(DT);
         IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
@@ -1469,12 +1371,20 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // di questa mappa e l'ordine di iterazione di una DenseMap dipende dall'hash del puntatore
         // (= indirizzo dell'allocatore) -> IR diverso a ogni compilazione dello stesso TU. Stesso
         // criterio gia' adottato per AccsByLoop qui sopra. Ordine = primo inserimento.
-        MapVector<BasicBlock *, SmallVector<Value *, 8>> BBShadows;  // fallback non-loop
+        // [FIX F1-loop 2026-09-26] Fallback dei check NON accumulabili nel loop. Era indicizzato
+        // per BASIC BLOCK ed emetteva al terminatore: un check il cui OrigIns e' (o e' seguito da)
+        // una barriera finiva DOPO di essa -> falso negativo, e dopo un sink noreturn addirittura
+        // in un blocco che termina con `unreachable` (codice morto). E' lo stesso difetto F1 gia'
+        // corretto sul path BB-coalesced, che qui non era mai arrivato perche' questo path ha il
+        // proprio fallback e non passa da anchorFor(). Ora e' indicizzato per ANCHOR, esattamente
+        // come ByAnchor nel path BB-coalesced.
+        MapVector<Instruction *, SmallVector<Value *, 8>> ByAnchor;   // fallback: 1 check per anchor
         // [FIX 2026-09-09] Defer essential-sink checks: materializeOneCheck SPLITS the CFG,
         // which invalidates LoopInfo/Loop* used below. Collect now, materialize AFTER all
         // LoopInfo use (getLoopFor + getExitBlocks). Fixes a nondeterministic codegen crash
         // (dangling Loop* -> stale exit blocks) seen on libxml2 with the flag on.
         SmallVector<ShadowAndInsertPoint, 16> Essential;
+        DenseMap<const Loop *, bool> LoopSoundCache;   // vedi loopFlushIsSound
 
         // FASE 1: accumula lo shadow GREZZO per (loop,tipo) -- nessun cambio di CFG
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
@@ -1482,7 +1392,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // (`C.Essential || isImmediateEssentialSink(C.OrigIns)`). Il bit e' default-TRUE in
             // insertShadowCheck/pushShadowCheck proprio perche' ogni sito di push, presente e
             // futuro, sia sound per costruzione; isImmediateEssentialSink e' solo la rete
-            // RIDONDANTE (indirect call / memintrinsic / atomic). Da sola lasciava differire al
+            // RIDONDANTE (un solo arm vivo: le call indirette). Da sola lasciava differire al
             // loop-exit check marcati essenziali ma non "sink immediati": return check
             // (visitReturnInst), eager-arg check (visitCallBase), check d'indirizzo con
             // ClCheckAccessAddress, pointer-shadow di handleMaskedGather/Scatter.
@@ -1494,10 +1404,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             Instruction *ShadowI = dyn_cast<Instruction>(It->Shadow);
             Type *T = It->Shadow->getType();
             // idoneo: loop+preheader, shadow-istruzione DENTRO il loop (l'accumulo inserito subito
-            // dopo lo shadow e' dominato, il reset in preheader domina il body), tipo OR-abile.
+            // dopo lo shadow e' dominato, il reset in preheader domina il body), tipo OR-abile,
+            // E il flush al loop-exit deve essere GARANTITO raggiunto (vedi loopFlushIsSound).
             if (!L || !L->getLoopPreheader() || !ShadowI || !L->contains(ShadowI->getParent()) ||
-                !T->isIntOrIntVectorTy()) {
-                BBShadows[It->OrigIns->getParent()].push_back(It->Shadow);
+                !T->isIntOrIntVectorTy() || !loopFlushIsSound(L, LoopSoundCache)) {
+                // [FIX F1-loop] emetti all'ANCHOR, non al terminatore del BB. anchorFor da'
+                // la prima barriera at-or-after OrigIns (altrimenti il terminatore), quindi il
+                // check finisce sempre PRIMA del punto oltre il quale il controllo puo' sfuggire.
+                // nullptr = terminatore non splittabile -> rientra fra gli essenziali, come fa
+                // la FASE 1 del path BB-coalesced.
+                if (Instruction *A = anchorFor(It->OrigIns))
+                    ByAnchor[A].push_back(It->Shadow);
+                else
+                    Essential.push_back(ShadowAndInsertPoint(It->Shadow, It->OrigIns, true));
                 continue;
             }
             std::pair<Loop *, Type *> Key(L, T);
@@ -1561,14 +1480,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // dominates). All LoopInfo use (getLoopFor + getExitBlocks) is already done above, so both
         // loops may split freely now.
         //
-        // fallback: 1 check al terminatore di BB (come ClBBCoalescedChecks) -- PRIMA degli essenziali
-        for (auto &Entry : BBShadows) {
+        // fallback: 1 check per ANCHOR (come ClBBCoalescedChecks) -- PRIMA degli essenziali.
+        // [FIX F1-loop 2026-09-26] Si emette all'anchor, non al terminatore del blocco.
+        // convertToBool e non normalizeShadow: il primo e' aggregate-safe, e qui gli aggregati
+        // arrivano per costruzione (il gate di FASE 1 manda nel fallback tutto cio' che non e'
+        // isIntOrIntVectorTy). E' la stessa funzione usata da emitCoalescedCheck.
+        for (auto &Entry : ByAnchor) {
             auto &Shadows = Entry.second;
             if (Shadows.empty()) continue;
-            IRBuilder<> IRB(Entry.first->getTerminator());
-            Value *Accd = normalizeShadow(IRB, Shadows[0]);
+            IRBuilder<> IRB(Entry.first);
+            Value *Accd = convertToBool(Shadows[0], IRB, "_cqmscoal");
             for (size_t i = 1; i < Shadows.size(); ++i)
-                Accd = IRB.CreateOr(Accd, normalizeShadow(IRB, Shadows[i]));
+                Accd = IRB.CreateOr(Accd, convertToBool(Shadows[i], IRB, "_cqmscoal"), "_cqmsor");
             materializeOneCheck(IRB, Accd);
         }
 
@@ -1593,61 +1516,46 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
     }
 
-    // [determinismo] Rende CONSECUTIVE le entry con lo stesso OrigIns senza ordinare per VALORE del
-    // puntatore: gli indirizzi delle Instruction cambiano da una compilazione all'altra, quindi
-    // `stable_sort(A.OrigIns < B.OrigIns)` produceva IR diverso a ogni build dello stesso TU (stessi
-    // conteggi -- check/xor/istruzioni -- ma ordine di blocchi e icmp diverso). Il grouping a valle
-    // (find_if su run consecutivi) chiede solo l'ADIACENZA, non un ordine totale: MapVector conserva
-    // l'ordine di PRIMO inserimento -> raggruppamento deterministico, come gia' ByAnchor/AccsByLoop.
     static void groupByOrigIns(SmallVectorImpl<ShadowAndInsertPoint> &V) {
         if (V.size() < 2)
             return;
+
         MapVector<Instruction *, SmallVector<ShadowAndInsertPoint, 2>> ByOrigIns;
+        
         for (const ShadowAndInsertPoint &E : V)
             ByOrigIns[E.OrigIns].push_back(E);
+        
         V.clear();
         for (auto &KV : ByOrigIns)
             V.append(KV.second.begin(), KV.second.end());
+    
     }
 
-    void materializeChecks() {
-        if (ClLoopCoalescedChecks) {   // [EXP#2] loop-carried accumulation + check at loop exits
-            materializeChecksLoopCoalesced();
-            return;
-        }
-        if (!ClBBCoalescedChecks) {
-            materializeChecksLegacy();   // path originale: baseline sound, invariato
-            return;
-        }
-
-        // Partiziona: essenziale se il bit lo dice o se OrigIns e' comunque un sink immediato (rete ridondante)
+    void materializeCoalescedChecks() {
         SmallVector<ShadowAndInsertPoint, 16> Essential;
         struct Deferred { Value *Shadow; Instruction *OrigIns; };
         SmallVector<Deferred, 16> Deferrable;
 
         for (const auto &C : InstrumentationList) {
+            // check if deferrable
             if (C.Essential || isImmediateEssentialSink(C.OrigIns))
                 Essential.push_back(C);
             else
                 Deferrable.push_back({C.Shadow, C.OrigIns});
         }
 
-        // FASE 1 (read-only, prima di ogni mutazione IR): calcola gli anchor e raggruppa (MapVector = ordine deterministico)
+        // FASE 1: computes the anchors and groups
         MapVector<Instruction *, SmallVector<Value *, 8>> ByAnchor;
         for (const auto &D : Deferrable) {
             if (Instruction *A = anchorFor(D.OrigIns))
                 ByAnchor[A].push_back(D.Shadow);
             else
-                Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true)); // not deferreable
+                Essential.push_back(ShadowAndInsertPoint(D.Shadow, D.OrigIns, true)); 
+                // not deferreable (no anchor means essential)
         }
 
-        // Rende consecutive le entry con lo stesso OrigIns: un check-valore ricaduto in Essential (anchor
-        // assente) puo' condividere OrigIns col check-indirizzo del load -> senza raggruppamento verrebbe
-        // processato due volte (2 check invece di 1 fuso). Il grouping sotto (find_if su run consecutivi)
-        // esige solo l'adiacenza -> ordine di primo inserimento, non di puntatore (vedi groupByOrigIns).
-        groupByOrigIns(Essential);
-
-        // FASE 2a: essenziali come legacy (1 check OR-ed per OrigIns, al sito)
+        // FASE 2a: essenziali threaten as legacy (1 check OR-ed per OrigIns, at site)
+        groupByOrigIns(Essential); // essentials are threaten as the legacy checks
         for (auto I = Essential.begin(); I != Essential.end();) {
             Instruction *O = I->OrigIns;
             auto J = std::find_if(I + 1, Essential.end(),
@@ -1656,9 +1564,26 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             I = J;
         }
 
-        // FASE 2b: un check coalescato per segmento straight-line (per anchor)
+        // FASE 2b: a coalesced check for a straigth-line segment (per anchor)
         for (auto &KV : ByAnchor)
             emitCoalescedCheck(KV.second, KV.first);
+
+    }
+
+    void materializeChecks() {
+
+        if (ClLoopCoalescedChecks) {   // loop-carried accumulation + check at loop exits
+            materializeCoalescedLoopChecks();
+            return;
+        }
+
+        if (ClBBCoalescedChecks) {
+            materializeCoalescedChecks();
+            return;
+        }
+
+        materializeChecksLegacy();   // path originale: baseline sound, invariato
+
     }
 
     bool runOnFunction() {
@@ -1909,7 +1834,8 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Shadow = ShadowBase + Offset
     /// Addr can be a ptr or <N x ptr>. In both cases ShadowTy the shadow type of
     /// a single pointee.
-    /// Returns shadow_ptr or <<N x shadow_ptr>
+    /// Returns shadow_ptr or <<N x shadow_ptr>>
+    //
     /// [ClSharedShadowBase] Puntatori shadow gia' calcolati, per oggetto base applicativo.
     /// Il riuso e' ammesso solo se il valore in cache DOMINA il punto di inserimento corrente:
     /// una costante domina sempre, un'istruzione solo se e' nello stesso blocco e viene prima.
@@ -1920,8 +1846,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     bool shadowBaseUsableHere(Value *Cached, IRBuilder<> &IRB) const {
         auto *I = dyn_cast<Instruction>(Cached);
         if (!I) return true;                       // costante / argomento: sempre disponibile
+        
         BasicBlock *IB = IRB.GetInsertBlock();
         if (I->getParent() != IB) return false;
+        
         BasicBlock::iterator IP = IRB.GetInsertPoint();
         return IP == IB->end() || I->comesBefore(&*IP);
     }
@@ -1930,9 +1858,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Ritorna nullptr se la condivisione non e' applicabile e va emesso il calcolo completo.
     Value *tryGetShadowPtrFromBase(Value *Addr, IRBuilder<> &IRB) {
         if (!ClSharedShadowBase) return nullptr;
+        
         // solo mapping XOR puro: con AndMask o ShadowBase l'identita' shadow(p+k)=shadow(p)+k
         // non e' garantita dall'argomento sulle regioni.
         if (CQMS.MapParams->AndMask || CQMS.MapParams->ShadowBase) return nullptr;
+
         if (!Addr->getType()->isPointerTy()) return nullptr;   // niente vettori di puntatori
 
         const DataLayout &DL = F.getDataLayout();
@@ -1957,6 +1887,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // gep NON inbounds: la memoria shadow non e' un oggetto allocato dal punto di vista di LLVM
         return IRB.CreateGEP(IRB.getInt8Ty(), ShadowBase,
                              ConstantInt::get(IRB.getInt64Ty(), Offset), "_cqmssoff");
+
     }
 
     Value* getShadowPtrUserspace(Value *Addr, IRBuilder<> &IRB, Type *ShadowTy, [[maybe_unused]] MaybeAlign Alignment) {
@@ -2307,32 +2238,39 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// PHIs/selects of such pointers are accepted only if ALL incoming objects qualify.
     static bool isAFLRuntimePointer(const Value *Ptr) {
         SmallVector<const Value *, 4> Objs;
+        
         getUnderlyingObjects(Ptr, Objs, /*LI=*/nullptr, /*MaxLookup=*/6);
         if (Objs.empty()) return false;
+
         for (const Value *O : Objs) {
             const Value *Base = getUnderlyingObject(stripIntPtrArithmetic(O));
+
             if (const auto *GV = dyn_cast<GlobalVariable>(Base)) {
                 if (GV->getName().starts_with("__afl_") || GV->getName().starts_with("__sancov_gen_"))
                     continue;
                 return false;
             }
+
             if (const auto *LI = dyn_cast<LoadInst>(Base)) {
                 // the map pointer itself: only @__afl_area_ptr (never the fuzz input buffer)
                 const Value *B2 = getUnderlyingObject(stripIntPtrArithmetic(LI->getPointerOperand()));
                 if (const auto *GV = dyn_cast<GlobalVariable>(B2))
                     if (GV->getName() == "__afl_area_ptr") continue;
             }
+
             return false;
         }
+
         return true;
     }
 
     /// Load/store/atomicrmw whose address is AFL runtime state (see ClSkipAFLRuntimeAccesses).
     static bool isAFLRuntimeAccess(const Instruction &I) {
         if (!ClSkipAFLRuntimeAccesses) return false;
-        if (const auto *LI = dyn_cast<LoadInst>(&I))   return isAFLRuntimePointer(LI->getPointerOperand());
-        if (const auto *SI = dyn_cast<StoreInst>(&I))  return isAFLRuntimePointer(SI->getPointerOperand());
+        if (const auto *LI  = dyn_cast<LoadInst>(&I))   return isAFLRuntimePointer(LI->getPointerOperand());
+        if (const auto *SI  = dyn_cast<StoreInst>(&I))  return isAFLRuntimePointer(SI->getPointerOperand());
         if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I)) return isAFLRuntimePointer(RMW->getPointerOperand());
+
         return false;
     }
 
@@ -2349,6 +2287,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     static bool onlyFeedsNoSanitize(const Value *V) {
         SmallVector<const Instruction *, 32> Work;
         SmallPtrSet<const Instruction *, 32> Seen;
+
+        // Lambda to push all users of a value onto the worklist, returning false 
+        //if any user is not an instruction or if the budget is exceeded.
         auto PushUsers = [&](const Value *X) -> bool {
             for (const User *U : X->users()) {
                 const auto *UI = dyn_cast<Instruction>(U);
@@ -2358,15 +2299,20 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             }
             return true;
         };
+
         if (!PushUsers(V)) return false;
+        
         while (!Work.empty()) {
             const Instruction *UI = Work.pop_back_val();
+
             if (isNoSanitizeEquivalent(*UI)) continue;       // MSan never visits it: dead leaf
+            
             bool Pure = isa<GetElementPtrInst>(UI) || isa<CastInst>(UI) || isa<PHINode>(UI) ||
                         isa<SelectInst>(UI) || isa<BinaryOperator>(UI) || isa<ICmpInst>(UI) ||
                         isa<FreezeInst>(UI) || isa<ExtractElementInst>(UI) ||
                         isa<InsertElementInst>(UI) || isa<ShuffleVectorInst>(UI) ||
                         isa<UnaryOperator>(UI);
+            
             if (!Pure) {
                 if (const auto *II = dyn_cast<IntrinsicInst>(UI)) {
                     switch (II->getIntrinsicID()) {
@@ -2379,113 +2325,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                     }
                 }
             }
+            
             if (!Pure) return false;                         // observable consumer
             if (!PushUsers(UI)) return false;
         }
         return true;
-    }
-
-    bool hasDominatingConstantStoreInBB(AllocaInst *AI, LoadInst *LI) {
-        BasicBlock *BB = LI->getParent();
-        if (AI->getParent() != BB) return false;
-
-        // Strip a load as "clean" ONLY if a dominant store covers
-        // EXACTLY the location read. Using stripInBoundsConstantOffsets() on the
-        // store pointer, a store at `gep AI, off` would be stripped to AI and
-        // treated as if it initialized the entire alloca (while only writing a
-        // portion) → a load from unwritten bytes would be incorrectly stripped (FALSE
-        // NEGATIVE). We therefore require: same pointer as the load, constant value,
-        // and store size >= the load.
-        const DataLayout &DL = LI->getModule()->getDataLayout();
-        Value *LPtr = LI->getPointerOperand();
-        uint64_t LSize = DL.getTypeStoreSize(LI->getType());
-
-        // [Fix] Non basta trovare lo store costante: bisogna
-        // continuare a scandire FINO alla load. Fermarsi al primo store che copre la
-        // locazione era un FALSE NEGATIVE reale - in `int y = 0; foo(&y); return y;`
-        // la load di y veniva marcata "provably clean" e il check spariva (a -O1 il bug
-        // e' mascherato solo perche' clang emette llvm.lifetime.start subito dopo
-        // l'alloca e quell'intrinsic fa abortire il loop prima dello store; con
-        // -Xclang -disable-lifetime-markers il conteggio dei check passa 1 -> 0).
-        // Dopo la copertura, quindi, qualunque cosa possa riscrivere o ri-poisonare lo
-        // slot fa abortire: call che scrivono memoria, memcpy/memmove/memset,
-        // lifetime.start/end (handleLifetimeStart ri-poisona l'alloca), atomici, e ogni
-        // store che non si possa provare estraneo ad AI.
-        auto isCoveringConstantStore = [&](StoreInst *SI) {
-            // Deve anche essere davvero instrumentato: uno store nosanitize(-equivalente)
-            // non scrive shadow pulito, quindi non "pulisce" un bel niente.
-            return !isNoSanitizeEquivalent(*SI) &&
-                   SI->getPointerOperand() == LPtr &&
-                   isa<Constant>(SI->getValueOperand()) &&
-                   DL.getTypeStoreSize(SI->getValueOperand()->getType()) >= LSize;
-        };
-
-        bool SawCoveringStore = false;
-        for (Instruction *I = AI->getNextNode(); I && I != LI; I = I->getNextNode()) {
-            // Intermediate call: conservative, abort
-            if (auto *CB = dyn_cast<CallBase>(I)) {
-                if (!isa<IntrinsicInst>(CB) || CB->mayWriteToMemory())
-                    return false;
-                // Espliciti, per non dipendere solo dagli attributi di memoria della
-                // declaration: memcpy/memmove/memset riscrivono lo shadow dalla
-                // sorgente, lifetime.start/end ri-poisonano lo slot.
-                if (isa<MemIntrinsic>(CB))
-                    return false;
-                if (auto *II = dyn_cast<IntrinsicInst>(CB))
-                    if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
-                        II->getIntrinsicID() == Intrinsic::lifetime_end)
-                        return false;
-                continue;
-            }
-
-            if (auto *SI = dyn_cast<StoreInst>(I)) {
-                if (isCoveringConstantStore(SI)) {
-                    SawCoveringStore = true;   // NON si esce: la load e' piu' avanti
-                    continue;
-                }
-                // Prima della copertura: come prima, qualunque altro store aborta.
-                // Dopo la copertura si tollera SOLO uno store la cui base (dopo lo strip
-                // dei GEP inbounds costanti) e' una alloca DIVERSA da AI: due oggetti
-                // alloca distinti non possono aliasare. Qui non abbiamo AliasAnalysis,
-                // quindi tutto il resto (puntatori generici, GEP non inbounds, offset
-                // variabili sulla stessa alloca) aborta.
-                if (SawCoveringStore)
-                    if (auto *OtherAI = dyn_cast<AllocaInst>(
-                            SI->getPointerOperand()->stripInBoundsConstantOffsets()))
-                        if (OtherAI != AI)
-                            continue;
-                return false;
-            }
-
-            // Qualunque altra istruzione che scrive memoria (atomicrmw, cmpxchg,
-            // va_arg, load volatile, ...) puo' toccare la locazione: conservativo.
-            if (I->mayWriteToMemory())
-                return false;
-        }
-        return SawCoveringStore;
-    }
-
-    bool isLoadFromGlobalConstant(LoadInst *LI) {
-        Value *Ptr = LI->getPointerOperand()->stripInBoundsConstantOffsets();
-        auto *GV = dyn_cast<GlobalVariable>(Ptr);
-        return GV && GV->isConstant() && GV->hasInitializer()
-            && !GV->isExternallyInitialized();
-    }
-
-    bool canProveLoadIsClean(LoadInst *LI) {
-        // [TODO] if this work, activate this flag then
-        if (!ClSkipProvableCleanLoads) return false;
-
-        // R1
-        if (isLoadFromGlobalConstant(LI)) return true;
-
-        // R2
-        Value *Ptr = LI->getPointerOperand()->stripInBoundsConstantOffsets();
-        if (auto *AI = dyn_cast<AllocaInst>(Ptr))
-            if (hasDominatingConstantStoreInBB(AI, LI))
-                return true;
-
-        return false;
     }
 
     /// Instrument LoadInst
@@ -2545,76 +2389,69 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         const Align Alignment = I.getAlign();
 
         bool insertedShadowLoad = false;
-
-        if (canProveLoadIsClean(&I)) {
-            LLVM_DEBUG(dbgs() << "Load is provably clean: " << I << "\n");
-            setShadow(&I, getCleanShadow(&I));
-        } else {
             
-            Value *ShadowPtr       = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
-            LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
-            Value *EffectiveShadow = LoadedShadow;
+        Value *ShadowPtr       = getShadowPtr(Addr, IRB, ShadowTy, Alignment, /*isStore*/ false);
+        LoadInst *LoadedShadow = IRB.CreateAlignedLoad(ShadowTy, ShadowPtr, Alignment, "_cqmsld");
+        Value *EffectiveShadow = LoadedShadow;
 
 #ifdef CQMSAN_FLIP_CONVENTION
-            // [FLIP experiment, fast/slow path] Under 0=uninit, a never-explicitly-
-            // written global (loader-initialized .data/.bss) has virgin
-            // shadow=0=poisoned by default, which is wrong (the loader DID
-            // initialize it) — the "globals become FP-prone" problem documented in
-            // STUDIO_unpoison_punti_e_costo.md §9-bis. Mirrors QMSan's own fix
-            // (msan_giovese_add_mmap/check_addr_mmap_list, verified in
-            // qemu/linux-user/elfload.c): a runtime range-list of loader-mapped
-            // segments, consulted here to override the shadow to clean for
-            // addresses inside a known-initialized range, WITHOUT ever writing
-            // shadow bytes for that region.
-            //
-            // Unlike the first version of this experiment, the range-list call is
-            // NOT made unconditionally on every load. QMSan's own equivalent check
-            // (msan-giovese-inl.h) is short-circuited: `((~res & MSAN_8)!=0) &&
-            // msan_giovese_check_addr(ptr)` — the expensive list walk runs only
-            // when the raw shadow already looks poisoned, to disambiguate a real
-            // bug from a loader-initialized false alarm. Mirrored here as a real
-            // fast/slow basic-block split: for the overwhelming majority of loads
-            // (genuinely defined memory, RawPoisoned=false), __cqmsan_is_static_range
-            // never runs at all.
-            Value *RawPoisoned = convertToBool(LoadedShadow, IRB, "_cqmsrawpoison");
-            BasicBlock *FastBB = IRB.GetInsertBlock();
-            Instruction *SlowTerm = SplitBlockAndInsertIfThen(
-                RawPoisoned, &*IRB.GetInsertPoint(), /*Unreachable*/false, CQMS.ColdCallWeights);
-            BasicBlock *SlowBB = SlowTerm->getParent();
-            BasicBlock *TailBB = SlowTerm->getSuccessor(0);
+        // [FLIP experiment, fast/slow path] Under 0=uninit, a never-explicitly-
+        // written global (loader-initialized .data/.bss) has virgin
+        // shadow=0=poisoned by default, which is wrong (the loader DID
+        // initialize it) — the "globals become FP-prone" problem documented in
+        // STUDIO_unpoison_punti_e_costo.md §9-bis. Mirrors QMSan's own fix
+        // (msan_giovese_add_mmap/check_addr_mmap_list, verified in
+        // qemu/linux-user/elfload.c): a runtime range-list of loader-mapped
+        // segments, consulted here to override the shadow to clean for
+        // addresses inside a known-initialized range, WITHOUT ever writing
+        // shadow bytes for that region.
+        //
+        // Unlike the first version of this experiment, the range-list call is
+        // NOT made unconditionally on every load. QMSan's own equivalent check
+        // (msan-giovese-inl.h) is short-circuited: `((~res & MSAN_8)!=0) &&
+        // msan_giovese_check_addr(ptr)` — the expensive list walk runs only
+        // when the raw shadow already looks poisoned, to disambiguate a real
+        // bug from a loader-initialized false alarm. Mirrored here as a real
+        // fast/slow basic-block split: for the overwhelming majority of loads
+        // (genuinely defined memory, RawPoisoned=false), __cqmsan_is_static_range
+        // never runs at all.
+        Value *RawPoisoned = convertToBool(LoadedShadow, IRB, "_cqmsrawpoison");
+        BasicBlock *FastBB = IRB.GetInsertBlock();
+        Instruction *SlowTerm = SplitBlockAndInsertIfThen(
+            RawPoisoned, &*IRB.GetInsertPoint(), /*Unreachable*/false, CQMS.ColdCallWeights);
+        BasicBlock *SlowBB = SlowTerm->getParent();
+        BasicBlock *TailBB = SlowTerm->getSuccessor(0);
 
-            IRBuilder<> SlowIRB(SlowTerm);
-            Value *AddrInt      = SlowIRB.CreatePtrToInt(Addr, CQMS.IntptrTy);
-            Value *IsStatic     = SlowIRB.CreateCall(CQMS.IsStaticRangeFn, {AddrInt});
-            Value *SlowShadow   = SlowIRB.CreateSelect(IsStatic, getCleanShadow(&I), LoadedShadow,
-                                                        "_cqmsstaticsel");
-            Value *SlowPoisoned = SlowIRB.CreateNot(IsStatic, "_cqmsslowpoison");
+        IRBuilder<> SlowIRB(SlowTerm);
+        Value *AddrInt      = SlowIRB.CreatePtrToInt(Addr, CQMS.IntptrTy);
+        Value *IsStatic     = SlowIRB.CreateCall(CQMS.IsStaticRangeFn, {AddrInt});
+        Value *SlowShadow   = SlowIRB.CreateSelect(IsStatic, getCleanShadow(&I), LoadedShadow,
+                                                    "_cqmsstaticsel");
+        Value *SlowPoisoned = SlowIRB.CreateNot(IsStatic, "_cqmsslowpoison");
 
-            IRB.SetInsertPoint(TailBB, TailBB->begin());
-            PHINode *ShadowPhi = IRB.CreatePHI(ShadowTy, 2, "_cqmsshadowphi");
-            ShadowPhi->addIncoming(LoadedShadow, FastBB);
-            ShadowPhi->addIncoming(SlowShadow, SlowBB);
-            PHINode *PoisonedPhi = IRB.CreatePHI(IRB.getInt1Ty(), 2, "_cqmspoisonedphi");
-            PoisonedPhi->addIncoming(ConstantInt::getFalse(IRB.getContext()), FastBB);
-            PoisonedPhi->addIncoming(SlowPoisoned, SlowBB);
+        IRB.SetInsertPoint(TailBB, TailBB->begin());
+        PHINode *ShadowPhi = IRB.CreatePHI(ShadowTy, 2, "_cqmsshadowphi");
+        ShadowPhi->addIncoming(LoadedShadow, FastBB);
+        ShadowPhi->addIncoming(SlowShadow, SlowBB);
+        PHINode *PoisonedPhi = IRB.CreatePHI(IRB.getInt1Ty(), 2, "_cqmspoisonedphi");
+        PoisonedPhi->addIncoming(ConstantInt::getFalse(IRB.getContext()), FastBB);
+        PoisonedPhi->addIncoming(SlowPoisoned, SlowBB);
 
-            EffectiveShadow = ShadowPhi;
-            Value *EffectivePoisoned = PoisonedPhi;
+        EffectiveShadow = ShadowPhi;
+        Value *EffectivePoisoned = PoisonedPhi;
 #endif
 
-            setShadow(&I, EffectiveShadow);
-            insertedShadowLoad = true;
+        setShadow(&I, EffectiveShadow);
+        insertedShadowLoad = true;
 
-            if (ClCheckLoads) {
-                // [PROTOTIPO ClSinkChecks] il deferral al sink e' fatto DOPO il visit (IR stabile),
-                // in runOnFunction, rimappando OrigIns. Qui si pusha sempre al load.
+        if (ClCheckLoads) {
+            // [PROTOTIPO ClSinkChecks] il deferral al sink e' fatto DOPO il visit (IR stabile),
+            // in runOnFunction, rimappando OrigIns. Qui si pusha sempre al load.
 #ifdef CQMSAN_FLIP_CONVENTION
-                pushShadowCheck(EffectivePoisoned, &I, /*Essential=*/false);
+            pushShadowCheck(EffectivePoisoned, &I, /*Essential=*/false);
 #else
-                pushShadowCheck(EffectiveShadow, &I, /*Essential=*/false);
+            pushShadowCheck(EffectiveShadow, &I, /*Essential=*/false);
 #endif
-            }
-
         }
 
         // Optional: check that the load address is fully defined.
