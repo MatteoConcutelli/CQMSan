@@ -45,7 +45,7 @@ CQMSAN_FLAG(int, store_context_size, 20,
 // Standalone (no AFL shm): degenerates to a per-process dedup of the report path.
 // cqmsan_report_count still counts every firing. Diagnostic handlers (__cqmsan_warning,
 // noreturn, _noupdate) are not filtered.
-CQMSAN_FLAG(bool, skip_known_sites, true,
+CQMSAN_FLAG(bool, skip_known_sites, false,
           "Skip unwind+map update for UMR sites whose ERROR bit is already set in the AFL map.")
 
 // [umr_unwind_depth / umr_fast_unwind] Stack unwind used ONLY to build the callstack hash
@@ -62,7 +62,7 @@ CQMSAN_FLAG(bool, skip_known_sites, true,
 //    -fno-omit-frame-pointer) instead of the DWARF one. false = old behaviour
 //    (common_flags()->fast_unwind_on_fatal, default false = slow).
 // Diagnostic paths (__cqmsan_warning report, noreturn) keep the full fatal-report unwind.
-CQMSAN_FLAG(int, umr_unwind_depth, 4,
+CQMSAN_FLAG(int, umr_unwind_depth, 0,
           "Max frames unwound for the UMR-map callstack hash (0 = full stack, 1 = pc only).")
 CQMSAN_FLAG(bool, umr_fast_unwind, true,
           "Use the frame-pointer unwinder for the UMR-map callstack hash (false = DWARF unwinder).")
