@@ -163,36 +163,31 @@ static cl::opt<bool> ClSinkChecks("cqmsan-sink-checks",
 /// ------------------------------------------------------------------------------------ ///
 // REPORTING 
 
-static cl::opt<bool> ClPCOnly(
-    "cqmsan_pc-only",
+static cl::opt<bool> ClPCOnly("cqmsan_pc-only",
     cl::desc("Fast warning updated the AFL map by PC only (no unwind, no CS_EDGE)."
              "Requires -cqmsan-fast-warning. "),
     cl::Hidden, cl::init(false));
 
-static cl::opt<bool> ClFastWarning(
-    "cqmsan-fast-warning",
+static cl::opt<bool> ClFastWarning("cqmsan-fast-warning",
     cl::desc("Use bitmap-only warning handler (__cqmsan_warning_fast) instead "
              "of full-diagnostic handler. Skips stack unwind, symbolize, and "
              "stderr Printf. Preserves AFL bitmap signal. Recommended for "
              "fuzzing campaigns; not recommended for developer debugging."),
     cl::Hidden, cl::init(true));
 
-static cl::opt<bool> ClColdWarning(
-    "cqmsan-cold-warning",
+static cl::opt<bool> ClColdWarning("cqmsan-cold-warning",
     cl::desc("Mark warning handler as cold (keep out of I-cache hot path)."),
     cl::Hidden, cl::init(false)); // when not sure that the warning function is cold, leave it to the compiler to decide. 
     // It may be hot if the program is small and the warning is triggered often.
 
-static cl::opt<bool> ClWarningPreserveAll(
-    "cqmsan-warning-preserve-all",
+static cl::opt<bool> ClWarningPreserveAll("cqmsan-warning-preserve-all",
     cl::desc("Give the returning (keep-going) warning callee the preserve_all calling "
              "convention so the cold check call does not clobber caller registers. "
              "The runtime entry points must be built with the same convention."),
     cl::Hidden, cl::init(true));
 
 // TODO maybe conflict with ClCheckReturns
-static cl::opt<bool> ClTrustReturn(
-    "cqmsan-trust-return",
+static cl::opt<bool> ClTrustReturn("cqmsan-trust-return",
     cl::desc("Trust return values from functions"),
     cl::Hidden, cl::init(true));
 
