@@ -1041,18 +1041,11 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         }
     }
 
-    // [fix ordine shadow/load] Punto in cui materializzare il check di un gruppo (tutte le entry
-    // del gruppo condividono OrigIns). Storicamente e' sempre stato OrigIns stesso, cioe' DAVANTI
-    // al sito. Da quando visitLoadInst emette lo shadow load DOPO la load applicativa (come MSan),
-    // per il gruppo di una LoadInst inserire davanti a OrigIns userebbe un valore non ancora
-    // definito: violazione di dominanza SSA e modulo rifiutato dal verifier. In quel caso il check
-    // va subito DOPO l'ultimo shadow del gruppo definito nello stesso blocco a partire da OrigIns.
-    // Gli shadow definiti in altri blocchi non aggiungono vincoli: o dominano gia' OrigIns, o il
-    // check era gia' invalido prima di questa modifica (es. remap ClSinkChecks cross-blocco).
     Instruction *checkInsertPoint(ArrayRef<ShadowAndInsertPoint> Checks) const {
         Instruction *OrigIns = Checks.front().OrigIns;
         BasicBlock *BB = OrigIns->getParent();
         Instruction *Last = nullptr;              // ultimo shadow definito in BB da OrigIns in poi
+
         for (const auto &C : Checks) {
             auto *SI = dyn_cast<Instruction>(C.Shadow);
             if (!SI || SI->getParent() != BB || SI->comesBefore(OrigIns))
@@ -1060,14 +1053,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             if (!Last || Last->comesBefore(SI))
                 Last = SI;
         }
+        
         if (!Last)
             return OrigIns;                       // nessun vincolo nuovo: posizione storica
-        // insertPointAfter salta PHI/EH pad (che non possono seguire uno shadow load) e dopo lo
+        
+            // insertPointAfter salta PHI/EH pad (che non possono seguire uno shadow load) e dopo lo
         // shadow load c'e' sempre almeno il terminatore: l'iteratore non e' mai end().
         BasicBlock::iterator IP = insertPointAfter(Last);
         assert(IP != BB->end() && "nessun punto di inserimento dopo lo shadow del gruppo");
+        
         if (IP == BB->end())
             return BB->getTerminator();
+        
         return &*IP;
     }
 
@@ -1143,31 +1140,13 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     }
 
     bool isImmediateEssentialSink(Instruction *OrigIns) const {
-        // Indirect call: ARM VIVO (solo con ClSinkChecks=1). findSinkFor accetta come sink una
+        // Indirect call (solo con ClSinkChecks=1). findSinkFor accetta come sink una
         // CallBase che usa il valore come argomento, e quella call puo' essere indiretta: il
         // puntatore va checkato PRIMA di eseguirla.
         if (auto *CB = dyn_cast<CallBase>(OrigIns))
             if (CB->isIndirectCall())
                 return true;
 
-        // [fix] Nessun arm per i MemIntrinsic: e' irraggiungibile per costruzione.
-        // visitMemMoveInst / visitMemCpyInst / visitMemSetInst abbassano l'intrinsic a
-        // una call __cqmsan_mem* e fanno I.eraseFromParent() senza mai spingere un check,
-        // quindi nessuna entry di InstrumentationList puo' avere un MemIntrinsic come
-        // OrigIns. Non era nemmeno una rete di sicurezza: i check si materializzano dopo
-        // la visita, percio' un OrigIns del genere sarebbe gia' memoria liberata e il
-        // dyn_cast leggerebbe un puntatore dangling prima di poter decidere qualsiasi
-        // cosa. L'invariante da mantenere e': mai spingere un check su un'istruzione
-        // che il visitor cancella.
-        // Atomic: ARM OGGI IRRAGGIUNGIBILE, tenuto come guardia. Nessuno dei sette siti
-        // Essential=false ha un'atomica come OrigIns, e findSinkFor non ne restituisce mai una:
-        // AtomicCmpXchgInst/AtomicRMWInst non compaiono nella sua catena di dispatch, quindi
-        // cadono fino in fondo con cand == nullptr. Lo si tiene per la stessa ragione per cui il
-        // bit Essential e' default-TRUE: se domani findSinkFor imparasse a deferire su un'atomica,
-        // o un nuovo sito spingesse Essential=false su una, il check non deve poter scavalcare
-        // effetti gia' visibili agli altri thread. NB: e' un caso DIVERSO dall'arm MemIntrinsic
-        // rimosso qui sopra -- quello non era solo irraggiungibile, era PERICOLOSO (avrebbe letto
-        // un puntatore gia' liberato dal visitor).
         if (isa<AtomicCmpXchgInst>(OrigIns) || isa<AtomicRMWInst>(OrigIns))
             return true;
         return false;
@@ -1259,33 +1238,14 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     Instruction *anchorFor(Instruction *OrigIns) const {
         BasicBlock *BB = OrigIns->getParent();
         Instruction *Term = BB->getTerminator();
-        // [FIX anchor-su-OrigIns-barriera] Il ciclo sotto parte da getNextNode() e quindi NON
-        // esamina OrigIns: se OrigIns e' esso stesso una barriera il check viene ancorato DOPO di
-        // lui. Con ClSinkChecks (default true) OrigIns e' spesso la CALL che consuma il valore
-        // caricato (findSinkFor), e una call che puo' unwind / noreturn / non-willreturn E' una
-        // barriera (isBBBarrier = !isGuaranteedToTransferExecutionToSuccessor);
-        // isImmediateEssentialSink intercetta solo le call INDIRETTE (l'arm mem-intrinsic e' stato
-        // rimosso, quello sulle atomiche e' irraggiungibile), quindi
-        // una call DIRETTA resta fra i Deferrable. Nell'IR reale: `call @may_throw(v)` seguita da
-        // icmp/br + __cqmsan_warning_fast -> check DOPO il sink; con un sink noreturn il check
-        // finisce nel blocco che termina con `unreachable` = codice morto -> falso negativo certo.
-        // La prima barriera at-or-after OrigIns e' OrigIns stesso -> l'anchor deve essere OrigIns
-        // (coerente con findSinkFor/guaranteedPathHasBarrier, che il sink NON lo conta come barriera
-        // proprio perche' il check gli va davanti). Dominanza: sicuro, ogni shadow e' definito prima
-        // del proprio OrigIns. Il fix [fix ordine shadow/load] emette ora lo shadow-load DOPO la
-        // load applicativa, ma qui non cambia nulla: questo ramo scatta solo se OrigIns e' una
-        // barriera, e una LoadInst non lo e' mai (isGuaranteedToTransferExecutionToSuccessor e' vero
-        // per una load), quindi OrigIns resta un'istruzione - tipicamente la call-sink di
-        // findSinkFor - che viene dopo gli shadow del gruppo. E' inoltre lo stesso punto
-        // d'inserimento del path legacy (materializeInstructionChecks, dove checkInsertPoint()
-        // ritorna OrigIns per tutti i gruppi che non sono quelli di una load).
-        // Terminatori esclusi: per loro il return finale da' gia' Term (== OrigIns) e conserva il
-        // filtro isUnsplittableTerminator (catchswitch/cleanupret/callbr/EH pad).
+        
         if (isBBBarrier(OrigIns) && !OrigIns->isTerminator())
             return OrigIns;
+        
         for (Instruction *I = OrigIns->getNextNode(); I && I != Term; I = I->getNextNode())
             if (isBBBarrier(I))
                 return I;
+    
         return isUnsplittableTerminator(Term) ? nullptr : Term;
     }
 
@@ -1359,7 +1319,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         materializeOneCheck(IRB, Acc);
     }
 
-    // [EXP #2 multi-blocco] accumulatore-memoria per-loop (i8) + check ai loop-exit; mem2reg lo promuove a PHI.
+    // accumulatore-memoria per-loop (i8) + check ai loop-exit; mem2reg lo promuove a PHI.
     // Robusto sui loop multi-blocco: l'OR in memoria evita i problemi di dominanza degli shadow condizionali.
     void materializeCoalescedLoopChecks() {
         DominatorTree DT(F);
@@ -1367,67 +1327,36 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
         Type *I8 = EntryB.getInt8Ty();
 
-        // [FIX] Accumulo dello shadow GREZZO per (loop, tipo-shadow), 1 OR nativo per load
-        // (come MSan: niente icmp/zext-di-bool per iterazione dentro il loop caldo; l'OR raw same-width
-        // e' vettorizzabile). Il vecchio schema faceva `or(acc, zext(icmp ne shadow,0))` per load -> un
-        // icmp + una zext + un or i8 per iterazione = piu' pesante di check-at-load (di qui il +7.4%).
-        // Ora la riduzione + l'UNICO icmp sono al loop-exit. mem2reg promuove gli accumulatori a PHI SSA.
         DenseMap<std::pair<Loop *, Type *>, AllocaInst *> Acc;    // 1 accumulatore per (loop, tipo)
         MapVector<Loop *, SmallVector<AllocaInst *, 4>> AccsByLoop;
-        // [determinismo] MapVector e NON DenseMap: il fallback sotto emette un check per ogni BB
-        // di questa mappa e l'ordine di iterazione di una DenseMap dipende dall'hash del puntatore
-        // (= indirizzo dell'allocatore) -> IR diverso a ogni compilazione dello stesso TU. Stesso
-        // criterio gia' adottato per AccsByLoop qui sopra. Ordine = primo inserimento.
-        // [FIX F1-loop 2026-09-26] Fallback dei check NON accumulabili nel loop. Era indicizzato
-        // per BASIC BLOCK ed emetteva al terminatore: un check il cui OrigIns e' (o e' seguito da)
-        // una barriera finiva DOPO di essa -> falso negativo, e dopo un sink noreturn addirittura
-        // in un blocco che termina con `unreachable` (codice morto). E' lo stesso difetto F1 gia'
-        // corretto sul path BB-coalesced, che qui non era mai arrivato perche' questo path ha il
-        // proprio fallback e non passa da anchorFor(). Ora e' indicizzato per ANCHOR, esattamente
-        // come ByAnchor nel path BB-coalesced.
         MapVector<Instruction *, SmallVector<Value *, 8>> ByAnchor;   // fallback: 1 check per anchor
-        // [FIX 2026-09-09] Defer essential-sink checks: materializeOneCheck SPLITS the CFG,
-        // which invalidates LoopInfo/Loop* used below. Collect now, materialize AFTER all
-        // LoopInfo use (getLoopFor + getExitBlocks). Fixes a nondeterministic codegen crash
-        // (dangling Loop* -> stale exit blocks) seen on libxml2 with the flag on.
         SmallVector<ShadowAndInsertPoint, 16> Essential;
         DenseMap<const Loop *, bool> LoopSoundCache;   // vedi loopFlushIsSound
 
         // FASE 1: accumula lo shadow GREZZO per (loop,tipo) -- nessun cambio di CFG
         for (auto It = InstrumentationList.begin(); It != InstrumentationList.end(); ++It) {
-            // [FIX] Onora il bit Essential, esattamente come il path BB-coalesced
-            // (`C.Essential || isImmediateEssentialSink(C.OrigIns)`). Il bit e' default-TRUE in
-            // insertShadowCheck/pushShadowCheck proprio perche' ogni sito di push, presente e
-            // futuro, sia sound per costruzione; isImmediateEssentialSink e' solo la rete
-            // RIDONDANTE (un solo arm vivo: le call indirette). Da sola lasciava differire al
-            // loop-exit check marcati essenziali ma non "sink immediati": return check
-            // (visitReturnInst), eager-arg check (visitCallBase), check d'indirizzo con
-            // ClCheckAccessAddress, pointer-shadow di handleMaskedGather/Scatter.
             if (It->Essential || isImmediateEssentialSink(It->OrigIns)) {
                 Essential.push_back(*It);   // [FIX] defer (splitta il CFG)
                 continue;
             }
+
             Loop *L = LI.getLoopFor(It->OrigIns->getParent());
             Instruction *ShadowI = dyn_cast<Instruction>(It->Shadow);
             Type *T = It->Shadow->getType();
-            // idoneo: loop+preheader, shadow-istruzione DENTRO il loop (l'accumulo inserito subito
-            // dopo lo shadow e' dominato, il reset in preheader domina il body), tipo OR-abile,
-            // E il flush al loop-exit deve essere GARANTITO raggiunto (vedi loopFlushIsSound).
+            
             if (!L || !L->getLoopPreheader() || !ShadowI || !L->contains(ShadowI->getParent()) ||
                 !T->isIntOrIntVectorTy() || !loopFlushIsSound(L, LoopSoundCache)) {
-                // [FIX F1-loop] emetti all'ANCHOR, non al terminatore del BB. anchorFor da'
-                // la prima barriera at-or-after OrigIns (altrimenti il terminatore), quindi il
-                // check finisce sempre PRIMA del punto oltre il quale il controllo puo' sfuggire.
-                // nullptr = terminatore non splittabile -> rientra fra gli essenziali, come fa
-                // la FASE 1 del path BB-coalesced.
-                if (Instruction *A = anchorFor(It->OrigIns))
+                
+                    if (Instruction *A = anchorFor(It->OrigIns))
                     ByAnchor[A].push_back(It->Shadow);
                 else
                     Essential.push_back(ShadowAndInsertPoint(It->Shadow, It->OrigIns, true));
                 continue;
             }
+
             std::pair<Loop *, Type *> Key(L, T);
             AllocaInst *A = Acc.lookup(Key);
+            
             if (!A) {
                 A = EntryB.CreateAlloca(T, nullptr, "cq_loopacc");
                 EntryB.CreateStore(getCleanShadow(T), A);   // init in ENTRY: domina TUTTO -> niente
@@ -1437,13 +1366,16 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 IRBuilder<> PH(L->getLoopPreheader()->getTerminator());
                 PH.CreateStore(getCleanShadow(T), A);       // reset a ogni ingresso nel loop (freschezza)
             }
+
             // acc |= shadow GREZZO -- 1 sola op (OR nativo same-width), SUBITO DOPO lo shadow.
             BasicBlock::iterator IP = isa<PHINode>(ShadowI)
                 ? ShadowI->getParent()->getFirstInsertionPt()
                 : std::next(ShadowI->getIterator());
+            
             IRBuilder<> IRB(ShadowI->getParent(), IP);
             Value *Old = IRB.CreateLoad(T, A, "cq_acc_ld");
             IRB.CreateStore(IRB.CreateOr(Old, It->Shadow, "cq_acc_or"), A);
+        
         }
 
         // raccogli (loop, exit-block) PRIMA di mutare il CFG (LI valido qui)
@@ -1478,42 +1410,21 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             CB->addParamAttr(1, Attribute::ZExt);
         }
 
-        // [FIX 2026-09-09] BB-fallback FIRST, essential-sink checks LAST. Rationale: an essential
-        // check (e.g. an indirect call) SPLITS its block; if that runs before the BB-fallback, the
-        // fallback would OR shadows that the split moved into a new tail block and emit the check at
-        // the old block's terminator -> "instruction does not dominate all uses". Building the
-        // fallback OR while the block is still whole (all shadows present and dominated) is safe: a
-        // later split moves the OR and the later shadows together into the tail (the head still
-        // dominates). All LoopInfo use (getLoopFor + getExitBlocks) is already done above, so both
-        // loops may split freely now.
-        //
-        // fallback: 1 check per ANCHOR (come ClBBCoalescedChecks) -- PRIMA degli essenziali.
-        // [FIX F1-loop 2026-09-26] Si emette all'anchor, non al terminatore del blocco.
-        // convertToBool e non normalizeShadow: il primo e' aggregate-safe, e qui gli aggregati
-        // arrivano per costruzione (il gate di FASE 1 manda nel fallback tutto cio' che non e'
-        // isIntOrIntVectorTy). E' la stessa funzione usata da emitCoalescedCheck.
         for (auto &Entry : ByAnchor) {
             auto &Shadows = Entry.second;
+            
             if (Shadows.empty()) continue;
+            
             IRBuilder<> IRB(Entry.first);
             Value *Accd = convertToBool(Shadows[0], IRB, "_cqmscoal");
+            
             for (size_t i = 1; i < Shadows.size(); ++i)
                 Accd = IRB.CreateOr(Accd, convertToBool(Shadows[i], IRB, "_cqmscoal"), "_cqmsor");
+            
             materializeOneCheck(IRB, Accd);
+        
         }
 
-        // essential checks LAST (splittano il CFG; nessuno legge piu' gli shadow dopo di qui).
-        // [FIX] Materializzati con materializeInstructionChecks come nel path legacy e
-        // in FASE 2a del BB-coalesced, non con materializeOneCheck per entry: (a) filtra gli shadow
-        // COSTANTI -- ClCheckConstantShadow e' init(true), quindi insertShadowCheck spinge shadow
-        // costanti-zero (tipico degli eager-arg check noundef) che con materializeOneCheck diretta
-        // diventavano uno split su `i1 false` per argomento; (b) fonde in UN solo check gli entry
-        // che condividono OrigIns (piu' eager-arg sulla stessa call). Raggruppamento per run
-        // consecutivi e NON per sort: InstrumentationList tiene gia' adiacenti gli entry con lo
-        // stesso OrigIns (invariante asserita in materializeChecksLegacy) e il filtro di FASE 1
-        // preserva l'ordine relativo -- cosi' l'ordine di emissione resta quello della lista
-        // (deterministico), mentre qui non esiste il ricadere-in-Essential che nel BB-coalesced
-        // rende necessario lo stable_sort.
         for (auto I = Essential.begin(); I != Essential.end();) {
             Instruction *O = I->OrigIns;
             auto J = std::find_if(I + 1, Essential.end(),
@@ -1599,11 +1510,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // incoming undef). Se invece ogni foglia e' o uno zero costante o uno shadow gia' checkato al
     // proprio load, il check al return non puo' scattare senza che sia gia' scattato quello al load:
     // e' ridondante ed e' solo codice in piu'.
-    //
-    // Censimento che motiva il filtro (ritorni scalari con check "reale" emesso, contro quelli con
-    // foglia poison): guetzli 9 -> 0, json 4 -> 0, re2 46 -> 13, libxml2 313 -> 53. Cioe' il filtro
-    // conserva il 100% della detection e toglie l'83-100% dei check emessi al return.
-    //
     // FAIL-SAFE: qualunque foglia che non si sappia classificare fa tornare true (si checka). Stessa
     // filosofia del bit Essential, che nasce true.
     bool returnShadowMayCarryUndef(Value *S, SmallPtrSetImpl<const Value *> &Seen) const {
@@ -1613,23 +1519,25 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             return !C->isNullValue();                      // zero = pulito; non-zero = POISON
         if (CheckedLoadShadows.count(S))
             return false;                                  // gia' verificato dal check-at-load
+        
         auto *I = dyn_cast<Instruction>(S);
         if (!I) return true;
+        
         switch (I->getOpcode()) {
-        case Instruction::PHI:
-        case Instruction::Select:
-        case Instruction::Or:   case Instruction::And:  case Instruction::Xor:
-        case Instruction::ZExt: case Instruction::SExt: case Instruction::Trunc:
-        case Instruction::BitCast: case Instruction::IntToPtr: case Instruction::PtrToInt:
-        case Instruction::Shl:  case Instruction::LShr: case Instruction::AShr: {
-            // Un Select ha la condizione come operando 0: e' shadow anch'essa, quindi si ispeziona.
-            for (Value *Op : I->operands())
-                if (Op->getType()->isSized() && returnShadowMayCarryUndef(Op, Seen))
-                    return true;
-            return false;
-        }
-        default:
-            return true;                                    // sconosciuto -> fail-safe
+            case Instruction::PHI:
+            case Instruction::Select:
+            case Instruction::Or:   case Instruction::And:  case Instruction::Xor:
+            case Instruction::ZExt: case Instruction::SExt: case Instruction::Trunc:
+            case Instruction::BitCast: case Instruction::IntToPtr: case Instruction::PtrToInt:
+            case Instruction::Shl:  case Instruction::LShr: case Instruction::AShr: {
+                // Un Select ha la condizione come operando 0: e' shadow anch'essa, quindi si ispeziona.
+                for (Value *Op : I->operands())
+                    if (Op->getType()->isSized() && returnShadowMayCarryUndef(Op, Seen))
+                        return true;
+                return false;
+            }
+            default:
+                return true;                                    // sconosciuto -> fail-safe
         }
     }
 
