@@ -194,7 +194,7 @@ static cl::opt<bool> ClTrustReturn("cqmsan-trust-return",
 static cl::opt<bool> ClCheckReturns("cqmsan-check-returns",
     cl::desc("Check in the callee that the returned scalar value is initialized, instead of "
              "trusting it clean at the call site. Prototype."),
-    cl::Hidden, cl::init(false));
+    cl::Hidden, cl::init(true));
 
 static cl::opt<bool> ClUnpoisonStores("cqmsan-unpoison-stores",
     cl::desc("Opportunistic (QMSan-style) stores: mark the destination shadow clean "
@@ -901,6 +901,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     };
 
     SmallVector<ShadowAndInsertPoint, 16> InstrumentationList;
+
+    // [ClCheckReturns - filtro per provenienza] Shadow prodotti da una load APPLICATIVA per cui e'
+    // gia' stato spinto un check-at-load. Se il valore restituito deriva solo da questi, il check al
+    // return e' RIDONDANTE: il check-at-load ha gia' verificato quel dato, e il suo anchor cade
+    // sempre prima del `ret` (anchorFor: prima barriera at-or-after, altrimenti il terminatore del
+    // blocco, e un `ret` non e' mai un sink per findSinkFor). Misurato: 9/9 dei check "reali" al
+    // return su guetzli, 4/4 su json, 33/46 su re2, 257/313 su libxml2 sono di questo tipo.
+    SmallPtrSet<const Value *, 32> CheckedLoadShadows;
+
+    // Return check differiti: la decisione si prende DOPO il fixup dei PHI shadow, perche' prima i
+    // PHI non hanno ancora gli incoming e il DAG non e' ispezionabile.
+    SmallVector<std::pair<Value *, Instruction *>, 8> PendingReturnChecks;
     bool InstrumentLifetimeStart = ClHandleLifetimeIntrinsics;
     SmallSetVector<AllocaInst *, 16> AllocaSet;
     SmallVector<std::pair<IntrinsicInst *, AllocaInst *>, 16> LifetimeStartList;
@@ -1581,6 +1593,57 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     }
 
+    // [ClCheckReturns - filtro per provenienza] Il valore restituito porta informazione NUOVA solo
+    // se il suo shadow puo' avere una foglia POISON COSTANTE, cioe' una sorgente `undef` che il
+    // check-at-load non ha mai visto (il caso `int h(void){int x; return x;}`, e i PHI con un
+    // incoming undef). Se invece ogni foglia e' o uno zero costante o uno shadow gia' checkato al
+    // proprio load, il check al return non puo' scattare senza che sia gia' scattato quello al load:
+    // e' ridondante ed e' solo codice in piu'.
+    //
+    // Censimento che motiva il filtro (ritorni scalari con check "reale" emesso, contro quelli con
+    // foglia poison): guetzli 9 -> 0, json 4 -> 0, re2 46 -> 13, libxml2 313 -> 53. Cioe' il filtro
+    // conserva il 100% della detection e toglie l'83-100% dei check emessi al return.
+    //
+    // FAIL-SAFE: qualunque foglia che non si sappia classificare fa tornare true (si checka). Stessa
+    // filosofia del bit Essential, che nasce true.
+    bool returnShadowMayCarryUndef(Value *S, SmallPtrSetImpl<const Value *> &Seen) const {
+        if (!S) return true;
+        if (!Seen.insert(S).second) return false;          // ciclo di PHI: gia' in esame
+        if (auto *C = dyn_cast<Constant>(S))
+            return !C->isNullValue();                      // zero = pulito; non-zero = POISON
+        if (CheckedLoadShadows.count(S))
+            return false;                                  // gia' verificato dal check-at-load
+        auto *I = dyn_cast<Instruction>(S);
+        if (!I) return true;
+        switch (I->getOpcode()) {
+        case Instruction::PHI:
+        case Instruction::Select:
+        case Instruction::Or:   case Instruction::And:  case Instruction::Xor:
+        case Instruction::ZExt: case Instruction::SExt: case Instruction::Trunc:
+        case Instruction::BitCast: case Instruction::IntToPtr: case Instruction::PtrToInt:
+        case Instruction::Shl:  case Instruction::LShr: case Instruction::AShr: {
+            // Un Select ha la condizione come operando 0: e' shadow anch'essa, quindi si ispeziona.
+            for (Value *Op : I->operands())
+                if (Op->getType()->isSized() && returnShadowMayCarryUndef(Op, Seen))
+                    return true;
+            return false;
+        }
+        default:
+            return true;                                    // sconosciuto -> fail-safe
+        }
+    }
+
+    // Chiamata in runOnFunction DOPO il fixup dei PHI shadow: solo ora il DAG e' completo.
+    void filterPendingReturnChecks() {
+        for (auto &PR : PendingReturnChecks) {
+            Value *Shadow = getShadow(PR.first);
+            SmallPtrSet<const Value *, 32> Seen;
+            if (returnShadowMayCarryUndef(Shadow, Seen))
+                pushShadowCheck(Shadow, PR.second);         // Essential=true: al sito, come prima
+        }
+        PendingReturnChecks.clear();
+    }
+
     bool runOnFunction() {
 
         // Iterate all BBs in depth-first order and create shadow instructions
@@ -1601,6 +1664,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 PNS->addIncoming(getShadow(PN, v), PN->getIncomingBlock(v));
             }
         }
+
+        // [ClCheckReturns] Ora i PHI shadow hanno gli incoming: si puo' decidere quali return
+        // checkare davvero (vedi returnShadowMayCarryUndef).
+        filterPendingReturnChecks();
 
         VAHelper->finalizeInstrumentation();
 
@@ -2444,8 +2511,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // in runOnFunction, rimappando OrigIns. Qui si pusha sempre al load.
 #ifdef CQMSAN_FLIP_CONVENTION
             pushShadowCheck(EffectivePoisoned, &I, /*Essential=*/false);
+                CheckedLoadShadows.insert(EffectivePoisoned);   // [ClCheckReturns] provenienza: gia' checkato qui
 #else
             pushShadowCheck(EffectiveShadow, &I, /*Essential=*/false);
+                CheckedLoadShadows.insert(EffectiveShadow);   // [ClCheckReturns] provenienza: gia' checkato qui
 #endif
         }
 
@@ -3196,8 +3265,12 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // noundef, quindi la condizione originale non scatta mai).
         Type *RT = RetVal->getType();
         bool ScalarRet = RT->isIntegerTy() || RT->isPointerTy() || RT->isFloatingPointTy();
-        if (ClCheckReturns ? ScalarRet : F.hasRetAttribute(Attribute::NoUndef))
-            insertShadowCheck(RetVal, &I);
+        if (ClCheckReturns ? ScalarRet : F.hasRetAttribute(Attribute::NoUndef)) {
+            // [ClCheckReturns] NON si emette qui: il DAG dello shadow non e' ancora ispezionabile
+            // (i PHI shadow non hanno gli incoming fino a finalizeShadowPHIs). Si differisce a
+            // filterPendingReturnChecks(), chiamata in runOnFunction dopo il fixup.
+            PendingReturnChecks.push_back({RetVal, &I});
+        }
 
         // No retval-TLS store: the caller always assumes clean (ClTrustReturn=true)
 #endif
