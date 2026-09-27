@@ -813,7 +813,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // la sola post-dominanza CFG non basta perche' una call unwinding non e' modellata come exit. La
     // dominanza shadow->sink e' garantita da SSA (il sink usa un valore derivato dal load). NON propaga:
     // porta lo shadow ORIGINALE. Ritorna il sink o nullptr (fallback: check al load).
-    Instruction *findSinkFor(LoadInst *Load, PostDominatorTree &PDT) {
+    Instruction *findSinkFor(LoadInst *Load, PostDominatorTree &PDT, LoopInfo &LI) {
 
         BasicBlock *LBB = Load->getParent();    // get the basic block of the load instruction
         SmallPtrSet<Value *, 32> seen;          
@@ -876,6 +876,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 // (br/switch di loop sono blocchi caldi -> deferire li' PEGGIORA le perf).
                 if (cand && !isa<PHINode>(cand) && !cand->isTerminator()) {
                     BasicBlock *CBB = cand->getParent();
+                    // [FIX guardia-di-loop 2026-09-27] La post-dominanza garantisce che il sink sia
+                    // RAGGIUNTO, non che sia raggiunto NELLA STESSA ITERAZIONE. Su un loop, e in
+                    // particolare su uno vettorizzato, il `middle.block` post-domina il corpo e usa
+                    // direttamente valori del corpo (la riduzione non passa da un PHI LCSSA): il
+                    // check veniva deferito li' con la shadow-load indirizzata dalla GEP
+                    // loop-carried, quindi si controllava SOLO L'ULTIMA ITERAZIONE -> falso negativo.
+                    // Verificato su k1_sum a -O2: corpo del loop 8 istruzioni invece di 30, perche'
+                    // non controllava nulla. A -O1 non morde (i loop non vengono vettorizzati), ma
+                    // avvelenerebbe qualunque misura a -O2.
+                    // Regola: il sink deve stare nello STESSO loop della load (o entrambi fuori).
+                    if (LI.getLoopFor(CBB) != LI.getLoopFor(LBB))
+                        continue;
                     bool guaranteed = (CBB == LBB) ? Load->comesBefore(cand) : PDT.dominates(CBB, LBB);
                     if (guaranteed && !guaranteedPathHasBarrier(Load, cand)) return cand;
                 }
@@ -1597,11 +1609,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         // La fusione avviene per OrigIns in materialize.
         if (ClSinkChecks) {
             PostDominatorTree PDT(F);
+            // [FIX guardia-di-loop] serve a findSinkFor per non deferire un check fuori dal loop
+            // in cui vive la load (vedi il commento li').
+            DominatorTree SinkDT(F);
+            LoopInfo SinkLI(SinkDT);
 
             for (auto &C : InstrumentationList) {
                 if (C.Essential) continue;
                 if (auto *L = dyn_cast<LoadInst>(C.OrigIns))
-                    if (Instruction *S = findSinkFor(L, PDT)) C.OrigIns = S;
+                    if (Instruction *S = findSinkFor(L, PDT, SinkLI)) C.OrigIns = S;
             }
 
             // Rende consecutive le entry con lo stesso OrigIns (richiesto dal grouping di
