@@ -3,3 +3,4 @@
 original-msan/
 docs/
 src/aflpp/src/afl-fuzz-bitmap.c
+.vscode/settings.json

@@ -468,7 +468,6 @@ void cqmsan_update_map(__sanitizer::StackTrace* stack){
     uptr __cqmsan_callstack_hash = 0;
     for (uptr i = 0; i < stack->size; ++i) {
       uptr frame_pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[i]);
-      __cqmsan_callstack_hash ^= __cqmsan_callstack_hash * 31 + frame_pc; // moltiplicativo: ordine preservato
     }
 
     // ------------------------------------------------------------------------------
