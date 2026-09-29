@@ -463,11 +463,12 @@ void cqmsan_update_map(__sanitizer::StackTrace* stack){
     if (stack->size == 0)
       return;
 
-    uptr pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[0]);
+    uptr pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[0]); 
     
     uptr __cqmsan_callstack_hash = 0;
     for (uptr i = 0; i < stack->size; ++i) {
       uptr frame_pc = __sanitizer::StackTrace::GetPreviousInstructionPc(stack->trace[i]);
+      __cqmsan_callstack_hash ^= frame_pc;
     }
 
     // ------------------------------------------------------------------------------
