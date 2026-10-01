@@ -121,6 +121,35 @@ static cl::opt<bool> ClSkipNoSanitizeOnlyLoads("cqmsan-skip-nosanitize-only-load
              "instructions (MSan-equivalent dead shadow)"),
     cl::Hidden, cl::init(true));
 
+// [ClSinkPastBarriers] Rilassa il vincolo delle barriere nel differimento al sink.
+//
+// Oggi un check puo' essere spostato al sink solo se sul percorso GARANTITO load->sink
+// non c'e' nessuna barriera (una call che puo' non ritornare, fare unwind o terminare il
+// processo). Il motivo e' che se l'esecuzione non torna da quella call, una violazione
+// gia' avvenuta non verrebbe mai riportata.
+//
+// Con questa flag si accetta quella perdita. La posizione e' coerente: e' la semantica
+// di MSan, che controlla al punto d'USO e non riporta nulla se il programma esce prima --
+// e finche' il valore non e' stato usato, nessun comportamento del programma ne dipende.
+//
+// Cosa si perde davvero: una violazione su una load il cui valore non e' ancora stato
+// usato, quando l'esecuzione termina dentro la call interposta. Per un fuzzer quel caso
+// e' quasi sempre gia' catturato per altra via (il processo che non torna e' esso stesso
+// un segnale).
+static cl::opt<bool> ClSinkPastBarriers("cqmsan-sink-past-barriers",
+    cl::desc("Allow deferring a check to its sink even when a barrier (a call that may "
+             "not return) lies on the path (MSan-like semantics: report at use, not at "
+             "load). Trades the report of a not-yet-used value against longer deferral."),
+    cl::Hidden, cl::init(false));
+
+static cl::opt<bool> ClSkipCalleeOnlyLoads("cqmsan-skip-callee-only-loads",
+    cl::desc("Do not load/check shadow for loads whose value is used only as the callee "
+             "operand of a call (MSan never checks that position, so its own shadow load "
+             "there is dead). Saves ~7.7% of static shadow loads on libxml2 at the cost of "
+             "no longer reporting a call through a function pointer read from "
+             "uninitialized memory."),
+    cl::Hidden, cl::init(false));
+
 static cl::opt<bool> ClSkipAFLRuntimeAccesses("cqmsan-skip-afl-runtime-accesses",
     cl::desc("Treat loads/stores whose underlying object is AFL runtime state "
              "(@__afl_*, @__sancov_gen_*, map counters) as nosanitize"),
@@ -638,6 +667,7 @@ void CompilerQEMUMemorySanitizer::createUserspaceApi(Module &M, const TargetLibr
         } else if (ClFastWarning && ClPCOnly) {
             FunctionName = "__cqmsan_maybe_warning_fast_pconly_";
         }
+
         FunctionName += itostr(AccessSize);
 
         MaybeWarningFn[AccessSizeIndex] = M.getOrInsertFunction(
@@ -681,7 +711,7 @@ void CompilerQEMUMemorySanitizer::initializeCallbacks(Module &M, const TargetLib
 ///
 /// inserts a call to __cqmsan_init to the module's constructor list.
 void CompilerQEMUMemorySanitizer::initializeModule(Module &M) {
-    auto &DL            = M.getDataLayout();                       // wich endianness, size of types, etc.
+    auto &DL            = M.getDataLayout();                   // wich endianness, size of types, etc.
     TargetTriple        = llvm::Triple(M.getTargetTriple());   // which OS, arch, etc.
     bool ShadowPassed   = ClShadowBase.getNumOccurrences() > 0;
     
@@ -798,21 +828,24 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     Function &F;
     CompilerQEMUMemorySanitizer &CQMS;
     SmallVector<PHINode *, 16> ShadowPHINodes;
+    
     // IR <-> ShadowValue
     ValueMap<Value *, Value *> ShadowMap;
+    
     std::unique_ptr<VarArgHelper> VAHelper;
+    
     const TargetLibraryInfo *TLI;   // for recognizing libc functions
     Instruction *FnPrologueEnd;
+    
     // List of instructions to instrument in a second time (see runOnFunction)
     SmallVector<Instruction *, 16> Instructions;
 
-    // [PROTOTIPO sink-based] Cerca un SINK (sink MSan-fedeli) raggiunto dal valore di Load, su cui
-    // deferire il check in modo SOUND (single-placement). Condizione di soundness: il sink deve essere
-    // GARANTITO raggiunto quando il load esegue -> stesso BB dopo il load, oppure BB che POST-DOMINA
-    // il BB del load, E senza barriere (call unwind/noreturn) sul percorso (guaranteedPathHasBarrier):
-    // la sola post-dominanza CFG non basta perche' una call unwinding non e' modellata come exit. La
-    // dominanza shadow->sink e' garantita da SSA (il sink usa un valore derivato dal load). NON propaga:
-    // porta lo shadow ORIGINALE. Ritorna il sink o nullptr (fallback: check al load).
+    // [PROTOTIPE sink-based] 
+    // Search for a sink (MSan-like) starting from a load.
+    // Defers the check to the sink only if the synk is granted reached:
+    // same BB || post-dominant BB || no Barrier
+    // No propagation: it brings the original Shadow
+    // Return the Sink instruction
     Instruction *findSinkFor(LoadInst *Load, PostDominatorTree &PDT, LoopInfo &LI) {
 
         BasicBlock *LBB = Load->getParent();    // get the basic block of the load instruction
@@ -831,20 +864,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 
                 if      (auto *LD = dyn_cast<LoadInst>(UI))     { if (LD->getPointerOperand() == V) cand = UI; }
                 else if (auto *ST = dyn_cast<StoreInst>(UI))    { if (ST->getPointerOperand() == V) cand=UI; 
-                                                             else if (ST->getValueOperand() == V) continue; }
+                                                                  else if (ST->getValueOperand() == V) continue; }
                 else if (auto *RI = dyn_cast<ReturnInst>(UI))   { if (RI->getReturnValue() == V) cand=UI; }
                 else if (auto *BR = dyn_cast<BranchInst>(UI))   { if (BR->isConditional() && BR->getCondition() == V) cand = UI; }
                 else if (auto *SW = dyn_cast<SwitchInst>(UI))   { if (SW->getCondition() == V) cand=UI; }
                 else if (auto *BO = dyn_cast<BinaryOperator>(UI)) {
                     auto op=BO->getOpcode();
-                    if ((op==Instruction::SDiv||op==Instruction::UDiv||op==Instruction::SRem||op==Instruction::URem)&&BO->getOperand(1)==V) cand=UI;
+                    if ((op==Instruction::SDiv||op==Instruction::UDiv||op==Instruction::SRem||op==Instruction::URem) && BO->getOperand(1)==V ) cand=UI;
                     else { if (seen.insert(BO).second) wl.push_back(BO); continue; }    // div/rem: sink (div-by-zero) -> check-valore deferible at sink; 
                                                                                         // other binop are not sinks
                 }
                 else if (auto *CB = dyn_cast<CallBase>(UI)) {
-                    // sink CALL: valore usato come argomento. IR stabile (remap post-visit) -> niente dangling.
-                    // Escludi memintrinsics e le call al runtime cqmsan (non sono veri sink d'uso).
-                    // (gli InvokeInst sono terminatori -> gia' esclusi dal filtro finale.)
+                    // sink CALL: value used as argument. 
+                    // Exclude memintrinsics and the calls
                     if (isa<MemIntrinsic>(CB)) continue;
 
                     Function *Callee = CB->getCalledFunction();
@@ -860,6 +892,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                     if (isArg) cand=UI; else continue;
 
                 }
+
                 // NB: NO PHINode/SelectInst nella propagazione: sono merge control-dipendenti -> su un path
                 // che non passa dal load lo shadow di L non domina (PHI) o il valore non viene da L (select
                 // -> falso positivo). Fermarsi qui e' il fallback sound (check al load).
@@ -876,20 +909,18 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 // (br/switch di loop sono blocchi caldi -> deferire li' PEGGIORA le perf).
                 if (cand && !isa<PHINode>(cand) && !cand->isTerminator()) {
                     BasicBlock *CBB = cand->getParent();
-                    // [FIX guardia-di-loop 2026-09-27] La post-dominanza garantisce che il sink sia
-                    // RAGGIUNTO, non che sia raggiunto NELLA STESSA ITERAZIONE. Su un loop, e in
-                    // particolare su uno vettorizzato, il `middle.block` post-domina il corpo e usa
-                    // direttamente valori del corpo (la riduzione non passa da un PHI LCSSA): il
-                    // check veniva deferito li' con la shadow-load indirizzata dalla GEP
-                    // loop-carried, quindi si controllava SOLO L'ULTIMA ITERAZIONE -> falso negativo.
-                    // Verificato su k1_sum a -O2: corpo del loop 8 istruzioni invece di 30, perche'
-                    // non controllava nulla. A -O1 non morde (i loop non vengono vettorizzati), ma
-                    // avvelenerebbe qualunque misura a -O2.
-                    // Regola: il sink deve stare nello STESSO loop della load (o entrambi fuori).
+            
                     if (LI.getLoopFor(CBB) != LI.getLoopFor(LBB))
                         continue;
+                    
                     bool guaranteed = (CBB == LBB) ? Load->comesBefore(cand) : PDT.dominates(CBB, LBB);
-                    if (guaranteed && !guaranteedPathHasBarrier(Load, cand)) return cand;
+                    
+                    // [ClSinkPastBarriers] col flag attivo la barriera non blocca piu'
+                    // il differimento: si accetta di non riportare una violazione su un
+                    // valore NON ancora usato se l'esecuzione non torna dalla call.
+                    if (guaranteed &&
+                        (ClSinkPastBarriers || !guaranteedPathHasBarrier(Load, cand)))
+                        return cand;
                 }
 
             }
@@ -914,20 +945,17 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
     SmallVector<ShadowAndInsertPoint, 16> InstrumentationList;
 
-    // [ClCheckReturns - filtro per provenienza] Shadow prodotti da una load APPLICATIVA per cui e'
-    // gia' stato spinto un check-at-load. Se il valore restituito deriva solo da questi, il check al
-    // return e' RIDONDANTE: il check-at-load ha gia' verificato quel dato, e il suo anchor cade
-    // sempre prima del `ret` (anchorFor: prima barriera at-or-after, altrimenti il terminatore del
-    // blocco, e un `ret` non e' mai un sink per findSinkFor). Misurato: 9/9 dei check "reali" al
-    // return su guetzli, 4/4 su json, 33/46 su re2, 257/313 su libxml2 sono di questo tipo.
+    // Set of shadow loads already checked at load site.
     SmallPtrSet<const Value *, 32> CheckedLoadShadows;
 
-    // Return check differiti: la decisione si prende DOPO il fixup dei PHI shadow, perche' prima i
-    // PHI non hanno ancora gli incoming e il DAG non e' ispezionabile.
+    // Deferred return checks: the decision is made AFTER the fixup of the shadow PHIs, 
+    // because before that the PHIs do not yet have the incoming and the DAG is not inspectable.
     SmallVector<std::pair<Value *, Instruction *>, 8> PendingReturnChecks;
+
     bool InstrumentLifetimeStart = ClHandleLifetimeIntrinsics;
     SmallSetVector<AllocaInst *, 16> AllocaSet;
     SmallVector<std::pair<IntrinsicInst *, AllocaInst *>, 16> LifetimeStartList;
+    
     // For instrument the store in a second time
     SmallVector<StoreInst *, 16> StoreList;
     int64_t SplittableBlocksCount = 0;
@@ -1215,29 +1243,6 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         return false;
     }
 
-    bool loopFlushIsSound(const Loop *L, DenseMap<const Loop *, bool> &Cache) const {
-        auto It = Cache.find(L);
-        if (It != Cache.end())
-            return It->second;
-        bool Sound = true;
-        SmallVector<BasicBlock *, 4> Exits;
-        L->getExitBlocks(Exits);
-        if (Exits.empty())
-            Sound = false;                                            // (1)
-        for (BasicBlock *E : Exits)
-            if (E->isEHPad() || E->getFirstInsertionPt() == E->end()) {
-                Sound = false; break;                                 // (2) -- stesso filtro della FASE 2
-            }
-        if (Sound)
-            for (const BasicBlock *B : L->blocks()) {                 // (3)
-                for (const Instruction &I : *B)
-                    if (isBBBarrier(&I)) { Sound = false; break; }
-                if (!Sound) break;
-            }
-        Cache[L] = Sound;
-        return Sound;
-    }
-
     // terminatori davanti ai quali non possiamo splittare/inserire in sicurezza
     static bool isUnsplittableTerminator(const Instruction *T) {
         return isa<CatchSwitchInst>(T) || isa<CleanupReturnInst>(T) ||
@@ -1331,6 +1336,29 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         materializeOneCheck(IRB, Acc);
     }
 
+    bool loopFlushIsSound(const Loop *L, DenseMap<const Loop *, bool> &Cache) const {
+        auto It = Cache.find(L);
+        if (It != Cache.end())
+            return It->second;
+        bool Sound = true;
+        SmallVector<BasicBlock *, 4> Exits;
+        L->getExitBlocks(Exits);
+        if (Exits.empty())
+            Sound = false;                                            // (1)
+        for (BasicBlock *E : Exits)
+            if (E->isEHPad() || E->getFirstInsertionPt() == E->end()) {
+                Sound = false; break;                                 // (2) -- stesso filtro della FASE 2
+            }
+        if (Sound)
+            for (const BasicBlock *B : L->blocks()) {                 // (3)
+                for (const Instruction &I : *B)
+                    if (isBBBarrier(&I)) { Sound = false; break; }
+                if (!Sound) break;
+            }
+        Cache[L] = Sound;
+        return Sound;
+    }
+    
     // accumulatore-memoria per-loop (i8) + check ai loop-exit; mem2reg lo promuove a PHI.
     // Robusto sui loop multi-blocco: l'OR in memoria evita i problemi di dominanza degli shadow condizionali.
     void materializeCoalescedLoopChecks() {
@@ -1416,10 +1444,25 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
                 Value *B = normalizeShadow(EB, V);          // reduce (se vettore) + icmp -> i1, UNA volta
                 Comb = Comb ? EB.CreateOr(Comb, B) : B;
             }
-            Value *C8 = EB.CreateZExt(Comb, I8);
-            CallBase *CB = EB.CreateCall(CQMS.MaybeWarningFn[0], {C8, EB.getInt32(0)});
-            CB->addParamAttr(0, Attribute::ZExt);
-            CB->addParamAttr(1, Attribute::ZExt);
+            // [2026-09-30] Branch GUARDATO invece di chiamata incondizionata.
+            //
+            // Prima: si emetteva una CallBase a MaybeWarningFn[0] a ogni uscita dal loop,
+            // passando il flag e lasciando al gestore la decisione. Due costi, entrambi
+            // per-uscita e non per-firing:
+            //   - la chiamata e' INCONDIZIONATA, quindi si esegue sempre, mentre il
+            //     check-at-load la mette dentro un blocco guardato da un branch annotato
+            //     1048575:1 non-preso che in pratica non si esegue mai;
+            //   - MaybeWarningFn NON e' preserve_allcc (lo e' invece __cqmsan_warning_fast),
+            //     quindi il chiamante deve salvare e ripristinare i registri caller-saved
+            //     a ogni uscita dal loop.
+            // Il guadagno del coalescing e' per-ITERAZIONE (un'istruzione in meno), il costo
+            // era per-USCITA: su loop corti il secondo domina, ed e' la spiegazione del
+            // +5.8% misurato su libxml2. Qui si usa la stessa forma del check-at-load:
+            // branch freddo + chiamata preserve_allcc nel ramo che non si prende.
+            Instruction *ExitTerm = SplitBlockAndInsertIfThen(
+                Comb, &*EB.GetInsertPoint(), /*Unreachable=*/false, CQMS.ColdCallWeights);
+            IRBuilder<> WB(ExitTerm);
+            insertWarningFn(WB);
         }
 
         for (auto &Entry : ByAnchor) {
@@ -2270,6 +2313,37 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// nothing. Any other consumer (store of the value, call, ret, br/switch, a memory op that
     /// uses it as address, ...) could observe the shadow under MSan too -> false. Bounded
     /// worklist; anything unusual answers false (conservative = keep the check).
+
+    /// [ClSkipCalleeOnlyLoads] True if every use of V is the *callee* operand of a call
+    /// or invoke -- i.e. the value is only ever jumped to, never inspected.
+    ///
+    /// Why this is the right set to consider. MSan does not treat the callee operand as a
+    /// sink: it writes the shadow of call ARGUMENTS into the param TLS but never inspects
+    /// the destination. The shadow load it emits for such a value therefore has no consumer
+    /// and its own post-instrumentation cleanup deletes it -- measured at 1260 of the 1849
+    /// application-side shadow loads the cleanup removes on libxml2. CQMSan, checking at the
+    /// load, keeps them: that is where a large part of its excess over MSan on application
+    /// code comes from.
+    ///
+    /// What is given up by skipping them. Exactly one class: a call made through a function
+    /// pointer read from uninitialized memory. That class is NOT lost in general -- if the
+    /// stale bytes are not a valid code address the jump faults and the fuzzer records a
+    /// crash -- but it IS lost silently when they happen to be one, which is the realistic
+    /// case for a reused stack slot.
+    ///
+    /// Deliberately conservative: uses are not followed through casts or phis, so a pointer
+    /// that reaches a call indirectly still gets instrumented.
+    static bool onlyFeedsCallee(const Value *V) {
+        if (V->use_empty())
+            return false;                       // nothing to save: leave the normal path
+        for (const Use &U : V->uses()) {
+            const auto *CB = dyn_cast<CallBase>(U.getUser());
+            if (!CB || !CB->isCallee(&U))
+                return false;
+        }
+        return true;
+    }
+
     static bool onlyFeedsNoSanitize(const Value *V) {
         SmallVector<const Instruction *, 32> Work;
         SmallPtrSet<const Instruction *, 32> Seen;
@@ -2344,24 +2418,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             return;
         }
 
-        // [fix ordine shadow/load] Lo shadow load va emesso DOPO la load applicativa (e' quello
-        // che fa MSan con NextNodeIRBuilder). Con l'ordine invertito, per un puntatore nullo o
-        // selvaggio CQMSan toccava `addr ^ 0x500000000000` PRIMA dell'accesso del programma:
-        //  - addr == 0: la pagina shadow e' mappata, quindi si poteva riportare un UMR spurio
-        //    prima del SIGSEGV vero;
-        //  - puntatore garbage: il processo faultava a un indirizzo di SHADOW e il crash che AFL
-        //    registra puntava nella regione shadow invece che all'indirizzo applicativo.
-        // Il check-valore segue lo shadow: vedi checkInsertPoint() (senza quello si violerebbe la
-        // dominanza SSA, perche' il check e' materializzato sul sito OrigIns = la load stessa).
-        //
-        // Due carve-out in cui si tiene l'ordine inverso (shadow PRIMA della load):
-        //  1) terminatore non splittabile (catchswitch/cleanupret/catchret/callbr/EH pad): li'
-        //     anchorFor() ritorna nullptr, il check ricade su materializeInstructionChecks e
-        //     l'unico punto utile dopo lo shadow load sarebbe proprio quel terminatore, che
-        //     materializeOneCheck non puo' splittare;
-        //  2) CQMSAN_FLIP_CONVENTION: lo slow-path splitta il blocco proprio qui, lo shadow
-        //     effettivo diventa una PHI del blocco di coda mentre OrigIns (&I) resterebbe nella
-        //     testa, e il check al load non lo dominerebbe piu'.
+        // [ClSkipCalleeOnlyLoads] The value is only ever used as the destination of a call.
+        // MSan does not check that position either, so this aligns the instrumentation with
+        // MSan's at the cost of the class documented on onlyFeedsCallee(). OFF by default:
+        // it trades detection for instrumentation volume, so it is an ablation, not a
+        // default. (Address check kept if enabled.)
+        if (ClSkipCalleeOnlyLoads && onlyFeedsCallee(&I)) {
+            LLVM_DEBUG(dbgs() << "Load feeds only a callee operand, no shadow/check: " << I << "\n");
+            setShadow(&I, getCleanShadow(&I));
+            if (ClCheckAccessAddress)
+                insertShadowCheck(I.getPointerOperand(), &I);
+            return;
+        }
+
 #ifdef CQMSAN_FLIP_CONVENTION
         const bool ShadowAfterLoad = false;
 #else
@@ -2381,26 +2450,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         Value *EffectiveShadow = LoadedShadow;
 
 #ifdef CQMSAN_FLIP_CONVENTION
-        // [FLIP experiment, fast/slow path] Under 0=uninit, a never-explicitly-
-        // written global (loader-initialized .data/.bss) has virgin
-        // shadow=0=poisoned by default, which is wrong (the loader DID
-        // initialize it) — the "globals become FP-prone" problem documented in
-        // STUDIO_unpoison_punti_e_costo.md §9-bis. Mirrors QMSan's own fix
-        // (msan_giovese_add_mmap/check_addr_mmap_list, verified in
-        // qemu/linux-user/elfload.c): a runtime range-list of loader-mapped
-        // segments, consulted here to override the shadow to clean for
-        // addresses inside a known-initialized range, WITHOUT ever writing
-        // shadow bytes for that region.
-        //
-        // Unlike the first version of this experiment, the range-list call is
-        // NOT made unconditionally on every load. QMSan's own equivalent check
-        // (msan-giovese-inl.h) is short-circuited: `((~res & MSAN_8)!=0) &&
-        // msan_giovese_check_addr(ptr)` — the expensive list walk runs only
-        // when the raw shadow already looks poisoned, to disambiguate a real
-        // bug from a loader-initialized false alarm. Mirrored here as a real
-        // fast/slow basic-block split: for the overwhelming majority of loads
-        // (genuinely defined memory, RawPoisoned=false), __cqmsan_is_static_range
-        // never runs at all.
+        
         Value *RawPoisoned = convertToBool(LoadedShadow, IRB, "_cqmsrawpoison");
         BasicBlock *FastBB = IRB.GetInsertBlock();
         Instruction *SlowTerm = SplitBlockAndInsertIfThen(
