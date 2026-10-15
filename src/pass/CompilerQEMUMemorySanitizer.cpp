@@ -2235,26 +2235,30 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // [ClSkipAFLRuntimeAccesses] / [ClSkipNoSanitizeOnlyLoads] helpers
     // ------------------------------------------------------------------------------------
 
+    // START - AFL runtime handling
+
     /// Strip inttoptr / ptrtoint / add-constant wrappers (instructions or constant
-    /// expressions) that AFL PCGUARD uses to address its guard array:
+    /// expressions) that AFL PCGUARD uses to address its guard array, i.e.:
     ///   inttoptr (add (ptrtoint @__sancov_gen_ to i64), 8) to ptr
+    /// thus extract the global variable @__sancov_gen_
     static const Value *stripIntPtrArithmetic(const Value *V) {
         for (unsigned Depth = 0; Depth < 8; ++Depth) {
             const auto *Op = dyn_cast<Operator>(V);
             if (!Op) return V;
+
             switch (Op->getOpcode()) {
-            case Instruction::IntToPtr:
-            case Instruction::PtrToInt:
-            case Instruction::BitCast:
-            case Instruction::AddrSpaceCast:
-                V = Op->getOperand(0);
-                continue;
-            case Instruction::Add:
-                if (isa<ConstantInt>(Op->getOperand(1))) { V = Op->getOperand(0); continue; }
-                if (isa<ConstantInt>(Op->getOperand(0))) { V = Op->getOperand(1); continue; }
-                return V;
-            default:
-                return V;
+                case Instruction::IntToPtr:
+                case Instruction::PtrToInt:
+                case Instruction::BitCast:
+                case Instruction::AddrSpaceCast:
+                    V = Op->getOperand(0);
+                    continue;
+                case Instruction::Add:
+                    if (isa<ConstantInt>(Op->getOperand(1))) { V = Op->getOperand(0); continue; }
+                    if (isa<ConstantInt>(Op->getOperand(0))) { V = Op->getOperand(1); continue; }
+                    return V;
+                default:
+                    return V;
             }
         }
         return V;
@@ -2268,6 +2272,7 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     static bool isAFLRuntimePointer(const Value *Ptr) {
         SmallVector<const Value *, 4> Objs;
         
+        // get the underlying objects of Ptr, up to a maximum depth of 6, and store them in Objs.
         getUnderlyingObjects(Ptr, Objs, /*LI=*/nullptr, /*MaxLookup=*/6);
         if (Objs.empty()) return false;
 
@@ -2296,12 +2301,15 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     /// Load/store/atomicrmw whose address is AFL runtime state (see ClSkipAFLRuntimeAccesses).
     static bool isAFLRuntimeAccess(const Instruction &I) {
         if (!ClSkipAFLRuntimeAccesses) return false;
-        if (const auto *LI  = dyn_cast<LoadInst>(&I))   return isAFLRuntimePointer(LI->getPointerOperand());
-        if (const auto *SI  = dyn_cast<StoreInst>(&I))  return isAFLRuntimePointer(SI->getPointerOperand());
+
+        if (const auto *LI  = dyn_cast<LoadInst>(&I))      return isAFLRuntimePointer(LI->getPointerOperand());
+        if (const auto *SI  = dyn_cast<StoreInst>(&I))     return isAFLRuntimePointer(SI->getPointerOperand());
         if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I)) return isAFLRuntimePointer(RMW->getPointerOperand());
 
         return false;
     }
+
+    // END - AFL runtime handling
 
     /// nosanitize, either explicitly (metadata) or by AFL-runtime recognition.
     static bool isNoSanitizeEquivalent(const Instruction &I) {

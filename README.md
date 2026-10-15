@@ -1,92 +1,121 @@
-# Compile-level QMSan
+# CQMSan: a compiler-level opportunistic sanitizer
 
-CQMSan brings QMSan's _**opportunistic**_ UMR-detection strategy from the **binary level (QEMU)** down to the **compile level (LLVM)**. Instead of fully propagating shadow state like MemorySanitizer, it performs a cheap **check at each load** ("is the valude I just loaded coming from uninitialized memory?") and turns UMR events into **extra coverage feedback** for the fuzzer.
+CQMSan detects **uses of uninitialised memory (UUM)** in programs under fuzzing. It is a compiler-level **opportunistic** detector: instead of propagating shadow state through every computation, as MemorySanitizer does, it checks the shadow **at every load**, reports what it finds to the fuzzer, and lets the program continue. Candidate violations are then confirmed by a binary-level **accurate detector** (Valgrind Memcheck), so no false alarm reaches the user and libraries that were not recompiled remain supported.
 
-|       | Level | Model | Completeness |
-|  ---  |  ---  |  ---  |      ---     |
-|**[MemorySanitizer (MSan)][msan]** | compile | propagates shadow, checks at _sinks_ | precise (oracle) |
-|**[QMSan][qmsan]**| binary (QEMU) | opportunistic, checks at loads | incomplete by design |
-| **CQMSan** (this) | compile | opportunistic, checks at loads | inclomplete by design |
+The design follows the two-tier, opportunistic approach that [QMSan][qmsan] introduced at the binary level, and realises it inside the compiler (LLVM 19).
+
+|                                | Level         | Model                                              |
+| ------------------------------ | ------------- | -------------------------------------------------- |
+| [MemorySanitizer (MSan)][msan] | compiler      | propagates shadow, checks at sinks                 |
+| [QMSan][qmsan]                 | binary (QEMU) | opportunistic, checks at loads + accurate detector |
+| **CQMSan** (this repository)   | compiler      | opportunistic, checks at loads + accurate detector |
 
 ## How it works
 
-- **LLVM pass** (`CompilerQEMUMemorySAnitizer`, LLVM 19): registered at the end of the optimization pipeline (`OptimizerLast`), faithfully replicating MSan's upstream sanitizer scheduling and post-instrumentation cleanup. For every load it inserts a shadow load and a check; loads that can be _statically proven initialized_ are elided.
-- **Runtime** (`libcqmsan_rt`, derived from compiler-rt): on a UMR it writes UMR-derived signals into the AFL++ shared bitmap: _error site_, _pc-edge_, _callstack hash_, and _callstack-edge_. So the fuzzer is guided toward new uninitialized-use contexts, not just new code edges.
-- **Two-tier detection** (as in QMSan): a fast **_opportunistic_** detector during fuzzing plus an **_accurate detector_** (Valgrind - a precise propagating oracle) to verify candidates and filter false positives.
-- Designed to run under a **custom AFL++ (AFL-QMSan)** fork-server.
+- **Opportunistic detector, compiled in.** An LLVM pass (`CompilerQEMUMemorySanitizer`, LLVM 19), registered at the end of the optimisation pipeline. It keeps a byte-granular shadow of memory: a store marks its destination initialised, the allocator and the stack instrumentation mark new memory uninitialised, and every load checks the shadow of the bytes it reads. Computed values carry no shadow, so the cost is a fixed amount of work per memory access.
+- **Run-time library** (`libcqmsan_rt`, derived from MSan's compiler-rt runtime). On a violation it records the site, and its calling context, in the map shared with AFL++, and returns: the program keeps running and the fuzzer sees the violation as feedback.
+- **Accurate detector, on the binary.** The fuzzer re-runs an input under Valgrind Memcheck only when it exhibits a violation it has not seen before, and only once per violation. Memcheck runs on an uninstrumented build of the target, so it also sees libraries that were not recompiled; only violations it confirms are reported.
+- **Fuzzer.** A patched [AFL-QMSan][aflqmsan] (AFL++ 4.10c) drives both detectors.
 
-## Build & usage
+By checking at the load, CQMSan also reports a call through a function pointer that was never written, a position MSan does not check.
 
-Build the toolchain (LLVM 19 pass + runtime + instrumented targets):
-```bash
-# 1) base images (AFL++/AFL-QMSan, then the CQMSan pass + runtime)
-docker build -t base-aflpp dockers/base-images/base-aflpp
-docker build -t base-cqmsan dockers/base-images/base-cqmsan
+## Results
 
-# 2) an instrumented fuzz target
-docker build -t <target>_cqmsan dockers/targets/<target>_cqmsan
-```
-Instrument your own target with the pass and link the runtime:
+From the evaluation in the thesis: 24-hour campaigns, 5 trials, on the eight programs of Google's fuzzer test suite used by QMSan (c-ares, guetzli, json, libxml2, openssl, pcre2, re2, woff2), against MSan with the same compiler, flags, harness and fuzzer.
 
-[TOOD] Case if you are testing a library with make etc..
-
-```bash
-clang -O1 -fno-ommit-frame-pointer \
-      -fpass-plugin=<path>/libCompilerQEMUMemorySanitizer.so \
-      your_target.c -o your_target \
-      -L<path>/cqmsan-rt/build -l:libcqmsan_rt.a
-```
-
-Then fuzz with the AFL-QMSan fork-server (keep-going, no shadow propagation):
-```bash
-$AFL/afl-fuzz -m none -i ./in -o ./out -- ./your_target @@
-```
-
-## Configuration
-
-Runtime (`CQMSAN_OPTIONS`, e.g. `symbolize=0`), and pass options ('cl:opt'):
-
-| Option | Default | Meaning |
-|  ----  | ------- | ------- |
-|`cqmsan-fast-warning`         | `true` | bitmap-only warning handler for campaigns (skips symbolize/printf)| 
-|`cqmsan-check-access-address` | `false` | also check the *pointer* shadow on load/store (MSan-upstream default)|
-|`cqmsan-instrument-loads`     | `true` | when `false`, loads are left untouched - **upper-bound ablation** |
-|`cqmsan-check-load`           | `true` | when `false`, load shadow but emit no check |
-|`cqmsan-keep-going`           |   -    | continue after an error (default opportunistic mode) |
-
-## Research context & findings [TODO]
-CQMSan was built to ask: **does QMSan's opportunistic approach still pay off once moved to the compile level?**
-The answer this project documents is:
-- On C targets CQMSan _reaches parity_ with MSan, but **does not surpass it** - there is a structural **structural ceiling**.
-- The reason: CQMSan's per-load check is a **side-effecting** operation (it reports), so the optimizer _cannot remove it_, even for dead loads. MSan's shadow is **side_effect-free SSA**, so dead/redundant shadow work is removed by **DCE/CSE** for free. At compile level MSan thus gets propagation *cheaply* and is also *more complete*.
-- The opportunistic trade-off is worthwile **at the binary level** (QMSan, where full propagation under emulation is prohibitiveli expensive), but **not at the compile level**.
-
-This makes CQMSan primarly a _**research artifact**_ that explains *why* the compile-level opportunistic design hits a ceiling - not a drop-in faster alternative to MSan.
+- **Detection:** at parity with MSan, with no false positive reaching the user.
+- **Coverage:** essentially the same code explored, measured on a common uninstrumented binary; where the two differ, CQMSan reaches more edges.
+- **Throughput:** that of MSan (geometric mean 0.98), while supporting libraries that were not recompiled.
 
 ## Repository layout
 
 ```
-TODO
+src/
+  pass/      LLVM 19 pass plugin (CompilerQEMUMemorySanitizer.{h,cpp})
+  rt/        run-time library: cqmsan/ (CQMSan runtime), sanitizer_common/, interception/
+  aflpp/     patched files for AFL-QMSan (commit d252acf05b6a7414235897a809ae007a3ba24b54)
+LICENSE
+THIRD_PARTY_NOTICES.md
 ```
 
-## Credits & licensing
-- The pass and runtime are _derived from LLVM's MemorySanitizer / compiler-rt_; most files retain their `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception` headers.
-- A small set of _AFL++ / [AFL-QMSan][aflqmsan]_ core files is vendored _with modifications_ (Apache-2.0)
-- The fuzzing-feedback design follows _[QMSan][qmsan]_ (Heinzeen) - **_Marini et al._, "QMSan", NDSS 2025**.
-- **QMSan / AFL-QMSan / QEMU / Valgrind are NOT redistributed here** - they are cloned at build time, so no GPL-2.0 code is shipped in this repo.
+## Build
 
-**License** **Apache License 2.0 WITH LLVM-exception** - see [`LICENSE`](LICENSE).
-Attribution and provenance of all third-party code: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Requirements: LLVM/Clang 19, CMake, Valgrind, and ahec ckout of [AFL-QMSan][aflqmsan].
 
-[aflqmsan]: https://github.com/Heinzeen/AFL-QMSan
+1. **Fuzzer.** Clone AFL-QMSan at commit `d252acf05b6a7414235897a809ae007a3ba24b54`, copy the files of `src/aflpp/` over it (same relative paths), and build:
+   ```bash
+   CFLAGS="-DQMSAN -DQMSAN_FILTERING -DQMSAN_CALLSTACK_EDGES -DQMSAN_CALLSTACK -DQMSAN_EDGES" make clean all
+   ```
+2. **Pass.** Build `src/pass/` as an out-of-tree LLVM 19 pass plugin; it produces `libCompilerQEMUMemorySanitizer.so`.
+3. **Run-time library.** Build the sources of `src/rt/` (`cqmsan/`, `sanitizer_common/`, `interception/`) as a static library, `libcqmsan_rt.a`, with `-O3 -fPIC -fno-rtti -fno-exceptions`. Defining `CQMSAN_GLIBC_ALLOC` replaces the sanitizer allocator with a thin layer over glibc's.
+
+## Usage
+
+Compile the target with AFL++'s compiler wrapper, load the pass, and link the runtime:
+
+```bash
+export CC=$AFL/afl-clang-fast CXX=$AFL/afl-clang-fast++
+export CFLAGS="-O1 -g -fPIE -pie -fno-omit-frame-pointer \
+               -fpass-plugin=<path>/libCompilerQEMUMemorySanitizer.so"
+export CXXFLAGS="$CFLAGS"
+export LDFLAGS="-L<path-to-runtime>"
+export LIBS="-l:libcqmsan_rt.a -lm -lpthread -ldl -lrt -lstdc++"
+# then build the target as usual (./configure && make, cmake, ...)
+```
+
+Build the same target a second time **without** the pass and the runtime: this is the binary the accurate detector runs under Valgrind. Then fuzz:
+
+```bash
+export CQMSAN_OPTIONS="symbolize=0"
+export AFL_CQMSAN_ACCURATE_TARGET=<path-to-uninstrumented-binary>
+$AFL/afl-fuzz -m none -i ./in -o ./out -- ./target_cqmsan @@
+```
+
+Code that must not be instrumented, such as the harness's `main` and input handling, can be listed in a file named by `CQMSAN_IGNORELIST`, read by the pass at compile time (same syntax as a sanitizer ignorelist).
+
+## Configuration
+
+Run-time options are passed through `CQMSAN_OPTIONS` (for example `symbolize=0`). Pass options are LLVM `cl::opt`s, given with `-mllvm -<option>=<value>`. The main ones:
+
+| Option | Default | Meaning |
+| ------ | ------- | ------- |
+| `cqmsan-keep-going` | `true` | continue after reporting a violation (the opportunistic mode) |
+| `cqmsan-fast-warning` | `true` | report handler that only updates the fuzzer's map (no printing, no symbolisation); turn off for debugging |
+| `cqmsan-unpoison-stores` | `true` | a store marks its destination initialised |
+| `cqmsan-check-returns` | `true` | check in the callee that a returned scalar is initialised |
+| `cqmsan-bb-coalesced-checks` | `true` | merge the checks of a basic block |
+| `cqmsan-sink-checks` | `true` | move a load's check down to the first use that matters, fusing checks |
+| `cqmsan-skip-afl-runtime-accesses` | `true` | do not instrument accesses to AFL++'s own state (coverage map, guards) |
+| `cqmsan-check-access-address` | `false` | also check the shadow of the pointer used by a load or store |
+| `cqmsan-poison-stack` | `true` | mark new stack variables uninitialised |
+| `cqmsan-instrument-loads` / `-stores` | `true` | ablation switches: `false` leaves loads / stores uninstrumented |
+| `cqmsan-check-loads` | `true` | ablation switch: `false` loads the shadow but emits no check |
+
+The full list, with descriptions, is at the top of `src/pass/CompilerQEMUMemorySanitizer.cpp`.
+
+## Credits and licensing
+
+- The pass and the run-time library are **derived from LLVM's MemorySanitizer and compiler-rt**; most files keep their `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception` headers.
+- A small set of **AFL++ / [AFL-QMSan][aflqmsan]** files is included with modifications (Apache-2.0).
+- The two-tier design and the fuzzer feedback follow **QMSan**: M. Marini, D. C. D'Elia, M. Payer, L. Querzoni, *"QMSan: Efficiently Detecting Uninitialized Memory Errors During Fuzzing"*, NDSS 2025.
+- **QMSan, AFL-QMSan, QEMU and Valgrind are not redistributed here**: they are obtained separately, so no GPL-2.0 code is shipped in this repository.
+
+**License:** Apache License 2.0 WITH LLVM-exception, see [`LICENSE`](LICENSE). Attribution and provenance of all third-party code: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Citation
 
-If you use CQMSan, please cite this:
+CQMSan was developed for the master's thesis below (Sapienza University of Rome, MSc in Cybersecurity).
+
 ```bibtex
-[TODO]
+@mastersthesis{concutelli2026cqmsan,
+  author = {Matteo Concutelli},
+  title  = {Compatibility and Efficiency Trade-offs in Detecting {UUM} Bugs: A Compiler-assisted Approach},
+  school = {Sapienza University of Rome},
+  year   = {2026},
+  note   = {Advisor: Prof. Daniele Cono D'Elia; co-advisor: Dr. Matteo Marini}
+}
 ```
 
-[msan]: https://github.com/google/sanitizers/wiki/memorysanitizer
+[msan]: https://clang.llvm.org/docs/MemorySanitizer.html
 [qmsan]: https://github.com/Heinzeen/QMSan
-
+[aflqmsan]: https://github.com/Heinzeen/AFL-QMSan
