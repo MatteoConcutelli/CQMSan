@@ -159,8 +159,10 @@ struct AP64 {
 };
 using PrimaryAllocator = SizeClassAllocator64<AP64>;
 #endif
+
 using Allocator = CombinedAllocator<PrimaryAllocator>;
 using AllocatorCache = Allocator::AllocatorCache;
+
 }  // namespace __cqmsan
 
 static Allocator allocator;

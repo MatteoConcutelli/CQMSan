@@ -332,6 +332,27 @@ cl::desc(
     "inline checks (-1 means never use callbacks)."),
 cl::Hidden, cl::init(3500));
 
+// [ClUndefSlice] Values that never pass through memory but can be undefined on some path.
+//
+// mem2reg/SROA turn a local left uninitialised on some path into a PHI (or, after SimplifyCFG,
+// a select) with an `undef` incoming. No load ever sees that value, so check-at-load cannot
+// report it, and before this flag only the PHI kept a shadow and only a `ret` checked it:
+// the value was lost as soon as it went through a select, an arithmetic op or a compare, and
+// a branch, a noundef argument, an address or a store never looked at it.
+//
+// The flag computes, per function, the forward slice of the values that depend on such an
+// `undef` (seeds: scalar PHI/select with an undef operand), and only for those values:
+//   - propagates the shadow (select: chosen arm; anything else: OR of the operands, as MSan's
+//     default; operands outside the slice count as clean, loads were checked at their load);
+//   - checks it at the sinks: branch/switch condition, noundef call argument, load/store
+//     address (return was already checked by ClCheckReturns);
+//   - lets a store write it into memory instead of clean, so the next load reports it.
+// Outside the slice nothing changes: same IR as without the flag.
+static cl::opt<bool> ClUndefSlice("cqmsan-undef-slice",
+    cl::desc("Propagate and check shadow along the slice of values that depend on an undef "
+             "PHI/select incoming (register-only uninitialised locals)."),
+    cl::Hidden, cl::init(true));
+
 // Reduce possible false negatives when true, avoiding the skip of costant shadow values
 static cl::opt<bool> ClCheckConstantShadow("cqmsan-check-constant-shadow",
     cl::desc("Insert checks for constant shadow values"),
@@ -952,6 +973,9 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
     // because before that the PHIs do not yet have the incoming and the DAG is not inspectable.
     SmallVector<std::pair<Value *, Instruction *>, 8> PendingReturnChecks;
 
+    // [ClUndefSlice] Values of the original IR that may carry an undef the loads never see.
+    SmallPtrSet<const Value *, 16> UndefSlice;
+
     bool InstrumentLifetimeStart = ClHandleLifetimeIntrinsics;
     SmallSetVector<AllocaInst *, 16> AllocaSet;
     SmallVector<std::pair<IntrinsicInst *, AllocaInst *>, 16> LifetimeStartList;
@@ -1029,6 +1053,10 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
             // [ClUnpoisonStores] opportunistic QMSan-style store: write clean shadow
             // unconditionally (mark init) instead of propagating getShadow(Val).
             Value *Shadow = (ClUnpoisonStores || SI->isAtomic()) ? getCleanShadow(Val) : getShadow(Val);
+            // [ClUndefSlice] a value that may be an undef no load has seen goes to memory with
+            // its shadow, so the next load of it reports it instead of finding it clean.
+            if (ClUnpoisonStores && !SI->isAtomic() && UndefSlice.count(Val))
+                Shadow = getShadow(Val);
             
             Type *ShadowTy = Shadow->getType();
             const Align Alignment = SI->getAlign();
@@ -1607,6 +1635,113 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
         PendingReturnChecks.clear();
     }
 
+    // ------------------------------------------------------------------------------------
+    // [ClUndefSlice] helpers
+    // ------------------------------------------------------------------------------------
+
+    static bool isUndefSliceScalar(Type *T) {
+        return T->isIntegerTy() || T->isPointerTy() || T->isFloatingPointTy();
+    }
+
+    /// Instructions whose shadow is computed by handleUndefSliceInst when they are in the slice.
+    /// PHIs are not here: visitPHINode already merges the incoming shadows.
+    bool isUndefSliceTransfer(Instruction &I) const {
+        if (!UndefSlice.count(&I)) return false;
+        return isa<BinaryOperator>(I) || isa<UnaryOperator>(I) || isa<CastInst>(I) ||
+               isa<CmpInst>(I) || isa<SelectInst>(I) || isa<GetElementPtrInst>(I);
+    }
+
+    /// Forward slice, on the original IR, from the scalar PHIs/selects with an undef operand.
+    /// freeze stops it (its result is defined by construction).
+    void computeUndefSlice() {
+        SmallVector<Instruction *, 16> Work;
+        for (Instruction *I : Instructions) {
+            if (!isUndefSliceScalar(I->getType())) continue;
+            bool Seed = false;
+            if (auto *PN = dyn_cast<PHINode>(I))
+                Seed = any_of(PN->incoming_values(), [](Value *V) { return isa<UndefValue>(V); });
+            else if (auto *SI = dyn_cast<SelectInst>(I))
+                Seed = isa<UndefValue>(SI->getTrueValue()) || isa<UndefValue>(SI->getFalseValue());
+            if (Seed && UndefSlice.insert(I).second)
+                Work.push_back(I);
+        }
+        while (!Work.empty()) {
+            Instruction *V = Work.pop_back_val();
+            for (User *U : V->users()) {
+                auto *UI = dyn_cast<Instruction>(U);
+                if (!UI || UI->getMetadata(LLVMContext::MD_nosanitize)) continue;
+                bool Transfer = isa<PHINode>(UI) || isa<BinaryOperator>(UI) ||
+                                isa<UnaryOperator>(UI) || isa<CastInst>(UI) || isa<CmpInst>(UI) ||
+                                isa<SelectInst>(UI) || isa<GetElementPtrInst>(UI);
+                if (Transfer && isUndefSliceScalar(UI->getType()) && UndefSlice.insert(UI).second)
+                    Work.push_back(UI);
+            }
+        }
+    }
+
+    /// Shadow of an operand as seen by the slice: its own shadow if it is in the slice or is
+    /// an undef constant, clean otherwise (a loaded value was already checked at its load).
+    Value *getUndefSliceShadow(Value *V) {
+        if (isa<UndefValue>(V) || UndefSlice.count(V))
+            return getShadow(V);
+        return getCleanShadow(V);
+    }
+
+    void handleUndefSliceInst(Instruction &I) {
+        IRBuilder<> IRB(&I);
+        Type *ShadowTy = getShadowTy(&I);
+        if (auto *SI = dyn_cast<SelectInst>(&I)) {
+            // Only the arm actually chosen carries its shadow (an OR would report the
+            // undefined arm even when it is not selected).
+            Value *S = IRB.CreateSelect(SI->getCondition(),
+                                        getUndefSliceShadow(SI->getTrueValue()),
+                                        getUndefSliceShadow(SI->getFalseValue()), "_cqmsus_sel");
+            if (UndefSlice.count(SI->getCondition())) {
+                Value *C = convertToBool(getShadow(SI->getCondition()), IRB, "_cqmsus_c");
+                S = IRB.CreateOr(S, IRB.CreateSExt(C, ShadowTy), "_cqmsus_or");
+            }
+            setShadow(&I, S);
+            return;
+        }
+        // Everything else: poisoned iff any operand in the slice is poisoned (MSan's default
+        // approximation), widened to the whole result.
+        Value *Acc = nullptr;
+        for (Value *Op : I.operands()) {
+            if (!isa<UndefValue>(Op) && !UndefSlice.count(Op)) continue;
+            if (!Op->getType()->isSized()) continue;
+            Value *B = convertToBool(getShadow(Op), IRB, "_cqmsus_b");
+            Acc = Acc ? IRB.CreateOr(Acc, B, "_cqmsus_or") : B;
+        }
+        setShadow(&I, Acc ? IRB.CreateSExt(Acc, ShadowTy, "_cqmsus") : getCleanShadow(&I));
+    }
+
+    /// Sinks of slice values that the opportunistic model does not check otherwise.
+    void checkUndefSliceSinks(Instruction &I) {
+        auto InSlice = [&](Value *V) { return UndefSlice.count(V) != 0; };
+        if (auto *BI = dyn_cast<BranchInst>(&I)) {
+            if (BI->isConditional() && InSlice(BI->getCondition()))
+                insertShadowCheck(BI->getCondition(), &I);
+        } else if (auto *SW = dyn_cast<SwitchInst>(&I)) {
+            if (InSlice(SW->getCondition()))
+                insertShadowCheck(SW->getCondition(), &I);
+        } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (!ClCheckAccessAddress && InSlice(LI->getPointerOperand()))
+                insertShadowCheck(LI->getPointerOperand(), &I);
+        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (!ClCheckAccessAddress && InSlice(SI->getPointerOperand()))
+                insertShadowCheck(SI->getPointerOperand(), &I);
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+            // Same surface as MSan's eager checks: only arguments the ABI says are defined.
+            if (CQMS.EagerChecks || CB->isInlineAsm() || isa<IntrinsicInst>(CB)) return;
+            for (unsigned i = 0, n = CB->arg_size(); i < n; ++i) {
+                Value *A = CB->getArgOperand(i);
+                if (InSlice(A) && CB->paramHasAttr(i, Attribute::NoUndef) &&
+                    !CB->paramHasAttr(i, Attribute::ByVal))
+                    insertShadowCheck(A, &I);
+            }
+        }
+    }
+
     bool runOnFunction() {
 
         // Iterate all BBs in depth-first order and create shadow instructions
@@ -1616,8 +1751,19 @@ struct CompilerQEMUMemorySanitizerVisitor : public InstVisitor<CompilerQEMUMemor
 
         // `visit` above only collects instructions. Process them after iterating
         // CFG to avoid requirement on CFG transformations.
-        for (Instruction *I : Instructions)
+        if (ClUndefSlice)
+            computeUndefSlice();
+
+        for (Instruction *I : Instructions) {
+            if (!UndefSlice.empty()) {
+                checkUndefSliceSinks(*I);
+                if (isUndefSliceTransfer(*I)) {
+                    handleUndefSliceInst(*I);
+                    continue;
+                }
+            }
             InstVisitor<CompilerQEMUMemorySanitizerVisitor>::visit(*I);
+        }
 
         // Finalize PHI nodes.
         for (PHINode *PN : ShadowPHINodes) {

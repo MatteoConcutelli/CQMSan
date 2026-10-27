@@ -13,7 +13,7 @@ The design follows the two-tier, opportunistic approach that [QMSan][qmsan] intr
 ## How it works
 
 - **Opportunistic detector, compiled in.** An LLVM pass (`CompilerQEMUMemorySanitizer`, LLVM 19), registered at the end of the optimisation pipeline. It keeps a byte-granular shadow of memory: a store marks its destination initialised, the allocator and the stack instrumentation mark new memory uninitialised, and every load checks the shadow of the bytes it reads. Computed values carry no shadow, so the cost is a fixed amount of work per memory access.
-- **Run-time library** (`libcqmsan_rt`, derived from MSan's compiler-rt runtime). On a violation it records the site, and its calling context, in the map shared with AFL++, and returns: the program keeps running and the fuzzer sees the violation as feedback.
+- **Run-time library** (`libcqmsan_rt`, derived from MSan's compiler-rt runtime). On a violation it records the site, and its calling context, in a violation map shared with AFL++, kept separate from the coverage map, and returns: the program keeps running. After each execution AFL++ reads that map, and only a violation it has not seen before triggers the accurate detector.
 - **Accurate detector, on the binary.** The fuzzer re-runs an input under Valgrind Memcheck only when it exhibits a violation it has not seen before, and only once per violation. Memcheck runs on an uninstrumented build of the target, so it also sees libraries that were not recompiled; only violations it confirms are reported.
 - **Fuzzer.** A patched [AFL-QMSan][aflqmsan] (AFL++ 4.10c) drives both detectors.
 
